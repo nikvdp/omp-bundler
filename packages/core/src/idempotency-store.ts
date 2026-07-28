@@ -420,6 +420,41 @@ export class IdempotencyStore {
   // ---- ingest ----
 
   /**
+   * Remove a newly-created row when ingest could not be accepted.
+   *
+   * This is the rollback boundary for failures before a passive append or RPC
+   * prompt is acknowledged. It deletes only a fully pending row, allowing the
+   * adapter to retry the same message. Once ingest completes or any response
+   * is saved, the row is durable and this transition is rejected.
+   */
+  discardPendingInbound(adapterId: string, messageId: string): void {
+    const info = this.db.run(
+      `DELETE FROM idempotency_store
+        WHERE adapter_id     = ?
+          AND message_id     = ?
+          AND ingest_state   = 'pending'
+          AND delivery_state = 'pending'
+          AND response_payload IS NULL`,
+      [adapterId, messageId],
+    );
+    if (info.changes === 0) {
+      const row = this.getRaw(adapterId, messageId);
+      if (!row) {
+        throw new InvalidStateTransitionError(
+          adapterId,
+          messageId,
+          `no idempotency entry for adapter="${adapterId}" message="${messageId}"`,
+        );
+      }
+      throw new InvalidStateTransitionError(
+        adapterId,
+        messageId,
+        `cannot discard accepted idempotency entry for adapter="${adapterId}" message="${messageId}"`,
+      );
+    }
+  }
+
+  /**
    * Advance ingest state pending -> completed. Compare-and-set: throws
    * {@link InvalidStateTransitionError} if the row is absent or not pending.
    */
