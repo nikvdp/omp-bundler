@@ -7,13 +7,17 @@
     ".": {
       "types": "./dist/rpc-child.d.ts",
       "import": "./dist/rpc-child.js"
+    },
+    "./session-registry": {
+      "types": "./dist/session-registry.d.ts",
+      "import": "./dist/session-registry.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json"
   },
-  "dependencies": {},
   "devDependencies": {
+    "@types/bun": "^1.3.14",
     "@types/node": "^24.6.0",
     "typescript": "~5.9.3"
   },
