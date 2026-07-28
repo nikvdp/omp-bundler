@@ -333,33 +333,38 @@ export class IdempotencyStore {
   /**
    * Idempotent begin for an inbound message.
    *
-   * Computes the canonical payload hash and, inside one transaction, either
-   * atomically inserts a fresh row with a core-generated correlation id or
-   * classifies the existing row for the same key:
+   * Computes the canonical payload hash and atomically inserts a fresh row or
+   * classifies the existing row for the same key. `correlationId` may attach a
+   * new message to an already-active conversation turn; when omitted, the
+   * store generates one.
    *
-   * - new row            -> `created` with the new correlation id
-   * - hash mismatch      -> throws {@link IdempotencyConflictError}, row
-   *   untouched
+   * - new row             -> `created`
+   * - hash mismatch       -> throws {@link IdempotencyConflictError}
    * - hash match, sent    -> `already-sent`
-   * - hash match, saved   -> `response-saved` (ready to redeliver)
- * - hash match, failed  -> `delivery-failed` with the RETAINED saved
- *   response plus curated delivery error (redeliver without a model turn)
-   * - hash match, pending -> `pending` (turn still in flight)
+   * - hash match, saved   -> `response-saved`
+   * - hash match, failed  -> `delivery-failed` with the retained response
+   * - hash match, pending -> `pending`
    *
-   * A replay that classifies as non-created never starts a second agent
-   * turn; persisted state is returned without mutation.
+   * Existing rows always retain and return their original correlation id.
    */
-  beginInbound(adapterId: string, message: InboundMessage): BeginInboundResult {
+  beginInbound(
+    adapterId: string,
+    message: InboundMessage,
+    correlationId?: string,
+  ): BeginInboundResult {
     if (!adapterId) throw new Error("adapterId is required");
     if (!message) throw new Error("message is required");
     if (!message.messageId) throw new Error("message.messageId is required");
+    if (correlationId !== undefined && correlationId.length === 0) {
+      throw new Error("correlationId must be non-empty when provided");
+    }
 
     const payloadHash = canonicalPayloadHash(message);
     const existing = this.getRaw(adapterId, message.messageId);
 
     if (!existing) {
+      const assignedCorrelationId = correlationId ?? randomUUID();
       const ts = nowUtc();
-      const correlationId = randomUUID();
       const tx = this.db.transaction(() => {
         this.db.run(
           `INSERT INTO idempotency_store
@@ -371,7 +376,7 @@ export class IdempotencyStore {
             adapterId,
             message.messageId,
             message.conversationKey,
-            correlationId,
+            assignedCorrelationId,
             payloadHash,
             ts,
             ts,
@@ -397,7 +402,7 @@ export class IdempotencyStore {
         }
         throw err;
       }
-      return { kind: "created", correlationId };
+      return { kind: "created", correlationId: assignedCorrelationId };
     }
 
     if (existing.payloadHash !== payloadHash) {
