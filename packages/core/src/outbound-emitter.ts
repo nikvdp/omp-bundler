@@ -59,6 +59,7 @@ import type {
   TurnUsage,
   PresenceChangedEvent,
 } from "@omp-bundler/contracts/outbound";
+import type { WorkspaceAttachment } from "@omp-bundler/contracts/shared";
 import {
   ADAPTER_API_VERSION,
   OUTBOUND_EVENT_CONTENT_TYPE_HEADER,
@@ -66,6 +67,7 @@ import {
   OUTBOUND_EVENT_SIGNATURE_HEADER,
   OUTBOUND_EVENT_TYPE_HEADER,
 } from "@omp-bundler/contracts/outbound";
+import { DELIVERY_ATTACHMENT_TOOL } from "./ambient-ingest-extension.js";
 import type { RpcEventFrame } from "./rpc-child.js";
 
 // ---------------------------------------------------------------------------
@@ -332,6 +334,9 @@ export class OutboundEmitter {
   /** Accumulated reply text from message_update text deltas. */
   private replyText = "";
 
+  /** Workspace output files requested by the agent for terminal delivery. */
+  private readonly replyAttachments: WorkspaceAttachment[] = [];
+
   /** Accumulated usage/cost from turn_end. */
   private replyUsage: TurnUsage | null = null;
 
@@ -463,6 +468,9 @@ export class OutboundEmitter {
         break;
       case "message_update":
         this.handleMessageUpdate(frame);
+        break;
+      case "tool_execution_end":
+        this.handleToolExecutionEnd(frame);
         break;
       case "turn_end":
         this.handleTurnEnd(frame);
@@ -685,10 +693,21 @@ export class OutboundEmitter {
       sequence: this.nextSequence(),
       occurredAt: toIsoUtc(this.opts.now()),
       text: this.replyText,
-      attachments: [],
+      attachments: this.replyAttachments,
       usage: usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
     };
     this.deliverDurable(event);
+  }
+
+  /** Capture successful deliver_attachment tool results for the terminal reply. */
+  private handleToolExecutionEnd(frame: RpcEventFrame): void {
+    const attachment = extractDeliveryAttachment(frame);
+    if (
+      attachment &&
+      !this.replyAttachments.some((candidate) => candidate.path === attachment.path)
+    ) {
+      this.replyAttachments.push(attachment);
+    }
   }
 
   /**
@@ -1080,6 +1099,39 @@ function extractTextDelta(frame: RpcEventFrame): string | null {
   if (type !== "text_delta") return null;
   const delta = (ev as { delta?: unknown }).delta;
   return typeof delta === "string" ? delta : null;
+}
+
+/** Extract a validated attachment marker from the extension tool result. */
+function extractDeliveryAttachment(frame: RpcEventFrame): WorkspaceAttachment | null {
+  if (frame.toolName !== DELIVERY_ATTACHMENT_TOOL || frame.isError === true) return null;
+  const result = frame.result;
+  if (result === null || typeof result !== "object" || !("details" in result)) return null;
+  const details = result.details;
+  if (
+    details === null ||
+    typeof details !== "object" ||
+    !("ompBundlerAttachment" in details)
+  ) {
+    return null;
+  }
+  const value = details.ompBundlerAttachment;
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    !("path" in value) ||
+    typeof value.path !== "string" ||
+    !value.path
+  ) {
+    return null;
+  }
+  const attachment: WorkspaceAttachment = { path: value.path };
+  if ("name" in value && typeof value.name === "string" && value.name) {
+    attachment.name = value.name;
+  }
+  if ("mediaType" in value && typeof value.mediaType === "string" && value.mediaType) {
+    attachment.mediaType = value.mediaType;
+  }
+  return attachment;
 }
 
 /**

@@ -627,6 +627,7 @@ export class CoreSupervisor {
     const corr = this.active.get(convKey);
     if (!corr || corr.terminalEmitted) return;
     corr.terminalEmitted = true;
+    corr.emitter.emitPresence("offline");
     corr.emitter.emitProviderError({
       code: "agent_unavailable",
       message: "Agent process stopped before completing the turn",
@@ -652,6 +653,16 @@ export class CoreSupervisor {
       return;
     }
 
+    if (frame.type === "turn_start") {
+      corr.emitter.ingest(frame);
+      corr.emitter.emitPresence("active");
+      this.buffer.recordInteraction(corr.adapterId, corr.conversationKey);
+      return;
+    }
+    if (frame.type === "agent_end") {
+      corr.emitter.emitPresence("idle");
+    }
+
     // Route the frame to the emitter for versioned event mapping.
     corr.emitter.ingest(frame);
 
@@ -659,9 +670,9 @@ export class CoreSupervisor {
       this.handleAgentEnd(convKey, corr);
     }
 
-    // Reset engagement on agent interaction events (turn_start, message_update,
-    // etc.) so late-arriving ambient messages stay inside the window.
-    if (frame.type === "turn_start" || frame.type === "message_update") {
+    // Reset engagement while the assistant is producing output so late-arriving
+    // ambient messages stay inside the window.
+    if (frame.type === "message_update") {
       this.buffer.recordInteraction(corr.adapterId, corr.conversationKey);
     }
   }
