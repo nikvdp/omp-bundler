@@ -15,9 +15,9 @@ import type { PumbleApi } from "./pumble-api.js";
  * Consumes the omp-bundler {@link OutboundEvent} stream and translates each
  * event into concrete Pumble side effects on the channel identified by the
  * injected {@link ConversationResolver}. The renderer is stateful but keeps
- * correlation state only in memory; durable dedupe and at-least-once delivery
- * across restarts are owned by a later leaf. Within a single process lifetime
- * it provides per-invocation exactly-once behavior for every event it applies.
+ * correlation state in memory; the adapter service owns durable event-id
+ * dedupe across restarts. Within one process it also checkpoints partial
+ * terminal delivery so a retry does not repeat completed steps.
  *
  * Side effect policy
  * ------------------
@@ -57,9 +57,8 @@ import type { PumbleApi } from "./pumble-api.js";
  * the caller can choose not to acknowledge and let the core retry the durable
  * redelivery. Reactions and progress are best-effort and never reject. The
  * renderer keeps per-correlation checkpoints (text posted, attachment indexes
- * sent) so an in-process retry skips work already completed and does not double
- * the final text or re-send delivered files. Cross-restart dedupe remains
- * documented at-least-once and is owned by a later leaf.
+ * sent) so an in-process retry skips work already completed. Server-level
+ * persistent event-id dedupe suppresses events completed before a restart.
  */
 
 /** Working/active reaction: "looking at this". */
@@ -73,6 +72,8 @@ const IDLE_REACTION = "\u{23F3}";
  * resolver; the renderer never parses `conversationKey`.
  */
 export interface ResolvedTarget {
+  appKey: string;
+  botToken: string;
   channelId: string;
   triggerMessageId: string;
   threadRootId?: string;
@@ -105,18 +106,16 @@ export interface AttachmentSender {
   send(target: ResolvedTarget, attachment: WorkspaceAttachment): Promise<void>;
 }
 
-/** Construction dependencies. `appKey` and `botToken` have no defaults. */
+/** Construction dependencies. Credentials are resolved per workspace target. */
 export interface PumbleRendererOptions {
   pumble: PumbleApi;
   resolver: ConversationResolver;
   logger: RendererLogger;
-  appKey: string;
-  botToken: string;
   /** Optional; when omitted attachment delivery fails loudly. */
   attachmentSender?: AttachmentSender;
 }
 
-/** In-memory per-correlation state. Not durable; later leaf owns dedupe. */
+/** In-memory per-correlation delivery checkpoints. */
 interface CorrelationState {
   /** Event ids already applied within this process, for in-memory dedupe. */
   seen: Set<string>;
@@ -146,8 +145,6 @@ export class PumbleRenderer {
   private readonly pumble: PumbleApi;
   private readonly resolver: ConversationResolver;
   private readonly logger: RendererLogger;
-  private readonly appKey: string;
-  private readonly botToken: string;
   private readonly attachmentSender?: AttachmentSender;
 
   /** Nested map keyed by (conversationKey, correlationId), never concatenation. */
@@ -157,8 +154,6 @@ export class PumbleRenderer {
     this.pumble = options.pumble;
     this.resolver = options.resolver;
     this.logger = options.logger;
-    this.appKey = options.appKey;
-    this.botToken = options.botToken;
     this.attachmentSender = options.attachmentSender;
   }
 
@@ -257,8 +252,8 @@ export class PumbleRenderer {
     if (!state.interimMessageId) {
       try {
         const response = await this.pumble.sendMessage(
-          this.appKey,
-          this.botToken,
+          target.appKey,
+          target.botToken,
           target.channelId,
           event.message,
           target.threadRootId,
@@ -282,8 +277,8 @@ export class PumbleRenderer {
     } else {
       try {
         await this.pumble.editMessage(
-          this.appKey,
-          this.botToken,
+          target.appKey,
+          target.botToken,
           target.channelId,
           state.interimMessageId,
           event.message,
@@ -304,8 +299,8 @@ export class PumbleRenderer {
     // Post the final text exactly once across in-process retries.
     if (event.text && !state.finalTextPosted) {
       await this.pumble.sendMessage(
-        this.appKey,
-        this.botToken,
+        target.appKey,
+        target.botToken,
         target.channelId,
         event.text,
         target.threadRootId,
@@ -334,8 +329,8 @@ export class PumbleRenderer {
     // The curated error message is the terminal message; a failed post rejects
     // so the core retries the durable redelivery.
     await this.pumble.sendMessage(
-      this.appKey,
-      this.botToken,
+      target.appKey,
+      target.botToken,
       target.channelId,
       event.message,
       target.threadRootId,
@@ -478,8 +473,8 @@ export class PumbleRenderer {
   private async safeAddReaction(target: ResolvedTarget, emoji: string): Promise<boolean> {
     try {
       await this.pumble.addReaction(
-        this.appKey,
-        this.botToken,
+        target.appKey,
+        target.botToken,
         target.channelId,
         target.triggerMessageId,
         emoji,
@@ -501,8 +496,8 @@ export class PumbleRenderer {
   ): Promise<void> {
     try {
       await this.pumble.removeReaction(
-        this.appKey,
-        this.botToken,
+        target.appKey,
+        target.botToken,
         target.channelId,
         target.triggerMessageId,
         emoji,
@@ -519,8 +514,8 @@ export class PumbleRenderer {
   private async safeSendNotice(target: ResolvedTarget, text: string): Promise<void> {
     try {
       await this.pumble.sendMessage(
-        this.appKey,
-        this.botToken,
+        target.appKey,
+        target.botToken,
         target.channelId,
         text,
         target.threadRootId,

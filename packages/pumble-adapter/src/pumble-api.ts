@@ -12,6 +12,7 @@ export class PumbleApi {
     const response = await fetch(`${this.config.pumbleApiBaseUrl}/oauth2/access`, {
       method: "POST",
       body: form,
+      signal: this.signal(),
     });
     if (!response.ok) {
       throw new Error(`Pumble OAuth exchange failed with HTTP ${response.status}`);
@@ -22,6 +23,7 @@ export class PumbleApi {
   async getChannel(appKey: string, botToken: string, channelId: string) {
     const response = await fetch(`${this.config.pumbleApiBaseUrl}/v1/channels/${channelId}`, {
       headers: this.authHeaders(appKey, botToken),
+      signal: this.signal(),
     });
     if (!response.ok) {
       throw new Error(`Pumble channel lookup failed with HTTP ${response.status}`);
@@ -47,6 +49,7 @@ export class PumbleApi {
         "content-type": "application/json",
       },
       body: JSON.stringify({ text }),
+      signal: this.signal(),
     });
     if (!response.ok) {
       throw new Error(`Pumble send failed with HTTP ${response.status}: ${await response.text()}`);
@@ -71,6 +74,7 @@ export class PumbleApi {
           "content-type": "application/json",
         },
         body: JSON.stringify({ text }),
+        signal: this.signal(),
       },
     );
     if (!response.ok) {
@@ -98,6 +102,7 @@ export class PumbleApi {
           "content-type": "application/json",
         },
         body: JSON.stringify({ type: emoji }),
+        signal: this.signal(),
       },
     );
     if (!response.ok) {
@@ -125,6 +130,7 @@ export class PumbleApi {
           "content-type": "application/json",
         },
         body: JSON.stringify({ type: emoji }),
+        signal: this.signal(),
       },
     );
     if (!response.ok) {
@@ -139,6 +145,7 @@ export class PumbleApi {
   async getUser(appKey: string, botToken: string, userId: string) {
     const response = await fetch(`${this.config.pumbleApiBaseUrl}/v1/users/${userId}`, {
       headers: this.authHeaders(appKey, botToken),
+      signal: this.signal(),
     });
     if (!response.ok) {
       throw new Error(`Pumble user lookup failed with HTTP ${response.status}`);
@@ -149,6 +156,7 @@ export class PumbleApi {
   async fetchFile(appKey: string, accessToken: string, fileUrl: string) {
     const response = await fetch(fileUrl, {
       headers: this.authHeaders(appKey, accessToken),
+      signal: this.signal(),
     });
     if (!response.ok) {
       throw new Error(`Pumble file download failed with HTTP ${response.status}`);
@@ -157,6 +165,10 @@ export class PumbleApi {
       throw new Error("Pumble file download returned an empty body.");
     }
     return response;
+  }
+
+  private signal(): AbortSignal {
+    return AbortSignal.timeout(this.config.httpTimeoutMs);
   }
 
   private authHeaders(appKey: string, botToken: string) {

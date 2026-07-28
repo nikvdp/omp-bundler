@@ -10,6 +10,7 @@ import { verifyPumbleSignature } from "./security.js";
 import { TokenStore } from "./token-store.js";
 import { TargetStore, type Target } from "./target-store.js";
 import { PumbleAttachmentSender } from "./attachment-sender.js";
+import { DeliveryStore } from "./delivery-store.js";
 import { parseNewMessage, normalizePumbleMessage, type NormalizeContext } from "./pumble-event.js";
 import { savePumbleFiles, type PumbleMessageFilesEvent } from "./pumble-files.js";
 import { PumbleRenderer, type ConversationResolver } from "./pumble-renderer.js";
@@ -25,28 +26,20 @@ await mkdir(config.pumbleDataDir, { recursive: true });
 const pumble = new PumbleApi(config);
 const tokens = new TokenStore(path.join(config.pumbleDataDir, "workspaces.json"));
 const targetStore = new TargetStore(path.join(config.pumbleDataDir, "targets.json"));
+const deliveryStore = new DeliveryStore(path.join(config.pumbleDataDir, "delivered-events.json"));
 
-// Resolve workspace tokens at startup for outbound rendering. The configured
-// workspaceId identifies the single installed Pumble workspace. If tokens are
-// missing (not yet authorized), rendering will fail loudly on each callback
-// until OAuth completes; inbound ingestion also fails explicitly.
-let botToken = "";
-let appKey = config.appKey;
-if (config.workspaceId) {
-  const workspaceTokens = await tokens.getWorkspace(config.workspaceId);
-  if (workspaceTokens?.botToken) {
-    botToken = workspaceTokens.botToken;
-  }
-}
-
-const attachmentSender = appKey
-  ? new PumbleAttachmentSender(config, pumble, appKey, botToken)
-  : undefined;
+const attachmentSender = new PumbleAttachmentSender(config, pumble);
 
 const resolver: ConversationResolver = async (conversationKey, correlationId) => {
   const target = await targetStore.resolve(conversationKey, correlationId);
   if (!target) return null;
+  const workspaceTokens = await tokens.getWorkspace(target.workspaceId);
+  if (!workspaceTokens?.botToken) {
+    throw new Error(`no bot token for workspace ${target.workspaceId}`);
+  }
   return {
+    appKey: config.appKey,
+    botToken: workspaceTokens.botToken,
     channelId: target.channelId,
     triggerMessageId: target.triggerMessageId,
     threadRootId: target.threadRootId,
@@ -57,8 +50,6 @@ const renderer = new PumbleRenderer({
   pumble,
   resolver,
   logger: console,
-  appKey,
-  botToken,
   attachmentSender,
 });
 
@@ -73,6 +64,17 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(config.port, config.host, () => {
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    server.close((error) => {
+      if (error) {
+        console.error(">>> Pumble adapter shutdown failed:", error.message);
+        process.exitCode = 1;
+      }
+    });
+  });
+}
   console.log(`>>> Pumble adapter listening on http://${config.host}:${config.port}`);
 });
 
@@ -349,6 +351,7 @@ async function processNewMessage(payload: Record<string, unknown>): Promise<NewM
 
   // Resolve the target for outbound callbacks.
   const target: Target = {
+    workspaceId: event.workspaceId,
     channelId: event.channelId,
     triggerMessageId: event.messageId,
     threadRootId: event.threadRootId,
@@ -391,6 +394,7 @@ async function postToCore(body: string): Promise<string> {
       [INBOUND_SECRET_HEADER]: config.coreSharedSecret,
     },
     body,
+    signal: AbortSignal.timeout(config.httpTimeoutMs),
   });
 
   if (response.status === 202 || response.status === 200) {
@@ -461,6 +465,13 @@ async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerRespo
 
   const event = payload as unknown as OutboundEvent;
 
+  if (await deliveryStore.hasCompleted(event.eventId)) {
+    if (event.type === "turn.reply" || event.type === "turn.error") {
+      await targetStore.forgetCorrelation(event.correlationId);
+    }
+    sendText(res, 200, "ok");
+    return;
+  }
   // Deliver the event through the renderer. Only 2xx after the renderer
   // succeeds; 5xx on retry-safe failure so the core redelivers.
   try {
@@ -472,7 +483,9 @@ async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerRespo
     return;
   }
 
-  // Clean up the correlation binding after a terminal event.
+  // Persist dedupe before acknowledging; terminal targets can then be released.
+  await deliveryStore.markCompleted(event.eventId);
+
   if (event.type === "turn.reply" || event.type === "turn.error") {
     await targetStore.forgetCorrelation(event.correlationId);
   }

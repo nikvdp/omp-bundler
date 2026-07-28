@@ -10,6 +10,7 @@ import path from "node:path";
  * root for a correlation even across a process restart.
  */
 export interface Target {
+  workspaceId: string;
   channelId: string;
   triggerMessageId: string;
   threadRootId?: string;
@@ -212,8 +213,12 @@ function isValidTarget(value: unknown): boolean {
   }
   const record = value as Record<string, unknown>;
   return (
+    typeof record.workspaceId === "string" &&
+    record.workspaceId.length > 0 &&
     typeof record.channelId === "string" &&
+    record.channelId.length > 0 &&
     typeof record.triggerMessageId === "string" &&
+    record.triggerMessageId.length > 0 &&
     (record.threadRootId === undefined || typeof record.threadRootId === "string")
   );
 }

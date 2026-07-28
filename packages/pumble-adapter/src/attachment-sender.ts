@@ -26,8 +26,6 @@ export class PumbleAttachmentSender implements AttachmentSender {
   constructor(
     private readonly config: BridgeConfig,
     private readonly pumble: PumbleApi,
-    private readonly appKey: string,
-    private readonly botToken: string,
   ) {}
 
   async send(target: ResolvedTarget, attachment: WorkspaceAttachment): Promise<void> {
@@ -36,8 +34,8 @@ export class PumbleAttachmentSender implements AttachmentSender {
     const link = this.signDownloadLink(attachment.path);
     const message = `Attachment: ${label}\n${link}`;
     await this.pumble.sendMessage(
-      this.appKey,
-      this.botToken,
+      target.appKey,
+      target.botToken,
       target.channelId,
       message,
       target.threadRootId,
