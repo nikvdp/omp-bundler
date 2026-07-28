@@ -1,0 +1,22 @@
+# Sample settings for the agent-folder container. Rendered/edited in place;
+# this file is read directly as ~/.omp/agent/config.yml once
+# OMP_AGENT_DIR points at this folder.
+
+modelRoles:
+  default: anthropic/claude-sonnet-4-5
+  smol: anthropic/claude-haiku-4-5
+
+enabledModels:
+  - claude-sonnet-4-5
+  - claude-haiku-4-5
+
+modelProviderOrder:
+  - anthropic
+
+modelTags:
+  fast: anthropic/claude-haiku-4-5
+
+disabledProviders:
+  - ollama
+  - llama.cpp
+  - lm-studio

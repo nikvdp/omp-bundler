@@ -1,0 +1,23 @@
+# Rendered to models.yml at container start. Placeholders are `${VAR}` and
+# resolve against the container's environment; rendering fails if a placeholder
+# is unresolved or a provider has no models.
+
+providers:
+  anthropic:
+    apiKey: ${ANTHROPIC_API_KEY}
+    models:
+      - id: claude-sonnet-4-5
+        name: Claude Sonnet 4.5
+        input:
+          - text
+          - image
+        reasoning: true
+        contextWindow: 200000
+        maxTokens: 64000
+      - id: claude-haiku-4-5
+        name: Claude Haiku 4.5
+        input:
+          - text
+          - image
+        contextWindow: 200000
+        maxTokens: 64000
