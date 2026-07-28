@@ -148,8 +148,10 @@ log "core pid=${CORE_PID}, pumble pid=${PUMBLE_PID}"
 # other is torn down (fail-fast sibling termination) and the
 # container exits with the first child's status. No background
 # process is left unmonitored.
+set +e
 wait -n
 FIRST_EXIT=$?
+set -e
 
 if [ "$TEARING_DOWN" -eq 1 ]; then
   # Signal-driven shutdown: forward already sent. Wait for both to
@@ -163,16 +165,21 @@ else
   forward_signal TERM
 fi
 
-# Reap both children. Give them a moment, then SIGKILL stragglers.
-if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
-  wait "$CORE_PID" 2>/dev/null || true
-fi
-if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-  wait "$PUMBLE_PID" 2>/dev/null || true
-fi
-
-# Hard-kill any survivors after a short grace period.
-sleep 1
+# Give both children a bounded grace period, then SIGKILL stragglers.
+for _ in {1..50}; do
+  CORE_ALIVE=0
+  PUMBLE_ALIVE=0
+  if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
+    CORE_ALIVE=1
+  fi
+  if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
+    PUMBLE_ALIVE=1
+  fi
+  if [ "$CORE_ALIVE" -eq 0 ] && [ "$PUMBLE_ALIVE" -eq 0 ]; then
+    break
+  fi
+  sleep 0.1
+done
 if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
   log "core did not exit; sending SIGKILL"
   kill -9 "$CORE_PID" 2>/dev/null || true

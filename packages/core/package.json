@@ -44,6 +44,11 @@
       "import": "./src/session-registry.ts",
       "default": "./dist/session-registry.js"
     },
+    "./outbound-emitter": {
+      "types": "./src/outbound-emitter.ts",
+      "import": "./src/outbound-emitter.ts",
+      "default": "./dist/outbound-emitter.js"
+    },
     "./server": {
       "types": "./src/server.ts",
       "import": "./src/server.ts",
