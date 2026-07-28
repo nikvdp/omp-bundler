@@ -3,18 +3,21 @@
 # OMP_AGENT_DIR points at this folder.
 
 modelRoles:
-  default: anthropic/claude-sonnet-4-5
-  smol: anthropic/claude-haiku-4-5
+  default: cliproxyapi/claude-haiku-4-5-20251001
+  smol: cliproxyapi/claude-3-5-haiku-20241022
+  slow: custom-provider/claude-fable-5
 
 enabledModels:
-  - claude-sonnet-4-5
-  - claude-haiku-4-5
+  - cliproxyapi/claude-haiku-4-5-20251001
+  - cliproxyapi/claude-3-5-haiku-20241022
+  - custom-provider/claude-fable-5
 
 modelProviderOrder:
-  - anthropic
+  - cliproxyapi
+  - custom-provider
 
 modelTags:
-  fast: anthropic/claude-haiku-4-5
+  fast: cliproxyapi/claude-3-5-haiku-20241022
 
 disabledProviders:
   - ollama
