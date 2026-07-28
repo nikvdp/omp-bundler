@@ -132,6 +132,27 @@ export function expand(tmpl: string): { text: string; missing: string[]; survivo
   return { text, missing: [...missing].sort(), survivors: [...survivors].sort() };
 }
 
+/**
+ * Remove provider apiKey fields when OMP's credential broker owns auth.
+ * JSON output is valid YAML and avoids resolving provider key placeholders.
+ */
+export function omitProviderApiKeys(tmpl: string): string {
+  const parsed = Bun.YAML.parse(tmpl);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return tmpl;
+  }
+  const providers = (parsed as Catalog).providers;
+  if (providers === null || typeof providers !== "object" || Array.isArray(providers)) {
+    return tmpl;
+  }
+  for (const provider of Object.values(providers)) {
+    if (provider !== null && typeof provider === "object" && !Array.isArray(provider)) {
+      delete provider.apiKey;
+    }
+  }
+  return JSON.stringify(parsed, null, 2);
+}
+
 // ── validation ────────────────────────────────────────────────────────
 
 type Model = Record<string, unknown>;
@@ -201,6 +222,19 @@ async function main(): Promise<void> {
   }
 
   if (tmpl.length === 0) die(`input template '${input}' is empty`);
+
+  const brokerUrl = process.env.OMP_AUTH_BROKER_URL?.trim();
+  const brokerToken = process.env.OMP_AUTH_BROKER_TOKEN?.trim();
+  if ((brokerUrl && !brokerToken) || (!brokerUrl && brokerToken)) {
+    failAll(["OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN must be set together"]);
+  }
+  if (brokerUrl && brokerToken) {
+    try {
+      tmpl = omitProviderApiKeys(tmpl);
+    } catch (e) {
+      die(`cannot prepare broker-backed model catalog: ${(e as Error).message}`);
+    }
+  }
 
   const { text: rendered, missing, survivors } = expand(tmpl);
 

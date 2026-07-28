@@ -66,6 +66,25 @@ ENV OMP_SESSIONS_DIR=/data/sessions
 ENV OMP_WORKSPACE_DIR=/data/workspace
 ENV OMP_ARTIFACTS_DIR=/data/artifacts
 ENV PI_ARTIFACTS_DIR=/data/artifacts
+
+# Core runtime invariants. Paths and internal service addresses belong to
+# this image; credentials and adapter registrations remain runtime inputs.
+ENV OMP_HOST=0.0.0.0
+ENV OMP_PORT=8787
+ENV OMP_SESSION_DB_PATH=/data/core/session-registry.sqlite
+ENV OMP_IDEMPOTENCY_DB_PATH=/data/core/idempotency.sqlite
+ENV OMP_OUTBOX_DB_PATH=/data/core/outbound.sqlite
+ENV OMP_MAX_CHILDREN=8
+ENV OMP_IDLE_TIMEOUT_MS=900000
+ENV OMP_ENGAGEMENT_WINDOW_MS=300000
+ENV OMP_CALLBACK_TIMEOUT_MS=15000
+ENV OMP_PROGRESS_THRESHOLD_MS=500
+ENV OMP_RETRY_DELAYS_MS=250,1000,5000
+
+# The two supervised services communicate over loopback by default.
+ENV PUMBLE_BRIDGE_HOST=0.0.0.0
+ENV PUMBLE_BRIDGE_PORT=8765
+ENV PUMBLE_CORE_URL=http://127.0.0.1:8787
 VOLUME ["/data"]
 
 # ── exposed ports ─────────────────────────────────────────────────────
@@ -75,17 +94,18 @@ VOLUME ["/data"]
 EXPOSE 8787
 EXPOSE 8765
 
-# ── seven required render env vars ───────────────────────────────────
-# The models.yml.tmpl renderer fails loudly if any of these are
-# missing or empty at container start. They are provider credentials
-# and base URLs; supply real values via runtime env/secrets.
+# ── model provider runtime config ─────────────────────────────────────
+# Base URLs are always required. API keys are required unless both
+# OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN are set, in which case the
+# renderer removes provider apiKey fields and OMP resolves credentials through
+# the broker.
 #   CLIPROXY_BASE_URL    cliproxyapi provider base URL
-#   CLIPROXY_API_KEY     cliproxyapi provider API key
 #   custom-provider_BASE_URL     custom-provider provider base URL
-#   custom-provider_API_KEY      custom-provider provider API key
-#   OLLAMA_CLOUD_API_KEY ollama-cloud provider API key
-#   OPENCODE_GO_API_KEY  opencode-go provider API key
-#   SYNTHETIC_API_KEY    synthetic provider API key
+#   CLIPROXY_API_KEY     cliproxyapi key without a broker
+#   custom-provider_API_KEY      custom-provider key without a broker
+#   OLLAMA_CLOUD_API_KEY ollama-cloud key without a broker
+#   OPENCODE_GO_API_KEY  opencode-go key without a broker
+#   SYNTHETIC_API_KEY    synthetic key without a broker
 
 # ── Pumble adapter runtime config ────────────────────────────────────
 # PUMBLE_CORE_URL        core base URL for posting inbound messages
@@ -93,6 +113,11 @@ EXPOSE 8765
 # PUMBLE_CORE_SHARED_SECRET  shared secret for inbound auth + outbound HMAC
 # PUMBLE_PUBLIC_BASE_URL public base URL for attachment links (required
 #                        for signed download links to resolve externally)
+# PUMBLE_CORE_CALLBACK_URL optional core-to-adapter callback override
+#                          (default: http://127.0.0.1:8765/core/events)
+#
+# OMP_ADAPTERS may override the generated Pumble registration with a JSON
+# array of {adapterId,callbackUrl,sharedSecret} entries.
 
 # ── child registry ──────────────────────────────────────────────────
 # The orphan sweep and core server share a JSON registry of live RPC

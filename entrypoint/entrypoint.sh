@@ -85,15 +85,48 @@ link_into_data() {
 link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 
 # -- 1. render models --------------------------------------------------
-# bun build/render-models.ts expands ${VAR} placeholders against the
-# container environment and fails loudly if any are missing, empty,
-# or leave unresolved survivors. The seven required render env vars
-# are documented in the Dockerfile; the renderer validates them.
+# bun build/render-models.ts expands the template's ${VAR} placeholders
+# against the container environment and fails loudly on missing, empty,
+# malformed, or unresolved values.
 log "rendering models.yml from ${MODELS_TMPL}"
 bun "$BUILD_DIR/render-models.ts" \
   --input "$MODELS_TMPL" \
   --output "$MODELS_OUT"
 log "models rendered to ${MODELS_OUT}"
+
+# Optional central credential vault. Both values are required together. The
+# renderer removes provider apiKey fields when the broker is configured, so
+# the broker remains ahead of provider environment variables in OMP's
+# credential cascade.
+if [ -n "${OMP_AUTH_BROKER_URL:-}" ] || [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ]; then
+  [ -n "${OMP_AUTH_BROKER_URL:-}" ] || die "OMP_AUTH_BROKER_URL is required with OMP_AUTH_BROKER_TOKEN"
+  [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ] || die "OMP_AUTH_BROKER_TOKEN is required with OMP_AUTH_BROKER_URL"
+  omp config set auth.broker.url "$OMP_AUTH_BROKER_URL" >/dev/null
+  omp config set auth.broker.token "$OMP_AUTH_BROKER_TOKEN" >/dev/null
+  log "configured OMP auth broker"
+fi
+
+# Default image composition: register the bundled Pumble adapter against its
+# loopback callback. OMP_ADAPTERS remains an escape hatch for multi-adapter
+# deployments. Build the JSON with Bun so arbitrary secret bytes are escaped.
+if [ -z "${OMP_ADAPTERS:-}" ]; then
+  [ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
+  export OMP_ADAPTERS="$(
+    bun -e '
+      const adapterId = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
+      const port = process.env.PUMBLE_BRIDGE_PORT?.trim() || "8765";
+      const callbackUrl =
+        process.env.PUMBLE_CORE_CALLBACK_URL?.trim() ||
+        `http://127.0.0.1:${port}/core/events`;
+      process.stdout.write(JSON.stringify([{
+        adapterId,
+        callbackUrl,
+        sharedSecret: process.env.PUMBLE_CORE_SHARED_SECRET,
+      }]));
+    '
+  )"
+  log "configured bundled Pumble adapter registration"
+fi
 
 # -- 2. orphan sweep ---------------------------------------------------
 # The orphan sweep is a core module. It MUST run once; we do not
