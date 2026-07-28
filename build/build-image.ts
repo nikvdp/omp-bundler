@@ -31,7 +31,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { access, copyFile, cp, mkdir, mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { access, copyFile, cp, lstat, mkdir, mkdtemp, readdir, realpath, rm, stat } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -104,6 +104,21 @@ function isEnoent(e: unknown): boolean {
   return e instanceof Error && (e as NodeJS.ErrnoException).code === "ENOENT";
 }
 
+// Docker must never receive a symlink from staged input. lstat and readdir
+// inspect each directory entry without resolving it first.
+async function assertNoSymlinks(path: string): Promise<Stats> {
+  const s = await lstat(path);
+  if (s.isSymbolicLink()) {
+    throw new Error(`refusing to stage symlink: ${path}`);
+  }
+  if (s.isDirectory()) {
+    for (const entry of await readdir(path)) {
+      await assertNoSymlinks(join(path, entry));
+    }
+  }
+  return s;
+}
+
 async function assertFolder(path: string): Promise<void> {
   let s: Stats;
   try {
@@ -118,11 +133,12 @@ async function assertFolder(path: string): Promise<void> {
 async function assertRequiredFiles(folder: string): Promise<void> {
   const missing: string[] = [];
   for (const name of REQUIRED_FILES) {
+    const path = join(folder, name);
     try {
-      await access(join(folder, name));
+      await assertNoSymlinks(path);
     } catch (e) {
       if (!isEnoent(e)) {
-        fail(`cannot access required file '${join(folder, name)}': ${(e as Error).message}`);
+        fail(`cannot inspect required file '${path}': ${(e as Error).message}`);
       }
       missing.push(name);
     }
@@ -218,10 +234,10 @@ async function stageContext(
       const src = join(folder, name);
       let s: Stats;
       try {
-        s = await stat(src);
+        s = await assertNoSymlinks(src);
       } catch (e) {
         if (!isEnoent(e)) {
-          throw new Error(`cannot stat optional dir '${src}': ${(e as Error).message}`);
+          throw new Error(`cannot inspect optional dir '${src}': ${(e as Error).message}`);
         }
         continue; // optional, absent is fine
       }
@@ -253,10 +269,10 @@ async function stageContext(
     for (const tree of RUNTIME_TREES) {
       const src = join(repoRoot, tree);
       try {
-        await access(src);
+        await assertNoSymlinks(src);
       } catch (e) {
         if (isEnoent(e)) throw new Error(`repo runtime tree not found: ${tree}`);
-        throw new Error(`cannot access repo runtime tree '${src}': ${(e as Error).message}`);
+        throw new Error(`cannot inspect repo runtime tree '${src}': ${(e as Error).message}`);
       }
       await cp(src, join(ctx, tree), {
         recursive: true,
