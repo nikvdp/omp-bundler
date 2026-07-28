@@ -46,7 +46,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { Database } from "bun:sqlite";
 
 import type {
@@ -198,6 +198,13 @@ export interface OutboxRow {
   updatedAt: string;
 }
 
+/** Durable correlation with at least one POST still pending after restart. */
+export interface PendingOutboundCorrelation {
+  adapterId: string;
+  conversationKey: string;
+  correlationId: string;
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -228,6 +235,42 @@ const INDEX_SEQUENCE = `
 CREATE INDEX IF NOT EXISTS idx_outbox_sequence
   ON outbound_outbox (adapter_id, correlation_id, sequence);
 `;
+
+/**
+ * Enumerate durable correlations that need delivery recovery after restart.
+ *
+ * A genuinely absent database means no prior events. Existing but corrupt or
+ * schema-incompatible databases fail loudly rather than losing callbacks.
+ */
+export function listPendingOutboundCorrelations(
+  dbPath: string,
+): PendingOutboundCorrelation[] {
+  if (!dbPath) throw new Error("dbPath is required");
+  if (dbPath === ":memory:") return [];
+  if (!existsSync(dbPath)) return [];
+
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    return db
+      .query(
+        `SELECT DISTINCT adapter_id, conversation_key, correlation_id
+           FROM outbound_outbox
+          WHERE status = 'pending'
+          ORDER BY adapter_id, correlation_id`,
+      )
+      .all()
+      .map((row) => {
+        const value = row as Record<string, unknown>;
+        return {
+          adapterId: String(value.adapter_id),
+          conversationKey: String(value.conversation_key),
+          correlationId: String(value.correlation_id),
+        };
+      });
+  } finally {
+    db.close();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers

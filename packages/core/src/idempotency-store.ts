@@ -628,6 +628,30 @@ export class IdempotencyStore {
     return null;
   }
 
+  /**
+   * Return every inbound row attached to one adapter correlation.
+   *
+   * Used by outbound recovery to restore terminal delivery hooks after a
+   * process restart without replaying the model turn.
+   */
+  getEntriesByCorrelation(
+    adapterId: string,
+    correlationId: string,
+  ): IdempotencyEntry[] {
+    return this.db
+      .query(
+        `SELECT adapter_id, message_id, conversation_key, correlation_id,
+                payload_hash, ingest_state, delivery_state,
+                response_payload, error_text, created_at, updated_at
+           FROM idempotency_store
+          WHERE adapter_id = ?
+            AND correlation_id = ?
+          ORDER BY created_at, message_id`,
+      )
+      .all(adapterId, correlationId)
+      .map((row) => rowToEntry(row as Record<string, unknown>));
+  }
+
   // ---- close ----
 
   /** Close the database handle. Safe to call multiple times. */
