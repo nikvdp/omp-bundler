@@ -1,7 +1,15 @@
 import type { BridgeConfig } from "./config.js";
 import { joinPublicUrl } from "./config.js";
 
-const botScopes = ["messages:read", "messages:write", "channels:read"];
+const botScopes = [
+  "messages:read", // Receive channel messages and attachment metadata.
+  "messages:write", // Send final replies and progress updates.
+  "messages:edit", // Update the bot's in-place progress message.
+  "channels:read", // Resolve channel type and membership context.
+  "reaction:write", // Acknowledge accepted work on the triggering message.
+  "reaction:read", // Receive reaction-driven approvals without later re-consent.
+  "user:read", // Resolve stable user ids to display names.
+];
 const userScopes = ["messages:read"];
 
 export function buildManifest(config: BridgeConfig) {
