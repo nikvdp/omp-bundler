@@ -36,6 +36,18 @@
       "types": "./src/pumble-renderer.ts",
       "import": "./src/pumble-renderer.ts"
     },
+    "./attachment-sender": {
+      "types": "./src/attachment-sender.ts",
+      "import": "./src/attachment-sender.ts"
+    },
+    "./delivery-store": {
+      "types": "./src/delivery-store.ts",
+      "import": "./src/delivery-store.ts"
+    },
+    "./target-store": {
+      "types": "./src/target-store.ts",
+      "import": "./src/target-store.ts"
+    },
     "./token-store": {
       "types": "./src/token-store.ts",
       "import": "./src/token-store.ts"
