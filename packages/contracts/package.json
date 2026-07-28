@@ -17,6 +17,7 @@
       "import": "./dist/outbound.js"
     },
     "./schemas/inbound-v1.json": "./schemas/inbound-v1.json",
+    "./schemas/inbound-accepted-v1.json": "./schemas/inbound-accepted-v1.json",
     "./schemas/outbound-v1.json": "./schemas/outbound-v1.json"
   },
   "files": [

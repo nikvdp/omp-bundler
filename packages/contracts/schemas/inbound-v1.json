@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omp-bundler.dev/contracts/schemas/inbound-v1.json",
+  "title": "Inbound Message Request (v1)",
+  "description": "Request body for POST /v1/adapters/{adapterId}/messages. adapterId is supplied by the route and is not duplicated in payloads. conversationKey is opaque and stable within that adapter namespace. Idempotency key is (adapterId, messageId): first acceptance returns HTTP 202 status 'accepted'; identical replay returns HTTP 200 status 'duplicate' with the original correlation id; same key plus different canonical payload is a conflict (HTTP 409). The correlation id is core-generated and stable for replays. The acceptance response is validated by inbound-accepted-v1.json. 'addressed' is a boolean indicating whether the agent was directly invoked (activation policy seam).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["messageId", "conversationKey", "speaker", "text", "attachments", "addressed"],
+  "properties": {
+    "messageId": {
+      "description": "Non-empty opaque string identifying this message within the adapter.",
+      "type": "string",
+      "minLength": 1
+    },
+    "conversationKey": {
+      "description": "Opaque, stable conversation key within the adapter namespace.",
+      "type": "string",
+      "minLength": 1
+    },
+    "speaker": {
+      "description": "The party that produced the message.",
+      "$ref": "#/$defs/Speaker"
+    },
+    "text": {
+      "description": "Message text. May be empty only when attachments is non-empty.",
+      "type": "string"
+    },
+    "attachments": {
+      "description": "Attachments referenced by workspace-relative POSIX path. May be empty only when text is non-empty.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/WorkspaceAttachment" }
+    },
+    "addressed": {
+      "description": "Whether the agent was directly invoked by this message (activation policy seam). true means the message explicitly targets the agent; false means it is ambient/contextual within the conversation.",
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "description": "Reject a message where text is empty and attachments is empty.",
+      "if": {
+        "properties": {
+          "text": { "const": "" }
+        },
+        "required": ["text"]
+      },
+      "then": {
+        "properties": {
+          "attachments": { "minItems": 1 }
+        },
+        "required": ["attachments"]
+      }
+    }
+  ],
+  "$defs": {
+    "Speaker": {
+      "description": "A party in an adapter conversation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "displayName"],
+      "properties": {
+        "id": {
+          "description": "Non-empty opaque speaker identifier within the adapter.",
+          "type": "string",
+          "minLength": 1
+        },
+        "displayName": {
+          "description": "Human-readable display name.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "WorkspaceAttachment": {
+      "description": "Attachment referenced by a workspace-relative POSIX path. Consumers enforce runtime path safety; this contract never carries inline bytes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "description": "Workspace-relative POSIX path to the attachment.",
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "description": "Optional display name for the attachment.",
+          "type": "string"
+        },
+        "mediaType": {
+          "description": "Optional IANA media type of the attachment.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

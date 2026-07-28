@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omp-bundler.dev/contracts/schemas/inbound-accepted-v1.json",
+  "title": "Inbound Message Acceptance Response (v1)",
+  "description": "Synchronous acceptance response for POST /v1/adapters/{adapterId}/messages. First acceptance returns HTTP 202 with status 'accepted'; identical replay (same (adapterId, messageId) key, same canonical payload) returns HTTP 200 with status 'duplicate' and the original correlation id; same key plus different canonical payload is a conflict (HTTP 409). The correlation id is core-generated, opaque, and stable for all replays of the same (adapterId, messageId) pair.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "correlationId"],
+  "properties": {
+    "status": {
+      "description": "Acceptance status. 'accepted' on first receipt (HTTP 202); 'duplicate' on identical replay (HTTP 200) with the original correlation id.",
+      "type": "string",
+      "enum": ["accepted", "duplicate"]
+    },
+    "correlationId": {
+      "description": "Core-generated opaque correlation id, stable for all replays of the same (adapterId, messageId) pair.",
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}
