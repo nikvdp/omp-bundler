@@ -1,4 +1,24 @@
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+interface ExtensionAPI {
+  registerCommand(
+    name: string,
+    options: {
+      description: string;
+      handler: (args: string) => Promise<void>;
+    },
+  ): void;
+  sendMessage(
+    message: {
+      customType: string;
+      content: string;
+      display: boolean;
+      attribution: "agent";
+    },
+    options: {
+      triggerTurn: boolean;
+      deliverAs?: "followUp";
+    },
+  ): void;
+}
 
 export const AMBIENT_INGEST_COMMAND = "omp-bundler-ambient";
 
