@@ -657,12 +657,19 @@ export class OutboundEmitter {
     }
   }
 
-  /** agent_end -> exactly ONE terminal turn.reply (durable). */
+  /** agent_end -> exactly one curated terminal event (durable). */
   private handleAgentEnd(frame: RpcEventFrame): void {
     if (this.terminalEmitted) return;
+    if (agentEndHasModelError(frame)) {
+      this.emitProviderError({
+        code: "model_error",
+        message: "Agent model request failed",
+        retryable: true,
+      });
+      return;
+    }
     this.terminalEmitted = true;
     this.ensureStarted();
-
     // Prefer usage accumulated from turn_end; fall back to agent_end messages.
     let usage = this.replyUsage ?? null;
     if (!usage) {
@@ -1099,6 +1106,21 @@ function extractUsageFromAgentEnd(frame: RpcEventFrame): TurnUsage {
     }
   }
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
+}
+
+/** Whether the final assistant message ended in a provider/model error. */
+function agentEndHasModelError(frame: RpcEventFrame): boolean {
+  const messages = frame.messages;
+  if (!Array.isArray(messages)) return false;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message === null || typeof message !== "object" || !("role" in message)) {
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    return "stopReason" in message && message.stopReason === "error";
+  }
+  return false;
 }
 
 /**
