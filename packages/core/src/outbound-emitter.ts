@@ -346,6 +346,9 @@ export class OutboundEmitter {
   /** Whether turn.started has been emitted for this correlation. */
   private startedEmitted = false;
 
+  /** Last emitted presence, used to suppress redundant state changes. */
+  private presence: Presence | null = null;
+
   /** Timestamp (epoch ms) of the last emitted progress event. */
   private lastProgressAt = 0;
 
@@ -523,6 +526,8 @@ export class OutboundEmitter {
    * Emit a presence.changed event for the conversation. Durable.
    */
   emitPresence(presence: Presence): void {
+    if (this.presence === presence) return;
+    this.presence = presence;
     const event: PresenceChangedEvent = {
       version: ADAPTER_API_VERSION,
       type: "presence.changed",
