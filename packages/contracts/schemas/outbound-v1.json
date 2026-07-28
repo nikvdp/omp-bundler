@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://omp-bundler.dev/contracts/schemas/outbound-v1.json",
+  "title": "Outbound webhook event (v1)",
+  "description": "JSON payload POSTed by the omp-bundler core to an adapter's registered callback URL. The adapter is the consumer and acknowledges each POST. Adapter identity is supplied by the route (/v1/adapters/{adapterId}/...); it is not duplicated here. conversationKey is opaque and stable within the adapter namespace.",
+  "$defs": {
+    "adapterApiVersion": {
+      "const": "v1",
+      "description": "API contract version; always the literal \"v1\"."
+    },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Non-empty opaque string identifier."
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Positive integer, monotonically increasing per correlationId."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$",
+      "description": "UTC ISO 8601 timestamp ending in Z, marking event generation (advisory)."
+    },
+    "workspaceAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace-relative POSIX path to the attachment. Never inline bytes; the adapter enforces path safety at read time."
+        },
+        "name": {
+          "type": "string",
+          "description": "Optional display name for the attachment."
+        },
+        "mediaType": {
+          "type": "string",
+          "description": "Optional IANA media type of the attachment payload."
+        }
+      }
+    },
+    "turnUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "output", "cacheRead", "cacheWrite", "costUsd"],
+      "properties": {
+        "input": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Nonnegative integer. Non-prompt input tokens."
+        },
+        "output": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Nonnegative integer. Generated output tokens."
+        },
+        "cacheRead": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Nonnegative integer. Cached prompt tokens read."
+        },
+        "cacheWrite": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Nonnegative integer. Prompt tokens written to cache."
+        },
+        "costUsd": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Nonnegative numeric cost in USD for the turn. May be fractional."
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "title": "turn.started",
+      "description": "A turn begins for a correlation. Delivered at-least-once. Always precedes turn.reply or turn.error for the same correlationId in a gap-free delivery.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt"],
+      "properties": {
+        "version": { "$ref": "#/$defs/adapterApiVersion" },
+        "type": { "const": "turn.started" },
+        "eventId": { "$ref": "#/$defs/opaqueId" },
+        "conversationKey": { "$ref": "#/$defs/opaqueId" },
+        "correlationId": { "$ref": "#/$defs/opaqueId" },
+        "sequence": { "$ref": "#/$defs/sequence" },
+        "occurredAt": { "$ref": "#/$defs/occurredAt" }
+      }
+    },
+    {
+      "title": "turn.progress",
+      "description": "Best-effort progress notification carrying a human-readable message. May be dropped or coalesce; a drop creates a sequence gap that the adapter MUST tolerate. Never terminal.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "message"],
+      "properties": {
+        "version": { "$ref": "#/$defs/adapterApiVersion" },
+        "type": { "const": "turn.progress" },
+        "eventId": { "$ref": "#/$defs/opaqueId" },
+        "conversationKey": { "$ref": "#/$defs/opaqueId" },
+        "correlationId": { "$ref": "#/$defs/opaqueId" },
+        "sequence": { "$ref": "#/$defs/sequence" },
+        "occurredAt": { "$ref": "#/$defs/occurredAt" },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable progress text, suitable for direct display."
+        }
+      }
+    },
+    {
+      "title": "turn.reply",
+      "description": "Terminal event carrying the completed turn reply. Delivered at-least-once. Attachments are workspace-relative POSIX paths; bytes are never inlined. Its arrival closes the turn regardless of dropped progress. Both text and attachments are always present; the pair (empty text, empty attachments) is invalid.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "text", "attachments", "usage"],
+      "allOf": [
+        {
+          "description": "Reject a reply where text is empty and attachments is empty.",
+          "if": {
+            "properties": {
+              "text": { "const": "" }
+            },
+            "required": ["text"]
+          },
+          "then": {
+            "properties": {
+              "attachments": { "minItems": 1 }
+            },
+            "required": ["attachments"]
+          }
+        }
+      ],
+      "properties": {
+        "version": { "$ref": "#/$defs/adapterApiVersion" },
+        "type": { "const": "turn.reply" },
+        "eventId": { "$ref": "#/$defs/opaqueId" },
+        "conversationKey": { "$ref": "#/$defs/opaqueId" },
+        "correlationId": { "$ref": "#/$defs/opaqueId" },
+        "sequence": { "$ref": "#/$defs/sequence" },
+        "occurredAt": { "$ref": "#/$defs/occurredAt" },
+        "text": {
+          "type": "string",
+          "description": "Reply text. May be empty only when attachments is non-empty."
+        },
+        "attachments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/workspaceAttachment" },
+          "description": "Workspace-relative output attachments. May be empty only when text is non-empty."
+        },
+        "usage": { "$ref": "#/$defs/turnUsage" }
+      }
+    },
+    {
+      "title": "presence.changed",
+      "description": "Presence change of the core agent within a conversation. Delivered at-least-once.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "presence"],
+      "properties": {
+        "version": { "$ref": "#/$defs/adapterApiVersion" },
+        "type": { "const": "presence.changed" },
+        "eventId": { "$ref": "#/$defs/opaqueId" },
+        "conversationKey": { "$ref": "#/$defs/opaqueId" },
+        "correlationId": { "$ref": "#/$defs/opaqueId" },
+        "sequence": { "$ref": "#/$defs/sequence" },
+        "occurredAt": { "$ref": "#/$defs/occurredAt" },
+        "presence": {
+          "enum": ["active", "idle", "offline"],
+          "description": "New presence state of the core agent."
+        }
+      }
+    },
+    {
+      "title": "turn.error",
+      "description": "Terminal error for a correlation. Delivered at-least-once. Its arrival closes the turn; the adapter MUST NOT expect a subsequent turn.reply for the same correlationId.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "code", "message", "retryable"],
+      "properties": {
+        "version": { "$ref": "#/$defs/adapterApiVersion" },
+        "type": { "const": "turn.error" },
+        "eventId": { "$ref": "#/$defs/opaqueId" },
+        "conversationKey": { "$ref": "#/$defs/opaqueId" },
+        "correlationId": { "$ref": "#/$defs/opaqueId" },
+        "sequence": { "$ref": "#/$defs/sequence" },
+        "occurredAt": { "$ref": "#/$defs/occurredAt" },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable, machine-readable error code. Not localized."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Curated, human-readable error message suitable for display."
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Whether the core failure is transient. Reports the nature of the failure, not permission to replay an already-accepted inbound message; a new inbound request is required to retry."
+        }
+      }
+    }
+  ]
+}
