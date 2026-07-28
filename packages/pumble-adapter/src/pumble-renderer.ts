@@ -186,6 +186,10 @@ export class PumbleRenderer {
     let perConversation = this.correlations.get(conversationKey);
     if (!perConversation) {
       perConversation = new Map();
+      this.correlations.set(conversationKey, perConversation);
+    }
+    let state = perConversation.get(correlationId);
+    if (!state) {
       state = {
         seen: new Set<string>(),
         startedReaction: false,
