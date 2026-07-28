@@ -1,0 +1,36 @@
+{
+  "name": "@omp-bundler/contracts",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./shared": {
+      "types": "./dist/shared.d.ts",
+      "import": "./dist/shared.js"
+    },
+    "./inbound": {
+      "types": "./dist/inbound.d.ts",
+      "import": "./dist/inbound.js"
+    },
+    "./outbound": {
+      "types": "./dist/outbound.d.ts",
+      "import": "./dist/outbound.js"
+    },
+    "./schemas/inbound-v1.json": "./schemas/inbound-v1.json",
+    "./schemas/outbound-v1.json": "./schemas/outbound-v1.json"
+  },
+  "files": [
+    "dist",
+    "schemas"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "typescript": "~5.9.3"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}
