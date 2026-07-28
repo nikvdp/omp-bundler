@@ -216,6 +216,14 @@ export class RpcChild extends EventEmitter {
   private closed = false;
   /** Process group id of the child, equal to the child pid on Unix. */
   private pgid: number | undefined;
+  /**
+   * Tracks the in-flight registration promise so an exit that happens during
+   * registration can queue the unregister after registration completes.
+   * `undefined` when no registration is in progress or pending.
+   */
+  private registerPromise: Promise<void> | undefined;
+  /** Set when the child exits while registration is still in flight. */
+  private exitDuringRegister = false;
   private readonly opts: Required<
     Pick<RpcChildOptions, "binary" | "args" | "cwd" | "readyTimeoutMs">
   > &
@@ -261,49 +269,21 @@ export class RpcChild extends EventEmitter {
       this.pgid = child.pid;
     }
 
-    // Register the process group in the persistent registry so a crashed
-    // supervisor can reclaim it. Best-effort: a registration failure does not
-    // block the child from running, but is surfaced as an "error" event.
-    void this.registerPgid();
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (data: string) => this.onStdoutData(data));
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (data: string) => {
-      // Surface stderr as a diagnostic event; the protocol channel is stdout.
-      this.emit("stderr", data);
-    });
-    child.on("error", (err) => {
-      this.emit("error", err);
-      this.rejectAllPending(err);
-    });
-    child.on("exit", (code, signal) => {
-      const err = new Error(
-        `omp rpc child exited (code=${code}, signal=${signal ?? "null"})`,
-      );
-      this.emit("exit", code, signal);
-      // Unregister the process group after the child has confirmed exited.
-      void this.unregisterPgid();
-      if (!this.closed) {
-        this.closed = true;
-        this.rejectAllPending(err);
-      }
-    });
-
+    // ---- ready handshake (listeners installed before registration) ----
     const { promise: readyPromise, resolve: readyResolve, reject: readyReject } =
       Promise.withResolvers<RpcReadyFrame>();
     let timer: NodeJS.Timeout | undefined;
     const cleanup = () => {
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
       this.off("ready", onReady);
-      this.off("exit", onExit);
-      this.off("error", onError);
+      this.off("exit", onExitForReady);
+      this.off("error", onErrorForReady);
     };
     const onReady = (frame: RpcReadyFrame) => {
       cleanup();
       readyResolve(frame);
     };
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    const onExitForReady = (code: number | null, signal: NodeJS.Signals | null) => {
       cleanup();
       readyReject(
         new Error(
@@ -311,7 +291,7 @@ export class RpcChild extends EventEmitter {
         ),
       );
     };
-    const onError = (err: Error) => {
+    const onErrorForReady = (err: Error) => {
       cleanup();
       readyReject(err);
     };
@@ -328,10 +308,68 @@ export class RpcChild extends EventEmitter {
         // ignore
       }
     }, this.opts.readyTimeoutMs);
-
     this.once("ready", onReady);
-    this.once("exit", onExit);
-    this.once("error", onError);
+    this.once("exit", onExitForReady);
+    this.once("error", onErrorForReady);
+
+    // ---- stdio + lifecycle listeners ----
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (data: string) => this.onStdoutData(data));
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (data: string) => {
+      // Surface stderr as a diagnostic event; the protocol channel is stdout.
+      this.emit("stderr", data);
+    });
+    child.on("error", (err) => {
+      this.emit("error", err);
+      this.rejectAllPending(err);
+    });
+    child.on("exit", (code, signal) => {
+      const err = new Error(
+        `omp rpc child exited (code=${code}, signal=${signal ?? "null"})`,
+      );
+      this.emit("exit", code, signal);
+      // If registration is still in flight, flag it so the awaited
+      // registration path runs unregister after it settles. Otherwise run
+      // unregister directly.
+      if (this.registerPromise !== undefined) {
+        this.exitDuringRegister = true;
+      } else {
+        void this.unregisterPgid();
+      }
+      if (!this.closed) {
+        this.closed = true;
+        this.rejectAllPending(err);
+      }
+    });
+
+    // ---- persistent registration (awaited; start() cannot resolve until it
+    // is durable, so a crash before start() resolves never leaves an
+    // unaccounted-for process group) ----
+    try {
+      await this.registerPgid();
+    } catch (err) {
+      // Registration failed: hard-kill the freshly-spawned group and reject.
+      cleanup();
+      try {
+        if (this.pgid !== undefined) {
+          this.hardKillPg("SIGKILL");
+        } else {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        // ignore: best-effort teardown of an unregistered group
+      }
+      throw err;
+    }
+    // If the child exited during registration, run the queued unregister
+    // (now that register has completed) before returning. The ready promise
+    // has already been rejected by onExitForReady, but we await the
+    // unregister for registry consistency.
+    if (this.exitDuringRegister) {
+      await this.unregisterPgid();
+    }
+
     return readyPromise;
   }
 
@@ -419,31 +457,35 @@ export class RpcChild extends EventEmitter {
   }
 
   /**
-   * Register this child's process group in the persistent registry. Best-effort
-   * (non-throwing): a registry failure is surfaced as an "error" event but does
-   * not prevent the child from running. Requires both `registryPath` and
-   * `conversationKey` to be set; otherwise a no-op.
+   * Persistently register this child's process group. Throws on failure so
+   * {@link start} can hard-kill the unregistered group and reject. The
+   * returned promise is tracked in {@link registerPromise} so an exit that
+   * fires while registration is in flight can queue the unregister after it
+   * settles. No-op (returns immediately) when no registry is configured.
    */
-  private async registerPgid(): Promise<void> {
+  private registerPgid(): Promise<void> {
     const { registryPath, conversationKey } = this.opts;
-    if (!registryPath || !conversationKey || this.pgid === undefined) return;
+    if (!registryPath || !conversationKey || this.pgid === undefined) {
+      return Promise.resolve();
+    }
     const entry: ChildRegistryEntry = {
       pgid: this.pgid,
       pid: this.pgid,
       startedAt: Date.now(),
       binary: this.opts.binary,
     };
-    try {
-      await registerChild(registryPath, conversationKey, entry);
-    } catch (err) {
-      this.emit("error", err instanceof Error ? err : new Error(String(err)));
-    }
+    const p = registerChild(registryPath, conversationKey, entry).finally(() => {
+      if (this.registerPromise === p) this.registerPromise = undefined;
+    });
+    this.registerPromise = p;
+    return p;
   }
 
   /**
    * Remove this child's process group from the persistent registry. Called
-   * after the child has confirmed exited (the `exit` handler). No-op if no
-   * registry is configured. Best-effort: failures are surfaced but swallowed.
+   * after the child has confirmed exited. No-op if no registry is configured.
+   * Failures are swallowed: the group is already dead, so a stale entry will
+   * be cleared by the next startup sweep.
    */
   private async unregisterPgid(): Promise<void> {
     const { registryPath, conversationKey } = this.opts;
