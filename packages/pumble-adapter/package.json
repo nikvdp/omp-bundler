@@ -3,13 +3,50 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/server.ts",
+      "import": "./src/server.ts"
+    },
+    "./config": {
+      "types": "./src/config.ts",
+      "import": "./src/config.ts"
+    },
+    "./manifest": {
+      "types": "./src/manifest.ts",
+      "import": "./src/manifest.ts"
+    },
+    "./security": {
+      "types": "./src/security.ts",
+      "import": "./src/security.ts"
+    },
+    "./pumble-api": {
+      "types": "./src/pumble-api.ts",
+      "import": "./src/pumble-api.ts"
+    },
+    "./pumble-event": {
+      "types": "./src/pumble-event.ts",
+      "import": "./src/pumble-event.ts"
+    },
+    "./pumble-files": {
+      "types": "./src/pumble-files.ts",
+      "import": "./src/pumble-files.ts"
+    },
+    "./pumble-renderer": {
+      "types": "./src/pumble-renderer.ts",
+      "import": "./src/pumble-renderer.ts"
+    },
+    "./token-store": {
+      "types": "./src/token-store.ts",
+      "import": "./src/token-store.ts"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx src/server.ts",
-    "start": "node dist/server.js"
+    "start": "bun src/server.ts"
   },
   "dependencies": {
-    "tsx": "^4.20.6"
+    "@omp-bundler/contracts": "file:../contracts"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",

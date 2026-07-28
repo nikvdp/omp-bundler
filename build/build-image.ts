@@ -11,7 +11,8 @@
  * the required files plus optional discovery directories. Local state
  * (rendered models.yml, agent.db, sessions, caches, credentials) is
  * never copied. The context root also gets the repo Dockerfile and
- * .dockerignore plus the build/, packages/core/, and entrypoint/ trees.
+ * .dockerignore plus the build/, packages/contracts/, packages/core/,
+ * packages/pumble-adapter/, and entrypoint/ trees.
  *
  * Catalog structural validation is reused from build/render-models.ts
  * (exported `validate`) so the build script and the container-time
@@ -42,11 +43,11 @@ type Args = { folder: string; tag: string };
 
 const USAGE = [
   "usage: bun build/build-image.ts <agent-folder-path> <local-image-tag>",
-  "",
   "Stages an ephemeral Docker context from <agent-folder-path> (copied as",
-  "template/) plus the repo build/, packages/core/, and entrypoint/ trees,",
-  "then runs `docker build -t <tag> <context>`. Validates required folder",
-  "surfaces and the models.yml.tmpl catalog before invoking Docker.",
+  "template/) plus the repo build/, packages/contracts/, packages/core/,",
+  "packages/pumble-adapter/, and entrypoint/ trees, then runs `docker build",
+  "-t <tag> <context>`. Validates required folder surfaces and the",
+  "models.yml.tmpl catalog before invoking Docker.",
 ].join("\n");
 
 function fail(msg: string): never {
@@ -85,7 +86,13 @@ const OPTIONAL_DIRS = ["agents", "commands", "extensions", "skills", "tools"] as
 const ROOT_FILES = ["Dockerfile", ".dockerignore"] as const;
 
 // Repo runtime trees copied verbatim into the ephemeral context.
-const RUNTIME_TREES = ["build", "packages/core", "entrypoint"] as const;
+const RUNTIME_TREES = [
+  "build",
+  "packages/contracts",
+  "packages/core",
+  "packages/pumble-adapter",
+  "entrypoint",
+] as const;
 
 // An apiKey must be exactly one ${VALID_NAME} placeholder and nothing
 // else: no literal secrets, no shell expansions, no partial embeddings.
@@ -241,7 +248,8 @@ async function stageContext(
       await copyFile(src, join(ctx, name));
     }
 
-    // Repo runtime trees: build/, packages/core/, entrypoint/.
+    // Repo runtime trees: build/, packages/contracts/, packages/core/,
+    // packages/pumble-adapter/, entrypoint/.
     for (const tree of RUNTIME_TREES) {
       const src = join(repoRoot, tree);
       try {

@@ -5,16 +5,66 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./dist/rpc-child.d.ts",
-      "import": "./dist/rpc-child.js"
+      "types": "./src/rpc-child.ts",
+      "import": "./src/rpc-child.ts",
+      "default": "./dist/rpc-child.js"
+    },
+    "./rpc-child": {
+      "types": "./src/rpc-child.ts",
+      "import": "./src/rpc-child.ts",
+      "default": "./dist/rpc-child.js"
+    },
+    "./child-reaper": {
+      "types": "./src/child-reaper.ts",
+      "import": "./src/child-reaper.ts",
+      "default": "./dist/child-reaper.js"
+    },
+    "./adapter-registry": {
+      "types": "./src/adapter-registry.ts",
+      "import": "./src/adapter-registry.ts",
+      "default": "./dist/adapter-registry.js"
+    },
+    "./idempotency-store": {
+      "types": "./src/idempotency-store.ts",
+      "import": "./src/idempotency-store.ts",
+      "default": "./dist/idempotency-store.js"
+    },
+    "./ingest-buffer": {
+      "types": "./src/ingest-buffer.ts",
+      "import": "./src/ingest-buffer.ts",
+      "default": "./dist/ingest-buffer.js"
+    },
+    "./pool-manager": {
+      "types": "./src/pool-manager.ts",
+      "import": "./src/pool-manager.ts",
+      "default": "./dist/pool-manager.js"
     },
     "./session-registry": {
-      "types": "./dist/session-registry.d.ts",
-      "import": "./dist/session-registry.js"
+      "types": "./src/session-registry.ts",
+      "import": "./src/session-registry.ts",
+      "default": "./dist/session-registry.js"
+    },
+    "./server": {
+      "types": "./src/server.ts",
+      "import": "./src/server.ts",
+      "default": "./dist/server.js"
+    },
+    "./orphan-sweep": {
+      "types": "./src/orphan-sweep.ts",
+      "import": "./src/orphan-sweep.ts",
+      "default": "./dist/orphan-sweep.js"
+    },
+    "./ambient-ingest-extension": {
+      "types": "./src/ambient-ingest-extension.ts",
+      "import": "./src/ambient-ingest-extension.ts",
+      "default": "./dist/ambient-ingest-extension.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@omp-bundler/contracts": "file:../contracts"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",

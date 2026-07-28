@@ -5,22 +5,26 @@
   "type": "module",
   "exports": {
     "./shared": {
-      "types": "./dist/shared.d.ts",
-      "import": "./dist/shared.js"
+      "types": "./src/shared.ts",
+      "import": "./src/shared.ts",
+      "default": "./dist/shared.js"
     },
     "./inbound": {
-      "types": "./dist/inbound.d.ts",
-      "import": "./dist/inbound.js"
+      "types": "./src/inbound.ts",
+      "import": "./src/inbound.ts",
+      "default": "./dist/inbound.js"
     },
     "./outbound": {
-      "types": "./dist/outbound.d.ts",
-      "import": "./dist/outbound.js"
+      "types": "./src/outbound.ts",
+      "import": "./src/outbound.ts",
+      "default": "./dist/outbound.js"
     },
     "./schemas/inbound-v1.json": "./schemas/inbound-v1.json",
     "./schemas/inbound-accepted-v1.json": "./schemas/inbound-accepted-v1.json",
     "./schemas/outbound-v1.json": "./schemas/outbound-v1.json"
   },
   "files": [
+    "src",
     "dist",
     "schemas"
   ],
