@@ -55,12 +55,18 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  const rest = argv.filter((a) => !a.startsWith("--"));
-  if (rest.length !== 2) {
+  if (argv.length !== 2) {
     console.error(USAGE);
-    fail("expected exactly two arguments: <agent-folder-path> <local-image-tag>");
+    fail(
+      `expected exactly two arguments: <agent-folder-path> <local-image-tag>, got ${argv.length}`,
+    );
   }
-  return { folder: rest[0], tag: rest[1] };
+  const [folder, tag] = argv;
+  if (folder.startsWith("-") || tag.startsWith("-")) {
+    console.error(USAGE);
+    fail("arguments must not be flags; expected <agent-folder-path> <local-image-tag>");
+  }
+  return { folder, tag };
 }
 
 // The agent folder is installed as $HOME/.omp/agent in the image, so
@@ -324,6 +330,7 @@ async function main(): Promise<void> {
 
   let ctx: string | null = null;
   let dockerCode = 0;
+  let buildError: string | null = null;
   try {
     ctx = await stageContext(repoRoot, folderAbs);
     console.error(`build-image: staged context at ${ctx}`);
@@ -335,10 +342,13 @@ async function main(): Promise<void> {
       console.error(`build-image: built ${tag}`);
     }
   } catch (e) {
-    fail(`build failed: ${(e as Error).message}`);
+    // Capture the error but do NOT process.exit here: the finally
+    // block must clean the staged context first, then we exit below.
+    buildError = `build failed: ${(e as Error).message}`;
   } finally {
     if (ctx !== null) await rm(ctx, { recursive: true, force: true });
   }
+  if (buildError !== null) fail(buildError);
   if (dockerCode !== 0) process.exit(dockerCode);
 }
 
