@@ -55,6 +55,97 @@ export class PumbleApi {
     return responseText ? (JSON.parse(responseText) as Record<string, unknown>) : {};
   }
 
+  async editMessage(
+    appKey: string,
+    botToken: string,
+    channelId: string,
+    messageId: string,
+    text: string,
+  ) {
+    const response = await fetch(
+      `${this.config.pumbleApiBaseUrl}/v1/channels/${channelId}/messages/${messageId}`,
+      {
+        method: "PUT",
+        headers: {
+          ...this.authHeaders(appKey, botToken),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ text }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Pumble edit failed with HTTP ${response.status}: ${await response.text()}`,
+      );
+    }
+    const responseText = await response.text();
+    return responseText ? (JSON.parse(responseText) as Record<string, unknown>) : {};
+  }
+
+  async addReaction(
+    appKey: string,
+    botToken: string,
+    channelId: string,
+    messageId: string,
+    emoji: string,
+  ) {
+    const response = await fetch(
+      `${this.config.pumbleApiBaseUrl}/v1/channels/${channelId}/messages/${messageId}/reactions`,
+      {
+        method: "POST",
+        headers: {
+          ...this.authHeaders(appKey, botToken),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ type: emoji }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Pumble add reaction failed with HTTP ${response.status}: ${await response.text()}`,
+      );
+    }
+    const responseText = await response.text();
+    return responseText ? (JSON.parse(responseText) as Record<string, unknown>) : {};
+  }
+
+  async removeReaction(
+    appKey: string,
+    botToken: string,
+    channelId: string,
+    messageId: string,
+    emoji: string,
+  ) {
+    const response = await fetch(
+      `${this.config.pumbleApiBaseUrl}/v1/channels/${channelId}/messages/${messageId}/reactions`,
+      {
+        method: "DELETE",
+        headers: {
+          ...this.authHeaders(appKey, botToken),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ type: emoji }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Pumble remove reaction failed with HTTP ${response.status}: ${await response.text()}`,
+      );
+    }
+    const responseText = await response.text();
+    return responseText ? (JSON.parse(responseText) as Record<string, unknown>) : {};
+  }
+
+  async getUser(appKey: string, botToken: string, userId: string) {
+    const response = await fetch(`${this.config.pumbleApiBaseUrl}/v1/users/${userId}`, {
+      headers: this.authHeaders(appKey, botToken),
+    });
+    if (!response.ok) {
+      throw new Error(`Pumble user lookup failed with HTTP ${response.status}`);
+    }
+    const responseText = await response.text();
+    return responseText ? (JSON.parse(responseText) as Record<string, unknown>) : {};
+  }
   async fetchFile(appKey: string, accessToken: string, fileUrl: string) {
     const response = await fetch(fileUrl, {
       headers: this.authHeaders(appKey, accessToken),
