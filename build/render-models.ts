@@ -1,6 +1,13 @@
 /**
  * Models template renderer.
  *
+ * Shared catalog validation lives here so both the renderer and the
+ * folder build script validate the same surface without duplication.
+ * Exports (used by build/build-image.ts):
+ *   - expand(tmpl): placeholder expansion against process.env
+ *   - validate(parsed): rendered-catalog structural validation
+ *   - PLACEHOLDER: env-placeholder regex
+ *
  * Expands ${VAR} placeholders in a models.yml.tmpl against the process
  * environment, validates the rendered catalog, and writes models.yml.
  * Fails nonzero with named diagnostics on:
@@ -86,14 +93,14 @@ function failAll(errors: string[]): never {
 // Valid env-var names: uppercase letters, digits, underscore; must
 // start with a letter or underscore. Matches ${ANTHROPIC_API_KEY},
 // ${custom-provider_BASE_URL}, etc.
-const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
+export const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 // Generic braced token: any ${...} at all, including shell-style
 // expansions (${VAR:-x}) and malformed names (${BAD-NAME}). The first
 // pass replaces valid-name placeholders; anything left is caught here.
 const SURVIVOR = /\$\{[^}]*\}/g;
 
-function expand(tmpl: string): { text: string; missing: string[]; survivors: string[] } {
+export function expand(tmpl: string): { text: string; missing: string[]; survivors: string[] } {
   const missing = new Set<string>();
 
   // First pass: replace every ${VALID_NAME} with its env value. Names
@@ -131,7 +138,7 @@ type Model = Record<string, unknown>;
 type Provider = { models?: unknown; [k: string]: unknown };
 type Catalog = { providers?: Record<string, Provider> | null; [k: string]: unknown };
 
-function validate(parsed: unknown): string[] {
+export function validate(parsed: unknown): string[] {
   const errors: string[] = [];
 
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
@@ -226,4 +233,4 @@ async function main(): Promise<void> {
   console.error(`models-renderer: rendered ${output} from ${input}`);
 }
 
-main();
+if (import.meta.main) main();
