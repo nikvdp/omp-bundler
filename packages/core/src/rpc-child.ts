@@ -30,6 +30,13 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
+import {
+  IS_UNIX,
+  registerChild,
+  unregisterChild,
+  killProcessGroup,
+  type ChildRegistryEntry,
+} from "./child-reaper.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -131,6 +138,20 @@ export interface RpcChildOptions {
   onExtensionUiRequest?: ExtensionUiRequestHandler;
   /** Timeout in ms for the initial `ready` frame. Defaults to 30_000. */
   readyTimeoutMs?: number;
+  /**
+   * Path to the persistent JSON registry that records this child's process
+   * group. When set together with {@link conversationKey}, the pgid is
+   * registered after spawn and removed after the child exits, so a crashed
+   * supervisor can reclaim orphaned groups via {@link sweepChildRegistry}.
+   * When omitted, the child still runs in its own process group but is not
+   * persisted. Unix-only enforcement is on the registry helpers.
+   */
+  registryPath?: string;
+  /**
+   * Opaque, adapter-namespaced conversation key under which this child is
+   * recorded in {@link registryPath}. Required for registry persistence.
+   */
+  conversationKey?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,10 +214,12 @@ export class RpcChild extends EventEmitter {
   >();
   private nextId = 1;
   private closed = false;
+  /** Process group id of the child, equal to the child pid on Unix. */
+  private pgid: number | undefined;
   private readonly opts: Required<
     Pick<RpcChildOptions, "binary" | "args" | "cwd" | "readyTimeoutMs">
   > &
-    Pick<RpcChildOptions, "env" | "onExtensionUiRequest">;
+    Pick<RpcChildOptions, "env" | "onExtensionUiRequest" | "registryPath" | "conversationKey">;
 
   constructor(options: RpcChildOptions = {}) {
     super();
@@ -207,6 +230,8 @@ export class RpcChild extends EventEmitter {
       readyTimeoutMs: options.readyTimeoutMs ?? 30_000,
       env: options.env,
       onExtensionUiRequest: options.onExtensionUiRequest,
+      registryPath: options.registryPath,
+      conversationKey: options.conversationKey,
     };
   }
 
@@ -218,12 +243,28 @@ export class RpcChild extends EventEmitter {
     if (this.closed) throw new Error("RpcChild is closed");
 
     const args = ["--mode", "rpc", ...this.opts.args];
+    // Spawn the child in its own process group on Unix so the entire tree
+    // (child + any descendants) can be torn down together by signalling the
+    // negative pgid. `detached: true` makes the child's pid its pgid. On
+    // non-Unix we spawn without a separate group; hard group teardown is
+    // then unavailable (see {@link hardKillPg} / sweepChildRegistry).
+    const detached = IS_UNIX;
     const child = spawn(this.opts.binary, args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: this.opts.cwd,
       env: this.opts.env ?? process.env,
+      detached,
     });
     this.child = child;
+
+    if (detached && child.pid !== undefined) {
+      this.pgid = child.pid;
+    }
+
+    // Register the process group in the persistent registry so a crashed
+    // supervisor can reclaim it. Best-effort: a registration failure does not
+    // block the child from running, but is surfaced as an "error" event.
+    void this.registerPgid();
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (data: string) => this.onStdoutData(data));
@@ -241,6 +282,8 @@ export class RpcChild extends EventEmitter {
         `omp rpc child exited (code=${code}, signal=${signal ?? "null"})`,
       );
       this.emit("exit", code, signal);
+      // Unregister the process group after the child has confirmed exited.
+      void this.unregisterPgid();
       if (!this.closed) {
         this.closed = true;
         this.rejectAllPending(err);
@@ -276,7 +319,11 @@ export class RpcChild extends EventEmitter {
       cleanup();
       readyReject(new Error("omp rpc child timed out waiting for ready frame"));
       try {
-        child.kill("SIGKILL");
+        if (this.pgid !== undefined) {
+          this.hardKillPg("SIGKILL");
+        } else {
+          child.kill("SIGKILL");
+        }
       } catch {
         // ignore
       }
@@ -319,9 +366,15 @@ export class RpcChild extends EventEmitter {
       exitResolve();
     };
     const timer = setTimeout(() => {
-      // Graceful exit didn't happen; force kill the child process.
+      // Graceful exit didn't happen; hard-kill the entire process group on
+      // Unix (signals the negative pgid). On non-Unix or when no group was
+      // established, fall back to killing the child pid directly.
       try {
-        child.kill("SIGKILL");
+        if (this.pgid !== undefined) {
+          this.hardKillPg("SIGKILL");
+        } else {
+          child.kill("SIGKILL");
+        }
       } catch {
         // ignore
       }
@@ -331,9 +384,76 @@ export class RpcChild extends EventEmitter {
     // If already exited.
     if (child.exitCode !== null || child.signalCode !== null) {
       clearTimeout(timer);
+      // Group already reaped in the exit handler; just resolve.
       exitResolve();
     }
     await exitPromise;
+  }
+
+  // ---- process-group reaping ----
+
+  /** Process group id of the child, or `undefined` if not spawned / non-Unix. */
+  get processGroupId(): number | undefined {
+    return this.pgid;
+  }
+
+  /**
+   * Hard-kill the entire child process group by signalling the negative pgid.
+   *
+   * This tears down the child AND any descendant processes it spawned, which a
+   * plain `child.kill()` cannot reach. Intended for crash handling and as the
+   * fallback after graceful {@link close} times out.
+   *
+   * @returns `true` if the signal was delivered, `false` if the group was
+   *          already gone. Throws {@link UnsupportedPlatformError} off-Unix or
+   *          `Error` if no process group was ever established (non-detached
+   *          spawn).
+   */
+  hardKillPg(signal: NodeJS.Signals = "SIGKILL"): boolean {
+    if (this.pgid === undefined) {
+      // No process group (non-Unix spawn or never started): callers should
+      // fall back to `child.kill()`. Signal this distinctly.
+      throw new Error("RpcChild has no process group (non-Unix or not started)");
+    }
+    return killProcessGroup(this.pgid, signal);
+  }
+
+  /**
+   * Register this child's process group in the persistent registry. Best-effort
+   * (non-throwing): a registry failure is surfaced as an "error" event but does
+   * not prevent the child from running. Requires both `registryPath` and
+   * `conversationKey` to be set; otherwise a no-op.
+   */
+  private async registerPgid(): Promise<void> {
+    const { registryPath, conversationKey } = this.opts;
+    if (!registryPath || !conversationKey || this.pgid === undefined) return;
+    const entry: ChildRegistryEntry = {
+      pgid: this.pgid,
+      pid: this.pgid,
+      startedAt: Date.now(),
+      binary: this.opts.binary,
+    };
+    try {
+      await registerChild(registryPath, conversationKey, entry);
+    } catch (err) {
+      this.emit("error", err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /**
+   * Remove this child's process group from the persistent registry. Called
+   * after the child has confirmed exited (the `exit` handler). No-op if no
+   * registry is configured. Best-effort: failures are surfaced but swallowed.
+   */
+  private async unregisterPgid(): Promise<void> {
+    const { registryPath, conversationKey } = this.opts;
+    if (!registryPath || !conversationKey || this.pgid === undefined) return;
+    try {
+      await unregisterChild(registryPath, conversationKey);
+    } catch {
+      // Swallow: the group is already dead; a stale entry will be cleared by
+      // the next startup sweep.
+    }
   }
 
   // ---- core send / receive ----
