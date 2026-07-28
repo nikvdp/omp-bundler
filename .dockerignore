@@ -1,0 +1,42 @@
+# Bundler root .dockerignore: keep the build context lean and keep
+# secrets / local state out of the image. Mirrors .gitignore plus
+# anything that must never reach a layer.
+
+# Version control
+.git
+.gitignore
+
+# Worktrees and local clones
+.worktrees/
+
+# Build artifacts
+dist/
+*.tgz
+
+# Dependencies (installed inside the image, not copied from host)
+node_modules/
+**/node_modules/
+
+# Runtime installs only the pinned global OMP package; core source uses
+# Bun built-ins directly.
+**/package-lock.json
+**/bun.lockb
+**/bun.lock
+
+# Secrets and local state: never bake into an image
+.env
+.env.*
+!.env.example
+.lb/
+
+# Docs are build-time documentation only; the agent folder sample
+# in template/ is the runtime surface and is copied explicitly.
+docs/
+README.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
