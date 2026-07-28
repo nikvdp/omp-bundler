@@ -408,6 +408,47 @@ export class PoolManager {
     return this.makeLease(entry);
   }
 
+  /**
+   * Remove a child that exited outside normal pool teardown. The dead process
+   * no longer occupies capacity, and stale ownership must not make a later
+   * acquire reuse it.
+   */
+  forgetExitedChild(
+    adapterId: string,
+    conversationKey: string,
+    child: RpcChild,
+  ): void {
+    const id = conversationIdOf(adapterId, conversationKey);
+    const entry = this.entries.get(id);
+    if (!entry || entry.child !== child) return;
+
+    if (entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+    }
+    this.entries.delete(id);
+
+    const releaseError = this.releaseOwnership(entry);
+    if (releaseError) {
+      this.log({
+        type: "ownership_release_failed",
+        adapterId,
+        conversationKey,
+        message: `exited child ownership release failed: ${releaseError.message}`,
+      });
+    } else {
+      this.log({
+        type: "child_closed",
+        adapterId,
+        conversationKey,
+        size: this.entries.size,
+        message: "exited child removed and ownership released",
+      });
+    }
+
+    this.drainWaiters();
+  }
+
   // ---- stats / observability ----
 
   /** Observable snapshot of pool state. */

@@ -56,7 +56,7 @@ import {
 } from "./idempotency-store.js";
 import { IngestBuffer, type ActivationMode, renderRecord } from "./ingest-buffer.js";
 import { PoolManager, type ChildFactory, type Lease } from "./pool-manager.js";
-import { RpcChild, type RpcEventFrame } from "./rpc-child.js";
+import { RpcChild, type RpcEventFrame, type RpcResponseFrame } from "./rpc-child.js";
 import {
   OutboundEmitter,
   type AdapterTarget,
@@ -147,17 +147,22 @@ export class CoreSupervisor {
   private readonly config: CoreConfig;
   private readonly now: Clock;
   private readonly fetchImpl: FetchImpl;
-  private readonly uuid: () => string;
-  private readonly childFactory: ChildFactoryFn;
+  private readonly uuid!: () => string;
+  private readonly childFactory!: ChildFactoryFn;
 
-  private readonly adapters: AdapterRegistry;
-  private readonly sessions: SessionRegistry;
-  private readonly idempotency: IdempotencyStore;
-  private readonly buffer: IngestBuffer;
-  private readonly pool: PoolManager;
+  private readonly adapters!: AdapterRegistry;
+  private readonly sessions!: SessionRegistry;
+  private readonly idempotency!: IdempotencyStore;
+  private readonly buffer!: IngestBuffer;
+  private readonly pool!: PoolManager;
 
   /** Per-conversation active correlation, keyed by composite (adapterId, conversationKey). */
   private readonly active = new Map<string, ActiveCorrelation>();
+  /** Serializes ingest decisions for each adapter-scoped conversation. */
+  private readonly inboundChains = new Map<string, Promise<void>>();
+
+  /** Children are wired once even when the pool reuses them across turns. */
+  private readonly wiredChildren = new WeakSet<RpcChild>();
 
   private closed = false;
 
@@ -165,6 +170,12 @@ export class CoreSupervisor {
     this.config = options.config;
     this.now = options.now ?? Date.now;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.uuid = options.uuid ?? (() => randomUUID());
+    this.childFactory = options.childFactory ?? this.defaultChildFactory.bind(this);
+
+    this.adapters = new AdapterRegistry(this.config.adapters);
+    this.sessions = new SessionRegistry({ dbPath: this.config.sessionDbPath });
+    this.idempotency = new IdempotencyStore({ dbPath: this.config.idempotencyDbPath });
     this.buffer = new IngestBuffer({
       engagementWindowMs: this.config.engagementWindowMs,
       now: this.now,
@@ -258,10 +269,45 @@ export class CoreSupervisor {
    * final callback happen asynchronously.
    */
   async processInbound(adapterId: string, message: InboundMessage): Promise<InboundResult> {
-    // 1. Idempotency: begin or classify.
+    const convKey = compositeKey(adapterId, message.conversationKey);
+    const previous = this.inboundChains.get(convKey) ?? Promise.resolve();
+    const run = previous
+      .catch(() => {})
+      .then(() => this.processInboundSerial(adapterId, message));
+    const settled = run.then(
+      () => {},
+      () => {},
+    );
+    this.inboundChains.set(convKey, settled);
+
+    try {
+      return await run;
+    } finally {
+      if (this.inboundChains.get(convKey) === settled) {
+        this.inboundChains.delete(convKey);
+      }
+    }
+  }
+
+  /**
+   * Process one inbound message after earlier work for the same conversation
+   * has settled. This keeps correlation assignment and activation atomic.
+   */
+  private async processInboundSerial(
+    adapterId: string,
+    message: InboundMessage,
+  ): Promise<InboundResult> {
+    // 1. Idempotency: new messages join the active turn correlation.
+    const activeCorrelation = this.active.get(
+      compositeKey(adapterId, message.conversationKey),
+    );
     let beginResult;
     try {
-      beginResult = this.idempotency.beginInbound(adapterId, message);
+      beginResult = this.idempotency.beginInbound(
+        adapterId,
+        message,
+        activeCorrelation?.correlationId,
+      );
     } catch (err) {
       if (err instanceof IdempotencyConflictError) {
         throw new InboundConflictError(adapterId, message.messageId);
@@ -395,28 +441,35 @@ export class CoreSupervisor {
   ): Promise<void> {
     const convKey = compositeKey(adapterId, message.conversationKey);
     let corr = this.active.get(convKey);
+    let createdCorrelation = false;
 
     // One live lease stays held for an active correlation until terminal
     // completion; later arrivals use that child directly, never re-acquire.
     if (!corr) {
       const lease = await this.pool.acquire(adapterId, message.conversationKey);
-      const emitter = this.createEmitter(adapterId, message.conversationKey, correlationId);
+      const messageIds = new Set([message.messageId]);
+      const emitter = this.createEmitter(
+        adapterId,
+        message.conversationKey,
+        correlationId,
+        messageIds,
+      );
       corr = {
         correlationId,
         adapterId,
         conversationKey: message.conversationKey,
-        messageIds: new Set([message.messageId]),
+        messageIds,
         emitter,
         lease,
         pendingFollowUps: 0,
         terminalEmitted: false,
       };
       this.active.set(convKey, corr);
+      createdCorrelation = true;
 
-      // Wire the child event handler to route frames to the emitter.
-      lease.child.onEvent((frame: RpcEventFrame) => {
-        this.handleChildEvent(convKey, frame);
-      });
+      // Route this conversation's child once. Pool reuse must not accumulate
+      // duplicate event listeners across successive correlations.
+      this.wireChild(lease.child, adapterId, message.conversationKey);
     } else {
       // Active correlation: use the existing child directly.
       corr.messageIds.add(message.messageId);
@@ -427,42 +480,56 @@ export class CoreSupervisor {
 
     const child = corr.lease!.child;
 
-    if (mode === "prompt") {
-      // Addressed, non-streaming: send the current message as a normal
-      // RPC prompt. The backlog was already appended as passive messages;
-      // they are in the session history and NOT duplicated in the prompt.
-      const promptText = renderRecord({
-        adapterId,
-        conversationKey: message.conversationKey,
-        messageId: message.messageId,
-        speaker: message.speaker,
-        text: message.text,
-        attachments: message.attachments,
-        addressed: message.addressed,
-        receivedAt: this.now(),
-      });
-      await child.prompt(promptText);
-    } else if (mode === "steer") {
-      // Addressed, streaming: steer the active stream with the current
-      // message. Backlog is in the session history, not duplicated.
-      const promptText = renderRecord({
-        adapterId,
-        conversationKey: message.conversationKey,
-        messageId: message.messageId,
-        speaker: message.speaker,
-        text: message.text,
-        attachments: message.attachments,
-        addressed: message.addressed,
-        receivedAt: this.now(),
-      });
-      await child.prompt(promptText, { streamingBehavior: "steer" });
-    } else {
-      // mode === "followUp": ambient inside the engagement window. Append
-      // the message as a passive agent-attributed follow-up via the ambient
-      // extension with triggerTurn=true. The extension triggers the turn
-      // inside OMP; no separate prompt command is needed.
-      corr.pendingFollowUps++;
-      await this.runAmbientCommand(child, message, true);
+    try {
+      if (mode === "prompt") {
+        // Addressed, non-streaming: send the current message as a normal
+        // RPC prompt. The backlog was already appended as passive messages;
+        // they are in the session history and NOT duplicated in the prompt.
+        const promptText = renderRecord({
+          adapterId,
+          conversationKey: message.conversationKey,
+          messageId: message.messageId,
+          speaker: message.speaker,
+          text: message.text,
+          attachments: message.attachments,
+          addressed: message.addressed,
+          receivedAt: this.now(),
+        });
+        assertRpcSuccess(await child.prompt(promptText), "prompt");
+      } else if (mode === "steer") {
+        // Addressed, streaming: steer the active stream with the current
+        // message. Backlog is in the session history, not duplicated.
+        const promptText = renderRecord({
+          adapterId,
+          conversationKey: message.conversationKey,
+          messageId: message.messageId,
+          speaker: message.speaker,
+          text: message.text,
+          attachments: message.attachments,
+          addressed: message.addressed,
+          receivedAt: this.now(),
+        });
+        assertRpcSuccess(
+          await child.prompt(promptText, { streamingBehavior: "steer" }),
+          "steer",
+        );
+      } else {
+        // mode === "followUp": ambient inside the engagement window. Append
+        // the message as a passive agent-attributed follow-up via the ambient
+        // extension with triggerTurn=true. The extension triggers the turn
+        // inside OMP; no separate prompt command is needed.
+        corr.pendingFollowUps++;
+        await this.runAmbientCommand(child, adapterId, message, true);
+      }
+    } catch (error) {
+      if (mode === "followUp" && corr.pendingFollowUps > 0) {
+        corr.pendingFollowUps--;
+      }
+      corr.messageIds.delete(message.messageId);
+      if (createdCorrelation) {
+        this.cleanupCorrelation(convKey, corr);
+      }
+      throw error;
     }
 
     // Mark ingest complete for this message (the turn has been dispatched).
@@ -485,13 +552,13 @@ export class CoreSupervisor {
     const convKey = compositeKey(adapterId, message.conversationKey);
     const corr = this.active.get(convKey);
     if (corr && corr.lease) {
-      await this.runAmbientCommand(corr.lease.child, message, triggerTurn);
+      await this.runAmbientCommand(corr.lease.child, adapterId, message, triggerTurn);
       return;
     }
     // No active child: acquire a lease just for the append, then release.
     const lease = await this.pool.acquire(adapterId, message.conversationKey);
     try {
-      await this.runAmbientCommand(lease.child, message, triggerTurn);
+      await this.runAmbientCommand(lease.child, adapterId, message, triggerTurn);
     } finally {
       lease.release();
     }
@@ -503,11 +570,12 @@ export class CoreSupervisor {
    */
   private async runAmbientCommand(
     child: RpcChild,
+    adapterId: string,
     message: InboundMessage,
     triggerTurn: boolean,
   ): Promise<void> {
     const content = renderRecord({
-      adapterId: "",
+      adapterId,
       conversationKey: message.conversationKey,
       messageId: message.messageId,
       speaker: message.speaker,
@@ -518,10 +586,54 @@ export class CoreSupervisor {
     });
     const payload = JSON.stringify({ content, triggerTurn });
     const encoded = Buffer.from(payload, "utf8").toString("base64url");
-    await child.send({ type: "command", command: AMBIENT_INGEST_COMMAND, args: encoded });
+    const response = await child.prompt(`/${AMBIENT_INGEST_COMMAND} ${encoded}`);
+    assertRpcSuccess(response, "ambient ingest");
   }
 
   // ---- internals: child event routing ----
+
+  /** Attach stable routing and fatal-process handlers once per pooled child. */
+  private wireChild(
+    child: RpcChild,
+    adapterId: string,
+    conversationKey: string,
+  ): void {
+    if (this.wiredChildren.has(child)) return;
+    this.wiredChildren.add(child);
+    const convKey = compositeKey(adapterId, conversationKey);
+
+    child.onEvent((frame: RpcEventFrame) => {
+      this.handleChildEvent(convKey, frame);
+    });
+    child.on("error", (error: Error) => {
+      console.error(`[rpc child] ${error.message}`);
+      this.failCorrelation(convKey);
+      void child.close().catch((closeError: unknown) => {
+        console.error(
+          `[rpc child close] ${closeError instanceof Error ? closeError.message : String(closeError)}`,
+        );
+      });
+    });
+    child.on("exit", () => {
+      if (!this.closed) {
+        this.pool.forgetExitedChild(adapterId, conversationKey, child);
+      }
+      this.failCorrelation(convKey);
+    });
+  }
+
+  /** Convert an unexpected child failure into one durable, curated terminal. */
+  private failCorrelation(convKey: string): void {
+    const corr = this.active.get(convKey);
+    if (!corr || corr.terminalEmitted) return;
+    corr.terminalEmitted = true;
+    corr.emitter.emitProviderError({
+      code: "agent_unavailable",
+      message: "Agent process stopped before completing the turn",
+      retryable: true,
+    });
+    this.cleanupCorrelation(convKey, corr);
+  }
 
   /**
    * Route a child event frame to the active correlation's OutboundEmitter.
@@ -532,10 +644,17 @@ export class CoreSupervisor {
     const corr = this.active.get(convKey);
     if (!corr) return;
 
+    // A queued ambient follow-up starts another agent turn. Suppress the
+    // preceding agent_end so the emitter produces one terminal event only
+    // after the final queued turn.
+    if (frame.type === "agent_end" && corr.pendingFollowUps > 0) {
+      corr.pendingFollowUps--;
+      return;
+    }
+
     // Route the frame to the emitter for versioned event mapping.
     corr.emitter.ingest(frame);
 
-    // Check for terminal (agent_end) to clean up the correlation.
     if (frame.type === "agent_end") {
       this.handleAgentEnd(convKey, corr);
     }
@@ -553,11 +672,6 @@ export class CoreSupervisor {
    * hooks save/deliver across every message id in the group.
    */
   private handleAgentEnd(convKey: string, corr: ActiveCorrelation): void {
-    if (corr.pendingFollowUps > 0) {
-      // A queued ambient follow-up is still in flight; do not close yet.
-      corr.pendingFollowUps--;
-      return;
-    }
 
     if (corr.terminalEmitted) return;
     corr.terminalEmitted = true;
@@ -568,11 +682,7 @@ export class CoreSupervisor {
 
     // Flush the emitter to ensure the terminal event is persisted and
     // delivery is attempted before we release the lease.
-    corr.emitter.flush().then(() => {
-      this.cleanupCorrelation(convKey, corr);
-    }).catch(() => {
-      this.cleanupCorrelation(convKey, corr);
-    });
+    this.cleanupCorrelation(convKey, corr);
   }
 
   /**
@@ -580,6 +690,9 @@ export class CoreSupervisor {
    * the active state. The emitter is flushed and closed.
    */
   private cleanupCorrelation(convKey: string, corr: ActiveCorrelation): void {
+    if (this.active.get(convKey) === corr) {
+      this.active.delete(convKey);
+    }
     if (corr.lease) {
       corr.lease.release();
       corr.lease = null;
@@ -589,7 +702,6 @@ export class CoreSupervisor {
     }).catch(() => {
       corr.emitter.close();
     });
-    this.active.delete(convKey);
   }
 
   // ---- internals: redelivery ----
@@ -608,13 +720,18 @@ export class CoreSupervisor {
     const convKey = compositeKey(adapterId, message.conversationKey);
     let corr = this.active.get(convKey);
     if (!corr) {
-      // Create a transient emitter just for redelivery.
-      const emitter = this.createEmitter(adapterId, message.conversationKey, beginResult.correlationId);
+      const messageIds = new Set([message.messageId]);
+      const emitter = this.createEmitter(
+        adapterId,
+        message.conversationKey,
+        beginResult.correlationId,
+        messageIds,
+      );
       corr = {
         correlationId: beginResult.correlationId,
         adapterId,
         conversationKey: message.conversationKey,
-        messageIds: new Set([message.messageId]),
+        messageIds,
         emitter,
         lease: null,
         pendingFollowUps: 0,
@@ -630,52 +747,42 @@ export class CoreSupervisor {
     // If this was a transient redelivery correlation with no lease, clean up.
     if (!corr.lease) {
       corr.emitter.close();
-      this.active.delete(convKey);
+      if (this.active.get(convKey) === corr) {
+        this.active.delete(convKey);
+      }
     }
   }
 
   // ---- internals: emitter creation ----
 
   /**
-   * Create an OutboundEmitter for a correlation with durable lifecycle hooks
-   * wired to the idempotency store. The hooks save/mark failure/sent across
-   * every message id in the correlation group. When `messageIds` is provided
-   * (restart recovery), the hooks use that set directly; otherwise they
-   * look up the active correlation to find the current message-id set.
+   * Create an OutboundEmitter whose durable hooks share the correlation's
+   * mutable message-id set. The set remains available after active state is
+   * removed, so callback acknowledgement can still transition every row.
    */
   private createEmitter(
     adapterId: string,
     conversationKey: string,
     correlationId: string,
+    messageIds: Set<string>,
   ): OutboundEmitter {
     return this.createEmitterWithMessages(
       adapterId,
       conversationKey,
       correlationId,
-      null,
+      messageIds,
     );
   }
 
-  /**
-   * Create an OutboundEmitter with an explicit message-id set for restart
-   * recovery. When `fixedMessageIds` is null, the hooks resolve the current
-   * set from the active map (live correlation). When non-null, the hooks use
-   * the fixed set directly (recovery correlation with no active state).
-   */
+  /** Create an emitter with the message-id set used by durable hooks. */
   private createEmitterWithMessages(
     adapterId: string,
     conversationKey: string,
     correlationId: string,
-    fixedMessageIds: Set<string> | null,
+    messageIds: Set<string>,
   ): OutboundEmitter {
-    const convKey = compositeKey(adapterId, conversationKey);
     const supervisor = this;
-
-    const resolveMessageIds = (): Set<string> => {
-      if (fixedMessageIds) return fixedMessageIds;
-      const corr = supervisor.active.get(convKey);
-      return corr ? corr.messageIds : new Set();
-    };
+    const resolveMessageIds = (): Set<string> => messageIds;
 
     return new OutboundEmitter({
       adapterId,
@@ -774,6 +881,7 @@ export class CoreSupervisor {
       registryPath: this.config.childRegistryPath || undefined,
       conversationKey: ctx.registryKey,
     });
+    this.wireChild(child, ctx.adapterId, ctx.conversationKey);
     await child.start();
     // Negotiate protocol v2 for server-side outbound chunking.
     await child.negotiateProtocolV2();
@@ -830,6 +938,13 @@ export function createCoreSupervisor(options: CoreSupervisorOptions): CoreSuperv
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Require an affirmative RPC response before acknowledging ingest. */
+function assertRpcSuccess(response: RpcResponseFrame, operation: string): void {
+  if (!response.success) {
+    throw new Error(`${operation} was rejected by the agent process`);
+  }
+}
 
 /** Composite conversation key (collision-proof, same algorithm as IngestBuffer). */
 function compositeKey(adapterId: string, conversationKey: string): string {

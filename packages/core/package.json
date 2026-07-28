@@ -44,6 +44,16 @@
       "import": "./src/session-registry.ts",
       "default": "./dist/session-registry.js"
     },
+    "./config": {
+      "types": "./src/config.ts",
+      "import": "./src/config.ts",
+      "default": "./dist/config.js"
+    },
+    "./supervisor": {
+      "types": "./src/supervisor.ts",
+      "import": "./src/supervisor.ts",
+      "default": "./dist/supervisor.js"
+    },
     "./outbound-emitter": {
       "types": "./src/outbound-emitter.ts",
       "import": "./src/outbound-emitter.ts",
@@ -64,6 +74,9 @@
       "import": "./src/ambient-ingest-extension.ts",
       "default": "./dist/ambient-ingest-extension.js"
     }
+  },
+  "bin": {
+    "omp-bundler-core": "./src/server.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json"
