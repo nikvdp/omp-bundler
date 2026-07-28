@@ -63,6 +63,7 @@
 
 import type { InboundMessage } from "@omp-bundler/contracts/inbound";
 import type { Speaker, WorkspaceAttachment } from "@omp-bundler/contracts/shared";
+import { conversationStorageKey } from "./adapter-registry.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -153,25 +154,8 @@ export interface ConversationStatus {
 // Composite key
 // ---------------------------------------------------------------------------
 
-/**
- * Collision-free composite key for `(adapterId, conversationKey)`.
- *
- * The encoding is length-prefixed: `${adapterId.length}:${adapterId}${conversationKey}`.
- * This mirrors `AdapterRegistry.storageKey` byte-for-byte (decimal adapterId
- * length, a single colon, raw adapterId, raw conversationKey) so the buffer
- * and the registry address the same conversation row consistently. Main
- * centralizes this single helper after integration; until then it is mirrored
- * here to avoid a cross-module dependency the package manifests wire later.
- *
- * The length prefix makes the split point unambiguous, so two different
- * tuples never collide regardless of the opaque strings' content (e.g.
- * ("ab", "c") and ("a", "bc") map to "2:abc" and "1:abc", distinct). This
- * never concatenates the two values raw, which would be unsafe, and it never
- * parses `conversationKey`.
- */
-export function compositeKey(adapterId: string, conversationKey: string): string {
-  return `${adapterId.length}:${adapterId}${conversationKey}`;
-}
+/** Shared collision-proof key for `(adapterId, conversationKey)`. */
+export const compositeKey = conversationStorageKey;
 
 // ---------------------------------------------------------------------------
 // Rendering

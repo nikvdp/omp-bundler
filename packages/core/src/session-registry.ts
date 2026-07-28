@@ -46,6 +46,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import type { RpcChild, RpcSessionState } from "./rpc-child.js";
+import { conversationStorageKey } from "./adapter-registry.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,10 +56,9 @@ import type { RpcChild, RpcSessionState } from "./rpc-child.js";
 export interface SessionRegistryOptions {
   /**
    * Filesystem path to the SQLite database file. Parent directories are
-   * created if missing. Defaults to `/data/session-registry.sqlite`. Use
-   * `:memory:` for ephemeral, in-memory registries (testing only).
+   * created if missing. Use `:memory:` for ephemeral tests.
    */
-  dbPath?: string;
+  dbPath: string;
 }
 
 /** A single registry row: the mapping record for one conversation. */
@@ -88,7 +88,6 @@ export interface AcquireResult {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_DB_PATH = "/data/session-registry.sqlite";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_registry (
@@ -139,13 +138,8 @@ function rowToRecord(row: Record<string, unknown>): SessionRecord {
   };
 }
 
-/**
- * Build the composite key used by the in-flight creation map and the
- * conversation guard. Namespaces the conversation key by adapter id.
- */
-function conversationKeyOf(adapterId: string, conversationKey: string): string {
-  return `${adapterId}\0${conversationKey}`;
-}
+/** Shared collision-proof key for the in-flight creation map. */
+const conversationKeyOf = conversationStorageKey;
 
 // ---------------------------------------------------------------------------
 // SessionRegistry
@@ -172,8 +166,8 @@ export class SessionRegistry {
    * idempotently. SQLite WAL mode is enabled for concurrent-reader throughput
    * with serialized writers.
    */
-  constructor(options: SessionRegistryOptions = {}) {
-    const dbPath = options.dbPath ?? DEFAULT_DB_PATH;
+  constructor(options: SessionRegistryOptions) {
+    const dbPath = options.dbPath;
 
     if (dbPath !== ":memory:") {
       const slash = dbPath.lastIndexOf("/");

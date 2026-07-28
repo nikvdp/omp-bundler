@@ -324,6 +324,19 @@ export class AdapterRegistry {
     return SIGNATURE_PREFIX + hmac.digest("hex");
   }
 
+/**
+ * Collision-proof key for the adapter-scoped conversation tuple.
+ *
+ * The decimal length prefix fixes the split point even when either opaque
+ * value contains colons, NULs, slashes, or newlines.
+ */
+export function conversationStorageKey(
+  adapterId: string,
+  conversationKey: string,
+): string {
+  return `${adapterId.length}:${adapterId}${conversationKey}`;
+}
+
   /**
    * Return a collision-proof identity/storage key for a conversation from the
    * tuple (adapterId, conversationKey) using a length-prefixed, delimiter-free
@@ -346,9 +359,7 @@ export class AdapterRegistry {
    * core uses for all per-conversation storage so that two adapters using the
    * same conversationKey never collide.
    */
-  static storageKey(adapterId: string, conversationKey: string): string {
-    return `${adapterId.length}:` + adapterId + conversationKey;
-  }
+  static storageKey = conversationStorageKey;
 
   /**
    * Snapshot of all registered adapters as secret-free descriptors, in

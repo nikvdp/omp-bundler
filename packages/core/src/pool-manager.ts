@@ -26,6 +26,7 @@
  * swallowed.
  */
 import { randomUUID } from "node:crypto";
+import { conversationStorageKey } from "./adapter-registry.js";
 import type { RpcChild } from "./rpc-child.js";
 import {
   type SessionRegistry,
@@ -44,7 +45,7 @@ export interface ChildFactoryContext {
   adapterId: string;
   conversationKey: string;
   /**
-   * The composite registry key (`adapterId\0conversationKey`). Stable across
+   * The collision-proof adapter-scoped conversation key. Stable across
    * revivals; the supervisor can use it as a deterministic reaper identifier.
    */
   registryKey: string;
@@ -1232,6 +1233,4 @@ export class PoolManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function conversationIdOf(adapterId: string, conversationKey: string): string {
-  return `${adapterId}\0${conversationKey}`;
-}
+const conversationIdOf = conversationStorageKey;
