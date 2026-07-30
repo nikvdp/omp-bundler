@@ -1143,15 +1143,15 @@ export interface ChildSpawnPlan {
  * legacy values straight from `config` so behavior is unchanged for adapters
  * that are not bound to an agent.
  *
- * When `registration.agentId` is present, the matching entry in
- * `config.agents` is consulted. If no entry exists or `config.agentsRootDir`
- * is null, this throws naming both the adapterId and agentId: `loadCoreConfig`
- * normally guarantees these invariants, so reaching this branch indicates a
- * misconfiguration that must surface loudly rather than silently falling back
- * to the shared workspace. Otherwise the per-agent workspace is
- * `join(config.agentsRootDir, agent.agentId)`, the model falls back to
- * `config.ompModel` when the agent pins none, and the args fall back to
- * `config.ompArgs` when the agent overrides none.
+ * When `registration.agentId` is present, the per-agent workspace is
+ * `join(config.agentsRootDir, agentId)` and the model/args come straight from
+ * the global `config` baseline. Per-agent model and args overrides live in
+ * the agent folder's own `.omp/config.yml`, which OMP reads via cwd discovery,
+ * so core passes only the global baseline here. Throws when
+ * `config.agentsRootDir` is null; `loadCoreConfig` normally guarantees it is
+ * set whenever an adapter binds an agentId, so reaching that branch indicates
+ * a misconfiguration that must surface loudly rather than silently falling
+ * back to the shared workspace.
  */
 export function resolveChildSpawnPlan(
   config: CoreConfig,
@@ -1164,16 +1164,14 @@ export function resolveChildSpawnPlan(
       args: config.ompArgs,
     };
   }
-  const agentId = registration.agentId;
-  const agent = config.agents.find((a) => a.agentId === agentId);
-  if (agent === undefined || config.agentsRootDir === null) {
+  if (config.agentsRootDir === null) {
     throw new Error(
-      `adapter "${registration.adapterId}" is bound to agent "${agentId}" but no matching agent entry or agentsRootDir is configured`,
+      `adapter "${registration.adapterId}" is bound to agent "${registration.agentId}" but OMP_AGENTS_ROOT is not set`,
     );
   }
   return {
-    cwd: join(config.agentsRootDir, agent.agentId),
-    model: agent.model ?? config.ompModel,
-    args: agent.args.length > 0 ? agent.args : config.ompArgs,
+    cwd: join(config.agentsRootDir, registration.agentId),
+    model: config.ompModel,
+    args: config.ompArgs,
   };
 }
