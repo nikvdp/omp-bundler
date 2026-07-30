@@ -14,6 +14,13 @@
  * .dockerignore plus the build/, packages/contracts/, packages/core/,
  * packages/pumble-adapter/, and entrypoint/ trees.
  *
+ * With --agents <dir>, each subdirectory's .omp/ is validated and
+ * staged to agents/<agentId>/.omp so the image bakes per-agent
+ * personalities at /agents/<agentId>/.omp/. The agents/ context
+ * directory is always created (empty when --agents is absent) so the
+ * Dockerfile COPY is unconditional. Only the .omp subtree is staged;
+ * sibling working files in the agent folder are untouched.
+ *
  * Catalog structural validation is reused from build/render-models.ts
  * (exported `validate`) so the build script and the container-time
  * renderer enforce the same surface; no duplicate catalog validator.
@@ -24,7 +31,7 @@
  * This script never prints secrets, build args, or env values.
  *
  * Usage:
- *   bun build/build-image.ts <agent-folder-path> <local-image-tag>
+ *   bun build/build-image.ts <agent-folder-path> <local-image-tag> [--agents <dir>]
  *
  * No external dependencies. Runs on Bun's built-in YAML parser and
  * node:fs/promises.
@@ -50,15 +57,16 @@ import { expand, validate } from "./render-models";
 
 // ── arg parsing ────────────────────────────────────────────────────────
 
-type Args = { folder: string; tag: string };
+type Args = { folder: string; tag: string; agentsDir: string | null };
 
 const USAGE = [
-  "usage: bun build/build-image.ts <agent-folder-path> <local-image-tag>",
+  "usage: bun build/build-image.ts <agent-folder-path> <local-image-tag> [--agents <dir>]",
   "Stages an ephemeral Docker context from <agent-folder-path> (copied as",
   "template/) plus the repo build/, packages/contracts/, packages/core/,",
   "packages/pumble-adapter/, and entrypoint/ trees, then runs `docker build",
   "-t <tag> <context>`. Validates required folder surfaces and the",
-  "models.yml.tmpl catalog before invoking Docker.",
+  "models.yml.tmpl catalog before invoking Docker. When --agents <dir> is",
+  "given, each subdirectory's .omp/ is validated and staged to agents/<id>/.omp.",
 ].join("\n");
 
 function fail(msg: string): never {
@@ -67,20 +75,43 @@ function fail(msg: string): never {
 }
 
 function parseArgs(argv: string[]): Args {
-  if (argv.length !== 2) {
+  // Accept exactly two positionals plus an optional trailing --agents <dir>.
+  // Any other flag, any other count, is rejected: the build surface stays
+  // predictable and no silent flag-guessing creeps in.
+  const positionals: string[] = [];
+  let agentsDir: string | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--agents") {
+      if (agentsDir !== null) {
+        console.error(USAGE);
+        fail("duplicate --agents flag");
+      }
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("-")) {
+        console.error(USAGE);
+        fail("--agents requires a directory argument");
+      }
+      agentsDir = next;
+      i++;
+      continue;
+    }
+    if (a.startsWith("-")) {
+      console.error(USAGE);
+      fail(
+        `unknown flag '${a}'; expected <agent-folder-path> <local-image-tag> [--agents <dir>]`,
+      );
+    }
+    positionals.push(a);
+  }
+  if (positionals.length !== 2) {
     console.error(USAGE);
     fail(
-      `expected exactly two arguments: <agent-folder-path> <local-image-tag>, got ${argv.length}`,
+      `expected exactly two positional arguments: <agent-folder-path> <local-image-tag>, got ${positionals.length}`,
     );
   }
-  const [folder, tag] = argv;
-  if (folder.startsWith("-") || tag.startsWith("-")) {
-    console.error(USAGE);
-    fail(
-      "arguments must not be flags; expected <agent-folder-path> <local-image-tag>",
-    );
-  }
-  return { folder, tag };
+  const [folder, tag] = positionals;
+  return { folder, tag, agentsDir };
 }
 
 // The agent folder is installed as $HOME/.omp/agent in the image, so
@@ -113,6 +144,36 @@ const RUNTIME_TREES = [
   "entrypoint",
 ] as const;
 const RUNTIME_IGNORED_DIRS = new Set(["node_modules", "dist"]);
+
+// Agent identities are baked at /agents/<agentId>/.omp/ in the image and
+// seeded to /data/agents/<agentId>/.omp at boot. The agentId is the folder
+// name and must match this regex everywhere OMP_AGENTS is consumed.
+const AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+// Entries allowed inside an agent's .omp/ directory. These are the only
+// per-agent discovery surfaces; anything else is rejected by name so a
+// stray file never impersonates a surface. Shared catalog and state are
+// global-only (live in template/ or /data), never per-agent.
+const AGENT_OMP_ALLOWED: Record<string, true> = {
+  "AGENTS.md": true,
+  "config.yml": true,
+  "settings.json": true,
+  agents: true,
+  commands: true,
+  extensions: true,
+  skills: true,
+  tools: true,
+};
+
+// Names rejected inside an agent's .omp/ because they are global-only:
+// the model catalog is shared (models.yml / models.yml.tmpl), session
+// history is shared, and agent.db* is shared per-agent-process state.
+const AGENT_OMP_GLOBAL_ONLY = [
+  "models.yml",
+  "models.yml.tmpl",
+  "sessions",
+] as const;
+const AGENT_DB = /^agent\.db.*$/;
 
 // An apiKey must be exactly one ${VALID_NAME} placeholder and nothing
 // else: no literal secrets, no shell expansions, no partial embeddings.
@@ -319,6 +380,110 @@ async function stageContext(repoRoot: string, folder: string): Promise<string> {
   return ctx;
 }
 
+// ── per-agent .omp staging ─────────────────────────────────────────────
+
+/**
+ * Validate and stage agent identity folders from --agents <dir> into the
+ * ephemeral context at agents/<agentId>/.omp. The agents/ directory is
+ * ALWAYS created (empty when --agents is absent) so the Dockerfile COPY
+ * is unconditional.
+ *
+ * For each subdirectory of <dir> (plain files are ignored):
+ *   - name must match the agentId regex;
+ *   - must contain a .omp directory;
+ *   - the agent folder is symlink-checked (RUNTIME_IGNORED_DIRS);
+ *   - inside .omp, only the whitelisted per-agent surfaces are allowed;
+ *     models.yml(.tmpl), sessions, and agent.db* are rejected as
+ *     global-only.
+ * Only the .omp subtree is staged; sibling working files are untouched.
+ */
+async function stageAgents(ctx: string, agentsDir: string | null): Promise<void> {
+  const agentsRoot = join(ctx, "agents");
+  await mkdir(agentsRoot, { recursive: true });
+  if (agentsDir === null) return;
+
+  let entries: string[];
+  try {
+    entries = await readdir(agentsDir);
+  } catch (e) {
+    if (isEnoent(e)) fail(`--agents directory not found: ${agentsDir}`);
+    fail(`cannot read --agents directory '${agentsDir}': ${(e as Error).message}`);
+  }
+
+  for (const name of entries) {
+    const agentPath = join(agentsDir, name);
+    let s: Stats;
+    try {
+      s = await lstat(agentPath);
+    } catch (e) {
+      if (isEnoent(e)) continue; // raced away; skip
+      fail(`cannot inspect --agents entry '${agentPath}': ${(e as Error).message}`);
+    }
+    // Plain files are ignored: only subdirectories are agent identities.
+    if (!s.isDirectory()) continue;
+
+    if (!AGENT_ID.test(name)) {
+      fail(
+        `--agents: invalid agent id '${name}' (must match ^[a-z0-9][a-z0-9_-]{0,63}$)`,
+      );
+    }
+
+    const ompPath = join(agentPath, ".omp");
+    let ompStat: Stats;
+    try {
+      ompStat = await stat(ompPath);
+    } catch (e) {
+      if (isEnoent(e)) {
+        fail(`--agents: agent '${name}' is missing a .omp directory (${ompPath})`);
+      }
+      fail(`cannot stat agent .omp '${ompPath}': ${(e as Error).message}`);
+    }
+    if (!ompStat.isDirectory()) {
+      fail(`--agents: agent '${name}' .omp is not a directory: ${ompPath}`);
+    }
+
+    // Symlink-check the whole agent folder (respecting ignored dirs) so
+    // Docker never receives a link from staged agent input.
+    try {
+      await assertNoSymlinks(agentPath, RUNTIME_IGNORED_DIRS);
+    } catch (e) {
+      fail(`--agents: agent '${name}': ${(e as Error).message}`);
+    }
+
+    // Whitelist the .omp contents by name. Global-only surfaces and any
+    // unknown name are rejected with a clear error.
+    let ompEntries: string[];
+    try {
+      ompEntries = await readdir(ompPath);
+    } catch (e) {
+      fail(`cannot read agent .omp '${ompPath}': ${(e as Error).message}`);
+    }
+    for (const entry of ompEntries) {
+      if ((AGENT_OMP_GLOBAL_ONLY as readonly string[]).includes(entry)) {
+        fail(
+          `--agents: agent '${name}': '${entry}' is global-only and not allowed inside an agent .omp (lives in the shared template/)`,
+        );
+      }
+      if (AGENT_DB.test(entry)) {
+        fail(
+          `--agents: agent '${name}': '${entry}' is global-only state (agent.db*) and not allowed inside an agent .omp`,
+        );
+      }
+      if (!AGENT_OMP_ALLOWED[entry]) {
+        fail(
+          `--agents: agent '${name}': '.omp/${entry}' is not an allowed agent surface; allowed: ${Object.keys(AGENT_OMP_ALLOWED).join(", ")}`,
+        );
+      }
+    }
+
+    // Stage ONLY the .omp subtree. dereference:false preserves on-disk
+    // shape; assertNoSymlinks already guaranteed no links are present.
+    const dest = join(agentsRoot, name, ".omp");
+    await mkdir(join(agentsRoot, name), { recursive: true });
+    await cp(ompPath, dest, { recursive: true, dereference: false });
+  }
+}
+
 // ── docker build ───────────────────────────────────────────────────────
 
 /**
@@ -339,7 +504,7 @@ function dockerBuild(tag: string, context: string): Promise<number> {
 // ── main ────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const { folder, tag } = parseArgs(process.argv.slice(2));
+  const { folder, tag, agentsDir } = parseArgs(process.argv.slice(2));
 
   if (!tag) fail("local image tag must be non-empty");
 
@@ -359,6 +524,23 @@ async function main(): Promise<void> {
   }
   await assertFolder(folderAbs);
   await assertRequiredFiles(folderAbs);
+
+  // Resolve --agents dir the same way as the agent folder: realpath to
+  // absolute, falling back to the raw path on ENOENT so stageAgents can
+  // name it. null means --agents was not given.
+  let agentsDirAbs: string | null = null;
+  if (agentsDir !== null) {
+    try {
+      agentsDirAbs = await realpath(agentsDir);
+    } catch (e) {
+      if (!isEnoent(e)) {
+        fail(
+          `cannot resolve --agents path '${agentsDir}': ${(e as Error).message}`,
+        );
+      }
+      agentsDirAbs = agentsDir;
+    }
+  }
 
   // Validate the catalog surface before touching Docker.
   const tmplText = await Bun.file(join(folderAbs, "models.yml.tmpl")).text();
@@ -390,6 +572,7 @@ async function main(): Promise<void> {
   let buildError: string | null = null;
   try {
     ctx = await stageContext(repoRoot, folderAbs);
+    await stageAgents(ctx, agentsDirAbs);
     console.error(`build-image: staged context at ${ctx}`);
     console.error(`build-image: docker build -t ${tag} <context>`);
     dockerCode = await dockerBuild(tag, ctx);
