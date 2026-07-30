@@ -24,6 +24,18 @@ export interface AdapterConfigEntry {
   adapterId: string;
   callbackUrl: string;
   sharedSecret: string;
+  /** Optional agent id; must reference a declared agent in `agents`. */
+  agentId?: string;
+}
+
+/** Declarative agent identity as it appears in the OMP_AGENTS JSON env var. */
+export interface AgentConfigEntry {
+  /** Agent id matching /^[a-z0-9][a-z0-9_-]{0,63}$/; unique across entries. */
+  agentId: string;
+  /** Pinned model id, or null when not pinned. */
+  model: string | null;
+  /** Extra args appended after the agent's model on child spawn. */
+  args: string[];
 }
 
 /** Validated, immutable supervisor configuration. */
@@ -64,6 +76,10 @@ export interface CoreConfig {
   retryDelaysMs: number[];
   /** Declarative adapter registrations. */
   adapters: AdapterRegistration[];
+  /** Declarative agent identities (OMP_AGENTS), empty when unset. */
+  agents: AgentConfigEntry[];
+  /** Root directory holding per-agent workspaces (OMP_AGENTS_ROOT), null when unset. */
+  agentsRootDir: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +124,16 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
   );
   const retryDelaysMs = parseRetryDelays(env.OMP_RETRY_DELAYS_MS);
 
-  const adapters = parseAdapters(env.OMP_ADAPTERS);
+  const agents = parseAgents(env.OMP_AGENTS);
+  const knownAgentIds = new Set(agents.map((a) => a.agentId));
+  const adapters = parseAdapters(env.OMP_ADAPTERS, knownAgentIds);
+
+  const agentsRootDir = env.OMP_AGENTS_ROOT?.trim() || null;
+  if (agents.length > 0 && agentsRootDir === null) {
+    throw new Error(
+      "OMP_AGENTS_ROOT is required when OMP_AGENTS is non-empty",
+    );
+  }
 
   return {
     host,
@@ -129,6 +154,8 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
     progressThresholdMs,
     retryDelaysMs,
     adapters,
+    agents,
+    agentsRootDir,
   };
 }
 
@@ -162,13 +189,22 @@ export function safeDescribe(config: CoreConfig): Record<string, unknown> {
     adapters: config.adapters.map((a) => ({
       adapterId: a.adapterId,
       callbackUrl: a.callbackUrl,
+      agentId: a.agentId ?? null,
     })),
+    agents: config.agents.map((a) => a.agentId),
+    agentsRootDir: config.agentsRootDir,
   };
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Agent id validation regex: lowercase alphanumerics, underscores, hyphens;
+ * must start with a letter or digit; 1-64 chars total.
+ */
+const AGENT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function required(env: CoreConfigEnv, key: string): string {
   const v = env[key]?.trim();
@@ -237,10 +273,16 @@ function parseRetryDelays(raw: string | undefined): number[] {
 
 /**
  * Parse the declarative adapter registrations from a JSON env var.
- * The JSON must be an array of {adapterId, callbackUrl, sharedSecret}.
- * Secrets are validated for non-emptiness but never logged.
+ * The JSON must be an array of {adapterId, callbackUrl, sharedSecret, agentId?}.
+ * Secrets are validated for non-emptiness but never logged. When an entry has
+ * `agentId`, it must match the agent id regex and reference a declared agent in
+ * `knownAgentIds`, else an Error naming OMP_ADAPTERS and the unknown id is
+ * thrown.
  */
-function parseAdapters(raw: string | undefined): AdapterRegistration[] {
+function parseAdapters(
+  raw: string | undefined,
+  knownAgentIds: Set<string>,
+): AdapterRegistration[] {
   const trimmed = raw?.trim();
   if (!trimmed) {
     throw new Error(
@@ -270,7 +312,31 @@ function parseAdapters(raw: string | undefined): AdapterRegistration[] {
     const adapterId = strField(r, "adapterId", i);
     const callbackUrl = strField(r, "callbackUrl", i);
     const sharedSecret = strField(r, "sharedSecret", i);
-    entries.push({ adapterId, callbackUrl, sharedSecret });
+    const registration: AdapterRegistration = {
+      adapterId,
+      callbackUrl,
+      sharedSecret,
+    };
+    if (r.agentId !== undefined) {
+      const agentId = r.agentId;
+      if (typeof agentId !== "string" || agentId.length === 0) {
+        throw new Error(
+          `OMP_ADAPTERS[${i}].agentId must be a non-empty string`,
+        );
+      }
+      if (!AGENT_ID_RE.test(agentId)) {
+        throw new Error(
+          `OMP_ADAPTERS[${i}].agentId "${agentId}" must match /^[a-z0-9][a-z0-9_-]{0,63}$/`,
+        );
+      }
+      if (!knownAgentIds.has(agentId)) {
+        throw new Error(
+          `OMP_ADAPTERS[${i}].agentId "${agentId}" does not match any declared OMP_AGENTS entry`,
+        );
+      }
+      registration.agentId = agentId;
+    }
+    entries.push(registration);
   }
   return entries;
 }
@@ -287,6 +353,82 @@ function strField(
     );
   }
   return v;
+}
+
+/**
+ * Parse the declarative agent identities from the OMP_AGENTS JSON env var.
+ * The JSON must be an array of {agentId, model?, args?}. agentId is required
+ * and must match {@link AGENT_ID_RE}; duplicate agentIds are rejected. model
+ * is an optional string (trimmed; empty/absent becomes null). args is an
+ * optional array of non-empty strings (absent becomes []). Returns [] when
+ * OMP_AGENTS is unset or empty.
+ */
+function parseAgents(raw: string | undefined): AgentConfigEntry[] {
+  const trimmed = raw?.trim();
+  if (!trimmed) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(
+      `OMP_AGENTS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("OMP_AGENTS must be a JSON array of agent declarations");
+  }
+  const entries: AgentConfigEntry[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < parsed.length; i++) {
+    const entry = parsed[i];
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`OMP_AGENTS[${i}] must be an object`);
+    }
+    const r = entry as Record<string, unknown>;
+    const agentId = r.agentId;
+    if (typeof agentId !== "string" || agentId.length === 0) {
+      throw new Error(
+        `OMP_AGENTS[${i}].agentId must be a non-empty string`,
+      );
+    }
+    if (!AGENT_ID_RE.test(agentId)) {
+      throw new Error(
+        `OMP_AGENTS[${i}].agentId "${agentId}" must match /^[a-z0-9][a-z0-9_-]{0,63}$/`,
+      );
+    }
+    if (seen.has(agentId)) {
+      throw new Error(`OMP_AGENTS[${i}].agentId "${agentId}" is a duplicate`);
+    }
+    seen.add(agentId);
+
+    let model: string | null = null;
+    if (r.model !== undefined) {
+      if (typeof r.model !== "string") {
+        throw new Error(`OMP_AGENTS[${i}].model must be a string`);
+      }
+      const trimmedModel = r.model.trim();
+      model = trimmedModel.length > 0 ? trimmedModel : null;
+    }
+
+    let args: string[] = [];
+    if (r.args !== undefined) {
+      if (!Array.isArray(r.args)) {
+        throw new Error(`OMP_AGENTS[${i}].args must be an array of strings`);
+      }
+      for (let j = 0; j < r.args.length; j++) {
+        const a = r.args[j];
+        if (typeof a !== "string" || a.length === 0) {
+          throw new Error(
+            `OMP_AGENTS[${i}].args[${j}] must be a non-empty string`,
+          );
+        }
+      }
+      args = r.args as string[];
+    }
+
+    entries.push({ agentId, model, args });
+  }
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +465,8 @@ export function testConfig(overrides: Partial<CoreConfig> = {}): CoreConfig {
         sharedSecret: randomUUID(),
       },
     ],
+    agents: [],
+    agentsRootDir: null,
   };
   return { ...base, ...overrides };
 }

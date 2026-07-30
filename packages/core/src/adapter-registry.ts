@@ -72,7 +72,8 @@ export { OUTBOUND_EVENT_SIGNATURE_HEADER };
 
 /**
  * A single declarative adapter registration supplied to the registry
- * constructor. All three fields are required and validated.
+ * constructor. adapterId/callbackUrl/sharedSecret are required and validated;
+ * agentId is optional and, when present, binds the adapter to a declared agent.
  */
 export interface AdapterRegistration {
   /** Non-empty, unique adapter id (route scoped). */
@@ -81,6 +82,8 @@ export interface AdapterRegistration {
   callbackUrl: string;
   /** Non-empty shared secret for inbound auth and outbound signing. */
   sharedSecret: string;
+  /** Optional agent id this adapter is bound to, or undefined when unbound. */
+  agentId?: string;
 }
 
 /** Secret-free projection of a registration, as returned by listAdapters. */
@@ -224,7 +227,7 @@ export class AdapterRegistry {
         );
       }
 
-      const { adapterId, callbackUrl, sharedSecret } = entry;
+      const { adapterId, callbackUrl, sharedSecret, agentId } = entry;
 
       if (typeof adapterId !== "string" || adapterId.length === 0) {
         throw new AdapterRegistrationError(
@@ -259,6 +262,7 @@ export class AdapterRegistry {
         adapterId,
         callbackUrl,
         sharedSecret,
+        agentId,
       });
       map.set(adapterId, frozen);
     }
@@ -283,6 +287,16 @@ export class AdapterRegistry {
   getCallbackUrl(adapterId: string): string {
     const entry = this.require(adapterId);
     return entry.callbackUrl;
+  }
+
+  /**
+   * Return the full (frozen) registration for an adapter, including its
+   * optional `agentId`. Throws {@link UnknownAdapterError} if the adapter is
+   * not registered. The returned object is the internal frozen record; it must
+   * not be mutated.
+   */
+  get(adapterId: string): Readonly<AdapterRegistration> {
+    return this.require(adapterId);
   }
 
   /**
