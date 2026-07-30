@@ -31,10 +31,21 @@
  */
 
 import { spawn } from "node:child_process";
-import { access, copyFile, cp, lstat, mkdir, mkdtemp, readdir, realpath, rm, stat } from "node:fs/promises";
+import {
+  access,
+  copyFile,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  realpath,
+  rm,
+  stat,
+} from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { expand, validate } from "./render-models";
 
 // ── arg parsing ────────────────────────────────────────────────────────
@@ -65,7 +76,9 @@ function parseArgs(argv: string[]): Args {
   const [folder, tag] = argv;
   if (folder.startsWith("-") || tag.startsWith("-")) {
     console.error(USAGE);
-    fail("arguments must not be flags; expected <agent-folder-path> <local-image-tag>");
+    fail(
+      "arguments must not be flags; expected <agent-folder-path> <local-image-tag>",
+    );
   }
   return { folder, tag };
 }
@@ -80,7 +93,13 @@ const REQUIRED_FILES = ["AGENTS.md", "config.yml", "models.yml.tmpl"] as const;
 // surface. Whitelisting (not whole-folder copy) keeps local state out
 // of the image: rendered models.yml, agent.db, sessions, caches, and
 // credentials never reach the context.
-const OPTIONAL_DIRS = ["agents", "commands", "extensions", "skills", "tools"] as const;
+const OPTIONAL_DIRS = [
+  "agents",
+  "commands",
+  "extensions",
+  "skills",
+  "tools",
+] as const;
 
 // Root files Docker needs at the context root to build.
 const ROOT_FILES = ["Dockerfile", ".dockerignore"] as const;
@@ -93,6 +112,7 @@ const RUNTIME_TREES = [
   "packages/pumble-adapter",
   "entrypoint",
 ] as const;
+const RUNTIME_IGNORED_DIRS = new Set(["node_modules", "dist"]);
 
 // An apiKey must be exactly one ${VALID_NAME} placeholder and nothing
 // else: no literal secrets, no shell expansions, no partial embeddings.
@@ -106,14 +126,18 @@ function isEnoent(e: unknown): boolean {
 
 // Docker must never receive a symlink from staged input. lstat and readdir
 // inspect each directory entry without resolving it first.
-async function assertNoSymlinks(path: string): Promise<Stats> {
+async function assertNoSymlinks(
+  path: string,
+  ignoredDirectoryNames: ReadonlySet<string> = new Set(),
+): Promise<Stats> {
   const s = await lstat(path);
   if (s.isSymbolicLink()) {
     throw new Error(`refusing to stage symlink: ${path}`);
   }
   if (s.isDirectory()) {
     for (const entry of await readdir(path)) {
-      await assertNoSymlinks(join(path, entry));
+      if (ignoredDirectoryNames.has(entry)) continue;
+      await assertNoSymlinks(join(path, entry), ignoredDirectoryNames);
     }
   }
   return s;
@@ -154,7 +178,10 @@ async function assertRequiredFiles(folder: string): Promise<void> {
 // ── catalog + apiKey validation (reuses render-models exports) ─────────
 
 type Provider = { apiKey?: unknown; models?: unknown; [k: string]: unknown };
-type Catalog = { providers?: Record<string, Provider> | null; [k: string]: unknown };
+type Catalog = {
+  providers?: Record<string, Provider> | null;
+  [k: string]: unknown;
+};
 
 /**
  * Validate the models.yml.tmpl catalog surface *before* Docker is
@@ -211,10 +238,7 @@ function validateCatalog(tmplText: string): string[] {
 
 // ── ephemeral context staging ──────────────────────────────────────────
 
-async function stageContext(
-  repoRoot: string,
-  folder: string,
-): Promise<string> {
+async function stageContext(repoRoot: string, folder: string): Promise<string> {
   const ctx = await mkdtemp(join(tmpdir(), "omp-bundler-build-"));
   const tmplDir = join(ctx, "template");
   try {
@@ -237,7 +261,9 @@ async function stageContext(
         s = await assertNoSymlinks(src);
       } catch (e) {
         if (!isEnoent(e)) {
-          throw new Error(`cannot inspect optional dir '${src}': ${(e as Error).message}`);
+          throw new Error(
+            `cannot inspect optional dir '${src}': ${(e as Error).message}`,
+          );
         }
         continue; // optional, absent is fine
       }
@@ -259,7 +285,9 @@ async function stageContext(
         await access(src);
       } catch (e) {
         if (isEnoent(e)) throw new Error(`repo root file not found: ${name}`);
-        throw new Error(`cannot access repo root file '${src}': ${(e as Error).message}`);
+        throw new Error(
+          `cannot access repo root file '${src}': ${(e as Error).message}`,
+        );
       }
       await copyFile(src, join(ctx, name));
     }
@@ -269,14 +297,19 @@ async function stageContext(
     for (const tree of RUNTIME_TREES) {
       const src = join(repoRoot, tree);
       try {
-        await assertNoSymlinks(src);
+        await assertNoSymlinks(src, RUNTIME_IGNORED_DIRS);
       } catch (e) {
-        if (isEnoent(e)) throw new Error(`repo runtime tree not found: ${tree}`);
-        throw new Error(`cannot inspect repo runtime tree '${src}': ${(e as Error).message}`);
+        if (isEnoent(e))
+          throw new Error(`repo runtime tree not found: ${tree}`);
+        throw new Error(
+          `cannot inspect repo runtime tree '${src}': ${(e as Error).message}`,
+        );
       }
       await cp(src, join(ctx, tree), {
         recursive: true,
-        dereference: true,
+        dereference: false,
+        filter: (candidate) =>
+          candidate === src || !RUNTIME_IGNORED_DIRS.has(basename(candidate)),
       });
     }
   } catch (e) {
@@ -318,7 +351,9 @@ async function main(): Promise<void> {
     folderAbs = await realpath(folder);
   } catch (e) {
     if (!isEnoent(e)) {
-      fail(`cannot resolve agent folder path '${folder}': ${(e as Error).message}`);
+      fail(
+        `cannot resolve agent folder path '${folder}': ${(e as Error).message}`,
+      );
     }
     folderAbs = folder;
   }
@@ -338,9 +373,7 @@ async function main(): Promise<void> {
   const { survivors } = expand(tmplText);
   const catalogErrors = validateCatalog(tmplText);
   const allErrors = [
-    ...survivors.map(
-      (t) => `unresolved placeholder '${t}' in models.yml.tmpl`,
-    ),
+    ...survivors.map((t) => `unresolved placeholder '${t}' in models.yml.tmpl`),
     ...catalogErrors,
   ];
   if (allErrors.length > 0) {
