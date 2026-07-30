@@ -226,6 +226,4 @@ export type OutboundEvent =
   | PresenceChangedEvent
   | TurnErrorEvent;
 
-export {
-  ADAPTER_API_VERSION,
-};
+export { ADAPTER_API_VERSION };

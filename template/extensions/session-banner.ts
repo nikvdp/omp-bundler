@@ -10,7 +10,8 @@ export default function sessionBanner(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-folder-status", {
-    description: "Report that this session is running from the agent-folder sample",
+    description:
+      "Report that this session is running from the agent-folder sample",
     handler: async (_args, ctx) => {
       ctx.ui.notify(`agent folder active, cwd=${ctx.cwd}`, "info");
     },

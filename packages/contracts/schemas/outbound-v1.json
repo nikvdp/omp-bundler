@@ -83,7 +83,15 @@
       "description": "A turn begins for a correlation. Delivered at-least-once. Always precedes turn.reply or turn.error for the same correlationId in a gap-free delivery.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt"],
+      "required": [
+        "version",
+        "type",
+        "eventId",
+        "conversationKey",
+        "correlationId",
+        "sequence",
+        "occurredAt"
+      ],
       "properties": {
         "version": { "$ref": "#/$defs/adapterApiVersion" },
         "type": { "const": "turn.started" },
@@ -99,7 +107,16 @@
       "description": "Best-effort progress notification carrying a human-readable message. May be dropped or coalesce; a drop creates a sequence gap that the adapter MUST tolerate. Never terminal.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "message"],
+      "required": [
+        "version",
+        "type",
+        "eventId",
+        "conversationKey",
+        "correlationId",
+        "sequence",
+        "occurredAt",
+        "message"
+      ],
       "properties": {
         "version": { "$ref": "#/$defs/adapterApiVersion" },
         "type": { "const": "turn.progress" },
@@ -120,7 +137,18 @@
       "description": "Terminal event carrying the completed turn reply. Delivered at-least-once. Attachments are workspace-relative POSIX paths; bytes are never inlined. Its arrival closes the turn regardless of dropped progress. Both text and attachments are always present; the pair (empty text, empty attachments) is invalid.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "text", "attachments", "usage"],
+      "required": [
+        "version",
+        "type",
+        "eventId",
+        "conversationKey",
+        "correlationId",
+        "sequence",
+        "occurredAt",
+        "text",
+        "attachments",
+        "usage"
+      ],
       "allOf": [
         {
           "description": "Reject a reply where text is empty and attachments is empty.",
@@ -163,7 +191,16 @@
       "description": "Presence change of the core agent within a conversation. Delivered at-least-once.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "presence"],
+      "required": [
+        "version",
+        "type",
+        "eventId",
+        "conversationKey",
+        "correlationId",
+        "sequence",
+        "occurredAt",
+        "presence"
+      ],
       "properties": {
         "version": { "$ref": "#/$defs/adapterApiVersion" },
         "type": { "const": "presence.changed" },
@@ -183,7 +220,18 @@
       "description": "Terminal error for a correlation. Delivered at-least-once. Its arrival closes the turn; the adapter MUST NOT expect a subsequent turn.reply for the same correlationId.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "type", "eventId", "conversationKey", "correlationId", "sequence", "occurredAt", "code", "message", "retryable"],
+      "required": [
+        "version",
+        "type",
+        "eventId",
+        "conversationKey",
+        "correlationId",
+        "sequence",
+        "occurredAt",
+        "code",
+        "message",
+        "retryable"
+      ],
       "properties": {
         "version": { "$ref": "#/$defs/adapterApiVersion" },
         "type": { "const": "turn.error" },

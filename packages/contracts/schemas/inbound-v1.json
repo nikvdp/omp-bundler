@@ -5,7 +5,14 @@
   "description": "Request body for POST /v1/adapters/{adapterId}/messages. adapterId is supplied by the route and is not duplicated in payloads. conversationKey is opaque and stable within that adapter namespace. Idempotency key is (adapterId, messageId): first acceptance returns HTTP 202 status 'accepted'; identical replay returns HTTP 200 status 'duplicate' with the original correlation id; same key plus different canonical payload is a conflict (HTTP 409). The correlation id is core-generated and stable for replays. The acceptance response is validated by inbound-accepted-v1.json. 'addressed' is a boolean indicating whether the agent was directly invoked (activation policy seam).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["messageId", "conversationKey", "speaker", "text", "attachments", "addressed"],
+  "required": [
+    "messageId",
+    "conversationKey",
+    "speaker",
+    "text",
+    "attachments",
+    "addressed"
+  ],
   "properties": {
     "messageId": {
       "description": "Non-empty opaque string identifying this message within the adapter.",
