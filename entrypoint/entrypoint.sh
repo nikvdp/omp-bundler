@@ -95,39 +95,48 @@ link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 # authoritative: the .omp tree is reseeded at every boot. Sibling
 # working files under /data/agents/<agentId> are left untouched.
 
-# OMP's project-level config discovery walks up from the cwd, so a
-# /data/.omp or /data/agents/.omp directory would leak config into
-# every agent and corrupt isolation. Refuse to boot in that case.
-if [ -d "${DATA_DIR}/.omp" ]; then
-	die "${DATA_DIR}/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/.omp would leak config into every agent"
-fi
-if [ -d "${DATA_DIR}/agents/.omp" ]; then
-	die "${DATA_DIR}/agents/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/agents/.omp would leak config into every agent"
-fi
-
 # Source root for baked agent identities. Overridable for local
 # development; defaults to the image /agents mount.
 AGENTS_SRC="${AGENTS_SRC:-/agents}"
 
+# Expand the baked agent identities first. When no agent is baked
+# (the source directory is absent or empty), boot continues without
+# seeding and without enforcing the leak guards below: an agentless
+# image must start cleanly even if a stale /data/.omp exists, since
+# no agent cwd will ever walk up into it.
 if [ -d "$AGENTS_SRC" ]; then
 	shopt -s nullglob dotglob
 	set -- "$AGENTS_SRC"/*
 	shopt -u nullglob dotglob
-	if [ "$#" -gt 0 ]; then
-		for _agent_src in "$@"; do
-			_agent_id="$(basename "$_agent_src")"
-			if [ ! -d "$_agent_src" ]; then
-				die "${AGENTS_SRC}/${_agent_id} is not a directory (bake validation should make this unreachable; failing loudly anyway)"
-			fi
-			if [ ! -d "${_agent_src}/.omp" ]; then
-				die "${AGENTS_SRC}/${_agent_id} has no .omp directory (bake validation should make this unreachable; failing loudly anyway)"
-			fi
-			mkdir -p "${DATA_DIR}/agents/${_agent_id}"
-			rm -rf "${DATA_DIR}/agents/${_agent_id}/.omp"
-			cp -R "${_agent_src}/.omp" "${DATA_DIR}/agents/${_agent_id}/.omp"
-			log "seeded agent ${_agent_id}"
-		done
+else
+	set --
+fi
+
+if [ "$#" -gt 0 ]; then
+	# OMP's project-level config discovery walks up from the cwd, so a
+	# /data/.omp or /data/agents/.omp directory would leak config into
+	# every agent and corrupt isolation. Refuse to boot before any
+	# seeding mutates the data volume.
+	if [ -d "${DATA_DIR}/.omp" ]; then
+		die "${DATA_DIR}/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/.omp would leak config into every agent"
 	fi
+	if [ -d "${DATA_DIR}/agents/.omp" ]; then
+		die "${DATA_DIR}/agents/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/agents/.omp would leak config into every agent"
+	fi
+
+	for _agent_src in "$@"; do
+		_agent_id="$(basename "$_agent_src")"
+		if [ ! -d "$_agent_src" ]; then
+			die "${AGENTS_SRC}/${_agent_id} is not a directory (bake validation should make this unreachable; failing loudly anyway)"
+		fi
+		if [ ! -d "${_agent_src}/.omp" ]; then
+			die "${AGENTS_SRC}/${_agent_id} has no .omp directory (bake validation should make this unreachable; failing loudly anyway)"
+		fi
+		mkdir -p "${DATA_DIR}/agents/${_agent_id}"
+		rm -rf "${DATA_DIR}/agents/${_agent_id}/.omp"
+		cp -R "${_agent_src}/.omp" "${DATA_DIR}/agents/${_agent_id}/.omp"
+		log "seeded agent ${_agent_id}"
+	done
 fi
 
 # -- 1. render models --------------------------------------------------
