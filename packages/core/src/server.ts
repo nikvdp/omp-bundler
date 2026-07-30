@@ -20,14 +20,23 @@
  * drain/close the pool and emitter, close SQLite stores, then exit nonzero
  * on teardown failure.
  */
-import http, { type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import http, {
+  type Server,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { randomUUID } from "node:crypto";
 
 import type { InboundMessage } from "@omp-bundler/contracts/inbound";
 import { INBOUND_MESSAGE_MEDIA_TYPE } from "@omp-bundler/contracts/inbound";
 
 import { INBOUND_SECRET_HEADER } from "./adapter-registry.js";
-import { CoreSupervisor, type CoreSupervisorOptions, InboundConflictError, createCoreSupervisor } from "./supervisor.js";
+import {
+  CoreSupervisor,
+  type CoreSupervisorOptions,
+  InboundConflictError,
+  createCoreSupervisor,
+} from "./supervisor.js";
 import { loadCoreConfig, type CoreConfig } from "./config.js";
 
 // ---------------------------------------------------------------------------
@@ -39,7 +48,6 @@ const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Header name for the inbound media type. */
 const CONTENT_TYPE_HEADER = "Content-Type";
-
 
 // ---------------------------------------------------------------------------
 // Server creation
@@ -73,12 +81,33 @@ export function createCoreServer(options: CoreServerOptions): CoreServer {
     }
   });
 
+  let closePromise: Promise<void> | null = null;
+
   return {
     server,
     supervisor,
-    close: async () => {
-      server.close();
-      await supervisor.close();
+    close: () => {
+      if (closePromise) return closePromise;
+      const serverClosed = new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+      closePromise = Promise.allSettled([
+        serverClosed,
+        supervisor.close(),
+      ]).then((results) => {
+        const errors = results
+          .filter(
+            (result): result is PromiseRejectedResult =>
+              result.status === "rejected",
+          )
+          .map((result) => result.reason);
+        if (errors.length > 0)
+          throw new AggregateError(errors, "core server close failed");
+      });
+      return closePromise;
     },
   };
 }
@@ -103,7 +132,9 @@ export async function bootCoreServer(config: CoreConfig): Promise<Server> {
   }
 
   server.listen(config.port, config.host, () => {
-    console.error(`>>> core supervisor listening on http://${config.host}:${config.port}`);
+    console.error(
+      `>>> core supervisor listening on http://${config.host}:${config.port}`,
+    );
   });
 
   let shuttingDown = false;
@@ -140,7 +171,10 @@ async function route(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const url = new URL(
+    req.url || "/",
+    `http://${req.headers.host || "localhost"}`,
+  );
   const method = req.method ?? "GET";
   const path = url.pathname;
 
@@ -165,7 +199,13 @@ async function route(
   // Engagement dismissal: DELETE /v1/adapters/:adapterId/conversations/:conversationKey/engagement
   const dismissMatch = matchEngagementRoute(path);
   if (dismissMatch && method === "DELETE") {
-    await handleDismissEngagement(supervisor, dismissMatch.adapterId, dismissMatch.conversationKey, req, res);
+    await handleDismissEngagement(
+      supervisor,
+      dismissMatch.adapterId,
+      dismissMatch.conversationKey,
+      req,
+      res,
+    );
     return;
   }
 
@@ -201,7 +241,12 @@ function matchEngagementRoute(
   const parts = path.split("/").filter((s) => s.length > 0);
   // /v1/adapters/:adapterId/conversations/:conversationKey/engagement
   if (parts.length !== 6) return null;
-  if (parts[0] !== "v1" || parts[1] !== "adapters" || parts[3] !== "conversations" || parts[5] !== "engagement") {
+  if (
+    parts[0] !== "v1" ||
+    parts[1] !== "adapters" ||
+    parts[3] !== "conversations" ||
+    parts[5] !== "engagement"
+  ) {
     return null;
   }
   return {
@@ -221,7 +266,9 @@ async function handleInboundMessage(
   res: ServerResponse,
 ): Promise<void> {
   // 1. Authenticate: unknown adapter (404) vs bad secret (401).
-  const secret = req.headers[INBOUND_SECRET_HEADER.toLowerCase()] as string | undefined;
+  const secret = req.headers[INBOUND_SECRET_HEADER.toLowerCase()] as
+    | string
+    | undefined;
   if (!supervisor.hasAdapter(adapterId)) {
     sendJson(res, 404, { error: "unknown adapter" });
     return;
@@ -232,9 +279,13 @@ async function handleInboundMessage(
   }
 
   // 2. Validate content type (v1 media type).
-  const contentType = req.headers[CONTENT_TYPE_HEADER.toLowerCase()] as string | undefined;
+  const contentType = req.headers[CONTENT_TYPE_HEADER.toLowerCase()] as
+    | string
+    | undefined;
   if (contentType !== INBOUND_MESSAGE_MEDIA_TYPE) {
-    sendJson(res, 400, { error: `unsupported content type; expected ${INBOUND_MESSAGE_MEDIA_TYPE}` });
+    sendJson(res, 400, {
+      error: `unsupported content type; expected ${INBOUND_MESSAGE_MEDIA_TYPE}`,
+    });
     return;
   }
 
@@ -269,9 +320,15 @@ async function handleInboundMessage(
   try {
     const result = await supervisor.processInbound(adapterId, message);
     if (result.kind === "accepted") {
-      sendJson(res, 202, { status: "accepted", correlationId: result.correlationId });
+      sendJson(res, 202, {
+        status: "accepted",
+        correlationId: result.correlationId,
+      });
     } else {
-      sendJson(res, 200, { status: "duplicate", correlationId: result.correlationId });
+      sendJson(res, 200, {
+        status: "duplicate",
+        correlationId: result.correlationId,
+      });
     }
   } catch (err) {
     handleInboundError(res, err);
@@ -285,7 +342,9 @@ async function handleDismissEngagement(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const secret = req.headers[INBOUND_SECRET_HEADER.toLowerCase()] as string | undefined;
+  const secret = req.headers[INBOUND_SECRET_HEADER.toLowerCase()] as
+    | string
+    | undefined;
   if (!supervisor.hasAdapter(adapterId)) {
     sendJson(res, 404, { error: "unknown adapter" });
     return;
@@ -332,52 +391,65 @@ function validateInboundMessage(parsed: unknown): InboundMessage | null {
     return null;
   }
   const obj = parsed as Record<string, unknown>;
+  if (
+    !hasOnlyProperties(obj, [
+      "messageId",
+      "conversationKey",
+      "speaker",
+      "text",
+      "attachments",
+      "addressed",
+    ])
+  )
+    return null;
 
   const messageId = obj.messageId;
   if (typeof messageId !== "string" || messageId.length === 0) return null;
 
   const conversationKey = obj.conversationKey;
-  if (typeof conversationKey !== "string" || conversationKey.length === 0) return null;
+  if (typeof conversationKey !== "string" || conversationKey.length === 0)
+    return null;
 
   const speaker = obj.speaker;
-  if (speaker === null || typeof speaker !== "object" || Array.isArray(speaker)) return null;
+  if (speaker === null || typeof speaker !== "object" || Array.isArray(speaker))
+    return null;
   const sp = speaker as Record<string, unknown>;
+  if (!hasOnlyProperties(sp, ["id", "displayName"])) return null;
   if (typeof sp.id !== "string" || sp.id.length === 0) return null;
-  if (typeof sp.displayName !== "string" || sp.displayName.length === 0) return null;
+  if (typeof sp.displayName !== "string" || sp.displayName.length === 0)
+    return null;
 
   const text = obj.text;
   if (typeof text !== "string") return null;
 
   const attachments = obj.attachments;
   if (!Array.isArray(attachments)) return null;
-
   if (text.length === 0 && attachments.length === 0) return null;
 
-  for (const a of attachments) {
-    if (a === null || typeof a !== "object" || Array.isArray(a)) return null;
-    const att = a as Record<string, unknown>;
+  for (const attachment of attachments) {
+    if (
+      attachment === null ||
+      typeof attachment !== "object" ||
+      Array.isArray(attachment)
+    )
+      return null;
+    const att = attachment as Record<string, unknown>;
+    if (!hasOnlyProperties(att, ["path", "name", "mediaType"])) return null;
     if (typeof att.path !== "string" || att.path.length === 0) return null;
+    if (att.name !== undefined && typeof att.name !== "string") return null;
+    if (att.mediaType !== undefined && typeof att.mediaType !== "string")
+      return null;
   }
 
-  const addressed = obj.addressed;
-  if (typeof addressed !== "boolean") return null;
+  if (typeof obj.addressed !== "boolean") return null;
+  return parsed as InboundMessage;
+}
 
-  return {
-    messageId,
-    conversationKey,
-    speaker: { id: sp.id as string, displayName: sp.displayName as string },
-    text,
-    attachments: attachments.map((a) => {
-      const att = a as Record<string, unknown>;
-      const result: { path: string; name?: string; mediaType?: string } = {
-        path: att.path as string,
-      };
-      if (typeof att.name === "string") result.name = att.name;
-      if (typeof att.mediaType === "string") result.mediaType = att.mediaType;
-      return result;
-    }),
-    addressed,
-  };
+function hasOnlyProperties(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
 }
 
 // ---------------------------------------------------------------------------

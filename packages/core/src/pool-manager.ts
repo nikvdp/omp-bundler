@@ -67,6 +67,8 @@ interface PoolEntry {
   ownerToken: string;
   /** True while a lease is held; idle children are candidates for eviction. */
   inUse: boolean;
+  /** Known-bad child awaiting confirmed exit; never lease it again. */
+  retiring: boolean;
   /** Monotonic timestamp of the last lease release (or creation if never leased). */
   lastUsedAt: number;
   /** Timer handle for the idle-timeout sweep, if scheduled. */
@@ -92,12 +94,14 @@ interface TeardownResult {
 }
 
 /**
- * Outcome of a single synchronous eviction. `ok:false` is produced only by a
- * child-close failure; the entry is restored as an occupied idle slot and the
- * preserved close `error` is carried so callers can surface it deterministically
- * rather than enqueueing behind a slot that will never drain.
+ * Outcome of a single synchronous eviction. `ok:false` is produced when a
+ * child-close failure restores the entry, or when another operation removed
+ * the candidate before this operation claimed it.
  */
-type EvictOutcome = { ok: true } | { ok: false; error: Error };
+type EvictOutcome =
+  | { ok: true }
+  | { ok: false; reason: "unavailable" }
+  | { ok: false; reason: "close_failed"; error: Error };
 
 /**
  * Outcome of an idle-eviction sweep for capacity. `all_in_use` means no idle
@@ -274,6 +278,18 @@ export class PoolManager {
    * exit, preventing N+1 live OS children.
    */
   private closing = 0;
+  /**
+   * Teardowns started by eviction. Entries removed before an asynchronous
+   * idle sweep finishes are not present in `entries`, so close must await this
+   * set separately before releasing the registry's remaining ownership.
+   */
+  private readonly pendingEvictions = new Set<Promise<unknown>>();
+
+  /** Shared completion promise for concurrent, idempotent close calls. */
+  private closePromise: Promise<void> | null = null;
+
+  /** Single capacity eviction used by FIFO waiter draining. */
+  private drainEviction: Promise<void> | null = null;
 
   constructor(options: PoolManagerOptions) {
     if (!options || typeof options !== "object") {
@@ -285,11 +301,10 @@ export class PoolManager {
     if (typeof options.factory !== "function") {
       throw new Error("PoolManagerOptions.factory is required");
     }
-    if (
-      !Number.isSafeInteger(options.maxChildren) ||
-      options.maxChildren < 1
-    ) {
-      throw new Error("PoolManagerOptions.maxChildren must be a positive integer");
+    if (!Number.isSafeInteger(options.maxChildren) || options.maxChildren < 1) {
+      throw new Error(
+        "PoolManagerOptions.maxChildren must be a positive integer",
+      );
     }
     if (
       !Number.isSafeInteger(options.idleTimeoutMs) ||
@@ -344,6 +359,11 @@ export class PoolManager {
     // gets the lease when the current holder releases it.
     const existing = this.entries.get(id);
     if (existing) {
+      if (existing.retiring) {
+        throw new Error(
+          `child for adapter="${adapterId}" key="${conversationKey}" is retiring`,
+        );
+      }
       if (!existing.inUse) {
         if (existing.idleTimer) {
           clearTimeout(existing.idleTimer);
@@ -355,7 +375,7 @@ export class PoolManager {
         return this.makeLease(existing);
       }
       // Entry is in use: wait for it to be released.
-      return this.enqueueWaiter(adapterId, conversationKey, id);
+      return this.enqueueWaiter(adapterId, conversationKey);
     }
 
     // A creation may already be in flight for this conversation; await it.
@@ -372,7 +392,7 @@ export class PoolManager {
         this.registry.touch(adapterId, conversationKey);
         return this.makeLease(entry);
       }
-      return this.enqueueWaiter(adapterId, conversationKey, id);
+      return this.enqueueWaiter(adapterId, conversationKey);
     }
 
     // We need to create a new child. Check capacity first. Account for
@@ -390,10 +410,11 @@ export class PoolManager {
           throw ev.error;
         }
         // All children are in use: enqueue a FIFO waiter.
-        return this.enqueueWaiter(adapterId, conversationKey, id);
+        return this.enqueueWaiter(adapterId, conversationKey);
       }
     }
 
+    if (this.closed) throw new PoolClosedError();
     // Create the child (and the registry mapping if needed).
     const entry = await this.createEntry(adapterId, conversationKey, id);
     if (this.closed) {
@@ -449,6 +470,29 @@ export class PoolManager {
     this.drainWaiters();
   }
 
+  /**
+   * Remove and close a known-bad child before its lease is released, keeping
+   * its capacity slot occupied until process exit is confirmed.
+   */
+  async retireChild(
+    adapterId: string,
+    conversationKey: string,
+    child: RpcChild,
+  ): Promise<void> {
+    const id = conversationIdOf(adapterId, conversationKey);
+    const entry = this.entries.get(id);
+    if (!entry || entry.child !== child || entry.retiring) return;
+    entry.retiring = true;
+    entry.inUse = false;
+    const outcome = await this.evictEntrySync(id, entry, "capacity");
+    if (!outcome.ok && outcome.reason === "close_failed") {
+      entry.inUse = true;
+      this.rejectWaitersFor(id, outcome.error);
+      throw outcome.error;
+    }
+    this.drainWaiters();
+  }
+
   // ---- stats / observability ----
 
   /** Observable snapshot of pool state. */
@@ -480,9 +524,13 @@ export class PoolManager {
    *   failed. Individual errors are aggregated on the `errors` property.
    */
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
+    this.closePromise = this.closeImpl();
+    return this.closePromise;
+  }
 
+  private async closeImpl(): Promise<void> {
     // Cancel all pending waiters deterministically in FIFO order.
     while (this.waiters.length > 0) {
       const w = this.waiters.shift()!;
@@ -498,25 +546,29 @@ export class PoolManager {
 
     const errors: Error[] = [];
 
-    // Await all in-flight creations. When they resolve, doCreate adds the
-    // entry to `this.entries` synchronously. We then iterate `entries` once
-    // to tear everything down, avoiding double-teardown. Rejections are fine:
-    // the child was already cleaned up in doCreate.
-    const inflightPromises = [...this.inflight.values()];
-    await Promise.allSettled(inflightPromises);
-    this.inflight.clear();
-    this.pendingCreations = 0;
-
-    // Close all live children and release ownership. Close before release;
-    // if close fails, keep ownership so startup sweep can recover.
-    // teardownEntry returns TeardownResult instead of throwing; we collect
-    // errors from both close_failed and release_failed stages.
-    const teardownPromises: Promise<TeardownResult>[] = [];
+    // Stop idle callbacks before the first await. Entries already removed by
+    // an idle callback are tracked in pendingEvictions and awaited below.
     for (const entry of this.entries.values()) {
       if (entry.idleTimer) {
         clearTimeout(entry.idleTimer);
         entry.idleTimer = null;
       }
+    }
+
+    // Await all in-flight creations. When they resolve, doCreate adds the
+    // entry to `this.entries` synchronously.
+    const inflightPromises = [...this.inflight.values()];
+    await Promise.allSettled(inflightPromises);
+    this.inflight.clear();
+    this.pendingCreations = 0;
+
+    // Idle evictions remove entries before their asynchronous child close and
+    // ownership release settle. Preserve any failure for the caller.
+    errors.push(...(await this.waitForPendingEvictions()));
+
+    // Close all live children and release ownership.
+    const teardownPromises: Promise<TeardownResult>[] = [];
+    for (const entry of this.entries.values()) {
       teardownPromises.push(this.teardownEntry(entry));
     }
     this.entries.clear();
@@ -524,7 +576,9 @@ export class PoolManager {
     const teardownResults = await Promise.allSettled(teardownPromises);
     for (const r of teardownResults) {
       if (r.status === "rejected") {
-        errors.push(r.reason instanceof Error ? r.reason : new Error(String(r.reason)));
+        errors.push(
+          r.reason instanceof Error ? r.reason : new Error(String(r.reason)),
+        );
       } else if (r.value.error) {
         errors.push(r.value.error);
       }
@@ -554,8 +608,11 @@ export class PoolManager {
     }
     for (const entry of toClose) {
       const id = conversationIdOf(entry.adapterId, entry.conversationKey);
+      if (this.entries.get(id) !== entry || entry.inUse) continue;
       this.entries.delete(id);
-      const result = await this.teardownEntry(entry);
+      this.closing++;
+      const result = await this.trackEviction(this.teardownEntry(entry));
+      this.closing--;
       if (result.stage === "close_failed") {
         // Child may still be alive: restore as occupied idle slot.
         entry.inUse = false;
@@ -566,6 +623,7 @@ export class PoolManager {
         closed++;
       }
     }
+    this.drainWaiters();
     return closed;
   }
 
@@ -586,11 +644,12 @@ export class PoolManager {
     if (existing) return existing;
 
     this.pendingCreations++;
-    const promise = this.doCreate(adapterId, conversationKey, id)
-      .finally(() => {
+    const promise = this.doCreate(adapterId, conversationKey, id).finally(
+      () => {
         this.inflight.delete(id);
         this.pendingCreations--;
-      });
+      },
+    );
     this.inflight.set(id, promise);
     return promise;
   }
@@ -603,7 +662,11 @@ export class PoolManager {
     // 1. Spawn a fresh child through the injected factory.
     let child: RpcChild;
     try {
-      child = await this.factory({ adapterId, conversationKey, registryKey: id });
+      child = await this.factory({
+        adapterId,
+        conversationKey,
+        registryKey: id,
+      });
     } catch (err) {
       this.log({
         type: "create_failed",
@@ -643,15 +706,8 @@ export class PoolManager {
     //    attempt a transfer from the recorded stale owner. Any other error
     //    (not OwnerMismatchError) is surfaced, not swallowed.
     const ownerToken = randomUUID();
-    let acquired = false;
     try {
-      this.registry.setOwner(
-        adapterId,
-        conversationKey,
-        null,
-        ownerToken,
-      );
-      acquired = true;
+      this.registry.setOwner(adapterId, conversationKey, null, ownerToken);
     } catch (err) {
       if (!(err instanceof OwnerMismatchError)) {
         await this.closeChildOrThrow(child, adapterId, conversationKey);
@@ -680,7 +736,6 @@ export class PoolManager {
             staleOwner,
             ownerToken,
           );
-          acquired = true;
         } catch (err2) {
           if (!(err2 instanceof OwnerMismatchError)) {
             await this.closeChildOrThrow(child, adapterId, conversationKey);
@@ -734,6 +789,7 @@ export class PoolManager {
       conversationKey,
       ownerToken,
       inUse: false,
+      retiring: false,
       lastUsedAt: Date.now(),
       idleTimer: null,
     };
@@ -765,8 +821,10 @@ export class PoolManager {
    * capacity allows.
    */
   private releaseEntry(id: string): void {
+    if (this.closed) return;
     const entry = this.entries.get(id);
     if (!entry) return;
+    if (entry.retiring) return;
     entry.inUse = false;
     entry.lastUsedAt = Date.now();
     this.touchLru(id);
@@ -825,22 +883,33 @@ export class PoolManager {
       // A concurrent acquirer may lease the entry between the snapshot and
       // now; only evict if it is still present and idle.
       const current = this.entries.get(id);
-      if (!current || current.inUse) continue;
+      if (!current || current !== entry || current.inUse) continue;
       const outcome = await this.evictEntrySync(id, entry, "capacity");
       if (outcome.ok) return { ok: true };
+      if (outcome.reason === "unavailable") continue;
       // Close failed: entry restored as an occupied idle slot. Preserve the
       // error and try the next candidate so a viable eviction is not rejected
       // on the strength of one failed child.
       closeError = outcome.error;
     }
 
+    if (closeError) {
+      this.log({
+        type: "cap_reached",
+        size: this.entries.size,
+        waiters: this.waiters.length,
+        message: `eviction close failed for all idle children; cannot free slot (${this.occupiedSlots()}/${this.maxChildren})`,
+      });
+      return { ok: false, reason: "close_failed", error: closeError };
+    }
+    if (this.occupiedSlots() < this.maxChildren) return { ok: true };
     this.log({
       type: "cap_reached",
       size: this.entries.size,
       waiters: this.waiters.length,
-      message: `eviction close failed for all idle children; cannot free slot (${this.occupiedSlots()}/${this.maxChildren})`,
+      message: `pool at capacity (${this.occupiedSlots()}/${this.maxChildren}); all candidates were claimed`,
     });
-    return { ok: false, reason: "close_failed", error: closeError! };
+    return { ok: false, reason: "all_in_use" };
   }
 
   /**
@@ -855,6 +924,7 @@ export class PoolManager {
     entry: PoolEntry,
     reason: "capacity" | "idle",
   ): void {
+    if (this.entries.get(id) !== entry || entry.inUse) return;
     if (entry.idleTimer) {
       clearTimeout(entry.idleTimer);
       entry.idleTimer = null;
@@ -870,19 +940,23 @@ export class PoolManager {
       message: `evicted (${reason})`,
     });
 
-    this.teardownEntry(entry)
-      .then((result) => {
-        if (result.stage === "close_failed") {
-          // Child may still be alive: restore as occupied idle slot.
-          entry.inUse = false;
-          entry.idleTimer = null;
-          this.entries.set(id, entry);
-        }
-      })
-      .finally(() => {
-        this.closing--;
-        this.drainWaiters();
-      });
+    const eviction = this.trackEviction(
+      this.teardownEntry(entry)
+        .then((result) => {
+          if (result.stage === "close_failed") {
+            // Child may still be alive: restore as occupied idle slot.
+            entry.inUse = false;
+            entry.idleTimer = null;
+            this.entries.set(id, entry);
+          }
+          if (result.error) throw result.error;
+        })
+        .finally(() => {
+          this.closing--;
+          this.drainWaiters();
+        }),
+    );
+    void eviction.catch(() => {});
   }
 
   /**
@@ -903,6 +977,9 @@ export class PoolManager {
     entry: PoolEntry,
     reason: "capacity" | "idle",
   ): Promise<EvictOutcome> {
+    if (this.entries.get(id) !== entry || entry.inUse) {
+      return { ok: false, reason: "unavailable" };
+    }
     if (entry.idleTimer) {
       clearTimeout(entry.idleTimer);
       entry.idleTimer = null;
@@ -918,7 +995,7 @@ export class PoolManager {
       message: `evicted (${reason})`,
     });
 
-    const result = await this.teardownEntry(entry);
+    const result = await this.trackEviction(this.teardownEntry(entry));
 
     if (result.stage === "close_failed") {
       // Child may still be alive: restore the entry as an occupied idle
@@ -927,7 +1004,7 @@ export class PoolManager {
       entry.idleTimer = null;
       this.entries.set(id, entry);
       this.closing--;
-      return { ok: false, error: result.error! };
+      return { ok: false, reason: "close_failed", error: result.error! };
     }
 
     this.closing--;
@@ -975,7 +1052,6 @@ export class PoolManager {
   private enqueueWaiter(
     adapterId: string,
     conversationKey: string,
-    id: string,
   ): Promise<Lease> {
     const { promise, resolve, reject } = Promise.withResolvers<Lease>();
     this.waiters.push({
@@ -995,6 +1071,17 @@ export class PoolManager {
     return promise;
   }
 
+  private rejectWaitersFor(id: string, error: Error): void {
+    for (let index = this.waiters.length - 1; index >= 0; index--) {
+      const waiter = this.waiters[index]!;
+      if (conversationIdOf(waiter.adapterId, waiter.conversationKey) !== id) {
+        continue;
+      }
+      this.waiters.splice(index, 1);
+      waiter.reject(error);
+    }
+  }
+
   /**
    * Drain the FIFO wait queue: for each waiter at the head, if capacity is
    * available, create/revive a child and resolve the waiter. Stops when the
@@ -1008,6 +1095,15 @@ export class PoolManager {
       // If a live, idle child exists for this conversation, hand it over.
       // This does not consume a new capacity slot.
       const existing = this.entries.get(id);
+      if (existing?.retiring) {
+        this.waiters.shift();
+        waiter.reject(
+          new Error(
+            `child for adapter="${waiter.adapterId}" key="${waiter.conversationKey}" is retiring`,
+          ),
+        );
+        continue;
+      }
       if (existing && !existing.inUse) {
         this.waiters.shift();
         existing.inUse = true;
@@ -1077,11 +1173,22 @@ export class PoolManager {
 
       // No existing child and no in-flight creation. Check capacity before
       // creating; if none available, try evicting an idle child to make room.
-      // If all are in use, stop draining.
+      // If all are in use, stop draining until a release makes one idle.
       if (this.occupiedSlots() >= this.maxChildren) {
-        // Attempt synchronous eviction to free a slot. This is async, so
-        // detach and re-drain on completion.
-        this.tryEvictForDrain();
+        const hasIdle = [...this.entries.values()].some(
+          (entry) => !entry.inUse,
+        );
+        if (!hasIdle) return;
+        if (!this.drainEviction) {
+          const eviction = this.tryEvictForDrain().finally(() => {
+            if (this.drainEviction === eviction) {
+              this.drainEviction = null;
+              this.drainWaiters();
+            }
+          });
+          this.drainEviction = eviction;
+          void eviction.catch(() => {});
+        }
         return;
       }
 
@@ -1124,38 +1231,22 @@ export class PoolManager {
    * restored idle entry or triggering another eviction) and none strand.
    */
   private async tryEvictForDrain(): Promise<void> {
-    // Find the first idle entry in LRU order.
-    for (const [id, entry] of this.entries) {
-      if (!entry.inUse) {
-        const outcome = await this.evictEntrySync(id, entry, "capacity");
-        if (!outcome.ok) {
-          // Close failed: reject the head waiter with the preserved close
-          // error, then continue draining remaining waiters so none strand.
-          if (this.waiters.length > 0) {
-            const w = this.waiters.shift()!;
-            w.reject(outcome.error);
-            this.log({
-              type: "wait_cancelled",
-              adapterId: w.adapterId,
-              conversationKey: w.conversationKey,
-              waiters: this.waiters.length,
-              message: "waiter rejected: eviction close failed",
-            });
-          }
-          this.drainWaiters();
-          return;
-        }
-        this.drainWaiters();
-        return;
-      }
+    const outcome = await this.evictIdleForCapacity();
+    if (outcome.ok || outcome.reason !== "close_failed") return;
+
+    // No idle child could be closed, so none of the current waiters can make
+    // progress. Reject them deterministically rather than retrying forever.
+    while (this.waiters.length > 0) {
+      const waiter = this.waiters.shift()!;
+      waiter.reject(outcome.error);
+      this.log({
+        type: "wait_cancelled",
+        adapterId: waiter.adapterId,
+        conversationKey: waiter.conversationKey,
+        waiters: this.waiters.length,
+        message: "waiter rejected: every idle child failed to close",
+      });
     }
-    // All in use: nothing to do; the next release will re-drain.
-    this.log({
-      type: "cap_reached",
-      size: this.entries.size,
-      waiters: this.waiters.length,
-      message: `pool at capacity (${this.occupiedSlots()}/${this.maxChildren}); all in use`,
-    });
   }
 
   // ---- internals: LRU ----
@@ -1170,6 +1261,28 @@ export class PoolManager {
     if (!entry) return;
     this.entries.delete(id);
     this.entries.set(id, entry);
+  }
+
+  /** Track teardown work whose entry has already left the live map. */
+  private trackEviction<T>(operation: Promise<T>): Promise<T> {
+    let tracked: Promise<T>;
+    tracked = operation.finally(() => {
+      this.pendingEvictions.delete(tracked);
+    });
+    this.pendingEvictions.add(tracked);
+    return tracked;
+  }
+
+  /** Drain pending evictions and return every failure observed while waiting. */
+  private async waitForPendingEvictions(): Promise<Error[]> {
+    const errors: Error[] = [];
+    while (this.pendingEvictions.size > 0) {
+      const results = await Promise.allSettled(this.pendingEvictions);
+      for (const result of results) {
+        if (result.status === "rejected") errors.push(asError(result.reason));
+      }
+    }
+    return errors;
   }
 
   // ---- internals: teardown ----
@@ -1262,7 +1375,11 @@ export class PoolManager {
    */
   private releaseOwnership(entry: PoolEntry): Error | null {
     try {
-      this.registry.release(entry.adapterId, entry.conversationKey, entry.ownerToken);
+      this.registry.release(
+        entry.adapterId,
+        entry.conversationKey,
+        entry.ownerToken,
+      );
       return null;
     } catch (err) {
       return err instanceof Error ? err : new Error(String(err));
@@ -1275,3 +1392,7 @@ export class PoolManager {
 // ---------------------------------------------------------------------------
 
 const conversationIdOf = conversationStorageKey;
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}

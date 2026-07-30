@@ -62,7 +62,10 @@
  */
 
 import type { InboundMessage } from "@omp-bundler/contracts/inbound";
-import type { Speaker, WorkspaceAttachment } from "@omp-bundler/contracts/shared";
+import type {
+  Speaker,
+  WorkspaceAttachment,
+} from "@omp-bundler/contracts/shared";
 import { conversationStorageKey } from "./adapter-registry.js";
 
 // ---------------------------------------------------------------------------
@@ -176,7 +179,9 @@ export const compositeKey = conversationStorageKey;
  * expressed via the activation mode, not the prompt body.
  */
 export function renderRecord(record: BufferedRecord): string {
-  const lines: string[] = [`${record.speaker.displayName} (id: ${record.speaker.id})`];
+  const lines: string[] = [
+    `${record.speaker.displayName} (id: ${record.speaker.id})`,
+  ];
   if (record.text.length > 0) lines.push(record.text);
   for (const attachment of record.attachments) {
     let line = `  - ${attachment.path}`;
@@ -397,7 +402,10 @@ function toRecord(
     adapterId,
     conversationKey: message.conversationKey,
     messageId: message.messageId,
-    speaker: { id: message.speaker.id, displayName: message.speaker.displayName },
+    speaker: {
+      id: message.speaker.id,
+      displayName: message.speaker.displayName,
+    },
     text: message.text,
     attachments: message.attachments.map((a) => ({
       path: a.path,

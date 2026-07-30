@@ -88,7 +88,6 @@ export interface AcquireResult {
 // Constants
 // ---------------------------------------------------------------------------
 
-
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS session_registry (
   adapter_id       TEXT    NOT NULL,
@@ -132,9 +131,10 @@ function rowToRecord(row: Record<string, unknown>): SessionRecord {
     sessionFile: String(row.session_file),
     createdAt: String(row.created_at),
     lastActive: String(row.last_active),
-    currentOwner: row.current_owner === null || row.current_owner === undefined
-      ? null
-      : String(row.current_owner),
+    currentOwner:
+      row.current_owner === null || row.current_owner === undefined
+        ? null
+        : String(row.current_owner),
   };
 }
 
@@ -309,10 +309,11 @@ export class SessionRegistry {
       return inflight;
     }
 
-    const promise = this.create(child, adapterId, conversationKey)
-      .finally(() => {
+    const promise = this.create(child, adapterId, conversationKey).finally(
+      () => {
         this.inflight.delete(key);
-      });
+      },
+    );
     this.inflight.set(key, promise);
     return promise;
   }

@@ -97,10 +97,13 @@ function withRegistryLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const result = prev.then(fn, fn);
   // Chain a void wrapper so a rejection in one operation does not propagate
   // to (and abort) the next queued operation.
-  registryLocks.set(path, result.then(
-    () => undefined,
-    () => undefined,
-  ));
+  registryLocks.set(
+    path,
+    result.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
   return result;
 }
 
@@ -140,7 +143,9 @@ export async function readChildRegistry(path: string): Promise<ChildRegistry> {
     );
   }
   const registry: ChildRegistry = {};
-  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(
+    parsed as Record<string, unknown>,
+  )) {
     if (!isRegistryEntry(value)) {
       throw new Error(
         `registry at ${path} has an invalid entry for key "${key}"; ` +
@@ -195,7 +200,10 @@ export async function registerChild(
 }
 
 /** Remove `key` from the registry. No-op if absent. Serialized per path. */
-export async function unregisterChild(path: string, key: string): Promise<void> {
+export async function unregisterChild(
+  path: string,
+  key: string,
+): Promise<void> {
   await withRegistryLock(path, async () => {
     const registry = await readChildRegistry(path);
     if (!(key in registry)) return;

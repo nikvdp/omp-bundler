@@ -138,6 +138,8 @@ export interface RpcChildOptions {
   onExtensionUiRequest?: ExtensionUiRequestHandler;
   /** Timeout in ms for the initial `ready` frame. Defaults to 30_000. */
   readyTimeoutMs?: number;
+  /** Timeout in ms for each command acknowledgement. Defaults to 30_000. */
+  responseTimeoutMs?: number;
   /**
    * Path to the persistent JSON registry that records this child's process
    * group. When set together with {@link conversationKey}, the pgid is
@@ -161,9 +163,11 @@ export interface RpcChildOptions {
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 const DEFAULT_MAX_REASSEMBLED_BYTES = 64 * 1024 * 1024;
 const CHUNK_PAYLOAD_BYTES = 256 * 1024;
+const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
 
 /** Canonical non-empty base64 regex, matching the server's rpc-frame.ts decoder. */
-const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const BASE64_RE =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 /**
  * Methods of `extension_ui_request` that expect a response from the host.
@@ -210,7 +214,12 @@ export class RpcChild extends EventEmitter {
   private pendingChunks = new Map<string, PendingChunks>();
   private pendingResponses = new Map<
     string,
-    { resolve: (r: RpcResponseFrame) => void; reject: (e: Error) => void; command: string }
+    {
+      resolve: (r: RpcResponseFrame) => void;
+      reject: (e: Error) => void;
+      command: string;
+      timer: NodeJS.Timeout;
+    }
   >();
   private nextId = 1;
   private closed = false;
@@ -225,17 +234,32 @@ export class RpcChild extends EventEmitter {
   /** Set when the child exits while registration is still in flight. */
   private exitDuringRegister = false;
   private readonly opts: Required<
-    Pick<RpcChildOptions, "binary" | "args" | "cwd" | "readyTimeoutMs">
+    Pick<
+      RpcChildOptions,
+      "binary" | "args" | "cwd" | "readyTimeoutMs" | "responseTimeoutMs"
+    >
   > &
-    Pick<RpcChildOptions, "env" | "onExtensionUiRequest" | "registryPath" | "conversationKey">;
+    Pick<
+      RpcChildOptions,
+      "env" | "onExtensionUiRequest" | "registryPath" | "conversationKey"
+    >;
 
   constructor(options: RpcChildOptions = {}) {
     super();
+    if (
+      options.responseTimeoutMs !== undefined &&
+      (!Number.isFinite(options.responseTimeoutMs) ||
+        options.responseTimeoutMs <= 0)
+    ) {
+      throw new Error("responseTimeoutMs must be a positive finite number");
+    }
     this.opts = {
       binary: options.binary ?? "omp",
       args: options.args ?? [],
       cwd: options.cwd ?? process.cwd(),
       readyTimeoutMs: options.readyTimeoutMs ?? 30_000,
+      responseTimeoutMs:
+        options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS,
       env: options.env,
       onExtensionUiRequest: options.onExtensionUiRequest,
       registryPath: options.registryPath,
@@ -270,8 +294,11 @@ export class RpcChild extends EventEmitter {
     }
 
     // ---- ready handshake (listeners installed before registration) ----
-    const { promise: readyPromise, resolve: readyResolve, reject: readyReject } =
-      Promise.withResolvers<RpcReadyFrame>();
+    const {
+      promise: readyPromise,
+      resolve: readyResolve,
+      reject: readyReject,
+    } = Promise.withResolvers<RpcReadyFrame>();
     let timer: NodeJS.Timeout | undefined;
     const cleanup = () => {
       clearTimeout(timer);
@@ -283,7 +310,10 @@ export class RpcChild extends EventEmitter {
       cleanup();
       readyResolve(frame);
     };
-    const onExitForReady = (code: number | null, signal: NodeJS.Signals | null) => {
+    const onExitForReady = (
+      code: number | null,
+      signal: NodeJS.Signals | null,
+    ) => {
       cleanup();
       readyReject(
         new Error(
@@ -375,9 +405,14 @@ export class RpcChild extends EventEmitter {
 
   /** Negotiate protocol version 2 (enables server-side outbound chunking). */
   async negotiateProtocolV2(): Promise<void> {
-    const res = await this.send({ type: "negotiate_protocol", protocolVersion: 2 });
+    const res = await this.send({
+      type: "negotiate_protocol",
+      protocolVersion: 2,
+    });
     if (!res.success) {
-      throw new Error(`negotiate_protocol v2 failed: ${res.error ?? "unknown"}`);
+      throw new Error(
+        `negotiate_protocol v2 failed: ${res.error ?? "unknown"}`,
+      );
     }
     this.protocolVersion = 2;
   }
@@ -398,7 +433,8 @@ export class RpcChild extends EventEmitter {
       // ignore
     }
 
-    const { promise: exitPromise, resolve: exitResolve } = Promise.withResolvers<void>();
+    const { promise: exitPromise, resolve: exitResolve } =
+      Promise.withResolvers<void>();
     const onExit = () => {
       clearTimeout(timer);
       exitResolve();
@@ -451,7 +487,9 @@ export class RpcChild extends EventEmitter {
     if (this.pgid === undefined) {
       // No process group (non-Unix spawn or never started): callers should
       // fall back to `child.kill()`. Signal this distinctly.
-      throw new Error("RpcChild has no process group (non-Unix or not started)");
+      throw new Error(
+        "RpcChild has no process group (non-Unix or not started)",
+      );
     }
     return killProcessGroup(this.pgid, signal);
   }
@@ -474,9 +512,11 @@ export class RpcChild extends EventEmitter {
       startedAt: Date.now(),
       binary: this.opts.binary,
     };
-    const p = registerChild(registryPath, conversationKey, entry).finally(() => {
-      if (this.registerPromise === p) this.registerPromise = undefined;
-    });
+    const p = registerChild(registryPath, conversationKey, entry).finally(
+      () => {
+        if (this.registerPromise === p) this.registerPromise = undefined;
+      },
+    );
     this.registerPromise = p;
     return p;
   }
@@ -508,24 +548,47 @@ export class RpcChild extends EventEmitter {
    * reads stdin line-by-line with no frame-size limit, so outbound chunking
    * is never needed.
    */
-  send<T = unknown>(frame: Record<string, unknown>): Promise<RpcResponseFrame & { data?: T }> {
+  send<T = unknown>(
+    frame: Record<string, unknown>,
+  ): Promise<RpcResponseFrame & { data?: T }> {
     if (!this.child) return Promise.reject(new Error("RpcChild not started"));
     if (this.closed) return Promise.reject(new Error("RpcChild is closed"));
 
     const id = typeof frame.id === "string" ? frame.id : String(this.nextId++);
+    if (this.pendingResponses.has(id)) {
+      return Promise.reject(
+        new Error(`omp rpc command id "${id}" is already pending`),
+      );
+    }
     const payload: Record<string, unknown> = { ...frame, id };
     const command = String(payload.type ?? "unknown");
 
-    const { promise: sendPromise, resolve: sendResolve, reject: sendReject } =
-      Promise.withResolvers<RpcResponseFrame & { data?: T }>();
+    const {
+      promise: sendPromise,
+      resolve: sendResolve,
+      reject: sendReject,
+    } = Promise.withResolvers<RpcResponseFrame & { data?: T }>();
+    const timer = setTimeout(() => {
+      const pending = this.pendingResponses.get(id);
+      if (!pending) return;
+      this.pendingResponses.delete(id);
+      pending.reject(
+        new Error(
+          `omp rpc command "${pending.command}" timed out waiting for acknowledgement`,
+        ),
+      );
+      void this.close();
+    }, this.opts.responseTimeoutMs);
     this.pendingResponses.set(id, {
       resolve: sendResolve as (r: RpcResponseFrame) => void,
       reject: sendReject,
       command,
+      timer,
     });
     try {
       this.writeRaw(JSON.stringify(payload) + "\n");
     } catch (err) {
+      clearTimeout(timer);
       this.pendingResponses.delete(id);
       sendReject(err instanceof Error ? err : new Error(String(err)));
     }
@@ -542,13 +605,10 @@ export class RpcChild extends EventEmitter {
 
   /** Low-level newline-delimited JSON line writer with backpressure. */
   private writeRaw(line: string): void {
-    if (!this.child || this.closed) return;
-    try {
-      if (!this.child.stdin.write(line)) {
-        this.child.stdin.once("drain", () => {});
-      }
-    } catch {
-      // ignore: child may already be dead
+    if (!this.child) throw new Error("RpcChild not started");
+    if (this.closed) throw new Error("RpcChild is closed");
+    if (!this.child.stdin.write(line)) {
+      this.child.stdin.once("drain", () => {});
     }
   }
 
@@ -573,13 +633,18 @@ export class RpcChild extends EventEmitter {
    */
   prompt(
     message: string,
-    options: { images?: unknown[]; streamingBehavior?: "steer" | "followUp" } = {},
+    options: {
+      images?: unknown[];
+      streamingBehavior?: "steer" | "followUp";
+    } = {},
   ): Promise<RpcResponseFrame> {
     return this.send({
       type: "prompt",
       message,
       ...(options.images ? { images: options.images } : {}),
-      ...(options.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
+      ...(options.streamingBehavior
+        ? { streamingBehavior: options.streamingBehavior }
+        : {}),
     });
   }
 
@@ -657,7 +722,9 @@ export class RpcChild extends EventEmitter {
    * in OMP `src/modes/rpc/rpc-frame.ts` exactly. Chunks only arrive after v2
    * negotiation; any `rpc_chunk` before that is rejected.
    */
-  private processChunk(chunk: RpcChunkFrame): Record<string, unknown> | undefined {
+  private processChunk(
+    chunk: RpcChunkFrame,
+  ): Record<string, unknown> | undefined {
     // rpc_chunk frames are only valid after v2 negotiation.
     if (this.protocolVersion < 2) {
       this.emit("error", new Error("rpc_chunk received before v2 negotiation"));
@@ -691,7 +758,10 @@ export class RpcChild extends EventEmitter {
       this.ready?.maxReassembledFrameBytes ?? DEFAULT_MAX_REASSEMBLED_BYTES;
     const maxCount = Math.ceil(maxReassembled / CHUNK_PAYLOAD_BYTES);
     if (count > maxCount) {
-      this.emit("error", new Error(`rpc_chunk count exceeds maximum (${count} > ${maxCount})`));
+      this.emit(
+        "error",
+        new Error(`rpc_chunk count exceeds maximum (${count} > ${maxCount})`),
+      );
       return undefined;
     }
     if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
@@ -700,11 +770,21 @@ export class RpcChild extends EventEmitter {
     }
     const maxFrame = this.ready?.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
     if (byteLength < maxFrame) {
-      this.emit("error", new Error(`rpc_chunk byteLength must be >= maxFrameBytes (${byteLength} < ${maxFrame})`));
+      this.emit(
+        "error",
+        new Error(
+          `rpc_chunk byteLength must be >= maxFrameBytes (${byteLength} < ${maxFrame})`,
+        ),
+      );
       return undefined;
     }
     if (byteLength > maxReassembled) {
-      this.emit("error", new Error(`rpc_chunk byteLength exceeds maxReassembledFrameBytes (${byteLength} > ${maxReassembled})`));
+      this.emit(
+        "error",
+        new Error(
+          `rpc_chunk byteLength exceeds maxReassembledFrameBytes (${byteLength} > ${maxReassembled})`,
+        ),
+      );
       return undefined;
     }
 
@@ -712,7 +792,10 @@ export class RpcChild extends EventEmitter {
     let pending = this.pendingChunks.get(chunkId);
     if (!pending) {
       if (index !== 0) {
-        this.emit("error", new Error("rpc_chunk sequence must start at index 0"));
+        this.emit(
+          "error",
+          new Error("rpc_chunk sequence must start at index 0"),
+        );
         return undefined;
       }
       pending = {
@@ -738,7 +821,11 @@ export class RpcChild extends EventEmitter {
     }
 
     // ---- payload validation before accumulation ----
-    if (typeof chunk.data !== "string" || chunk.data.length === 0 || !BASE64_RE.test(chunk.data)) {
+    if (
+      typeof chunk.data !== "string" ||
+      chunk.data.length === 0 ||
+      !BASE64_RE.test(chunk.data)
+    ) {
       this.emit("error", new Error("invalid rpc_chunk base64 data"));
       this.pendingChunks.delete(chunkId);
       return undefined;
@@ -751,14 +838,20 @@ export class RpcChild extends EventEmitter {
       return undefined;
     }
     if (bytes.byteLength > CHUNK_PAYLOAD_BYTES) {
-      this.emit("error", new Error("rpc_chunk payload exceeds transport limit"));
+      this.emit(
+        "error",
+        new Error("rpc_chunk payload exceeds transport limit"),
+      );
       this.pendingChunks.delete(chunkId);
       return undefined;
     }
 
     pending.receivedBytes += bytes.byteLength;
     if (pending.receivedBytes > pending.byteLength) {
-      this.emit("error", new Error("rpc_chunk accumulated bytes exceed declared byteLength"));
+      this.emit(
+        "error",
+        new Error("rpc_chunk accumulated bytes exceed declared byteLength"),
+      );
       this.pendingChunks.delete(chunkId);
       return undefined;
     }
@@ -808,6 +901,7 @@ export class RpcChild extends EventEmitter {
         const pending = this.pendingResponses.get(id);
         if (pending) {
           this.pendingResponses.delete(id);
+          clearTimeout(pending.timer);
           pending.resolve(response);
         } else {
           // Response with no matching pending: surface as an event.
@@ -820,7 +914,9 @@ export class RpcChild extends EventEmitter {
     }
 
     if (type === "extension_ui_request") {
-      this.handleExtensionUiRequest(frame as unknown as RpcExtensionUiRequestFrame);
+      this.handleExtensionUiRequest(
+        frame as unknown as RpcExtensionUiRequestFrame,
+      );
       return;
     }
 
@@ -856,6 +952,7 @@ export class RpcChild extends EventEmitter {
 
   private rejectAllPending(err: Error): void {
     for (const pending of this.pendingResponses.values()) {
+      clearTimeout(pending.timer);
       pending.reject(err);
     }
     this.pendingResponses.clear();

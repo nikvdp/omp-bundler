@@ -54,9 +54,17 @@ import {
   IdempotencyConflictError,
   type IdempotencyEntry,
 } from "./idempotency-store.js";
-import { IngestBuffer, type ActivationMode, renderRecord } from "./ingest-buffer.js";
+import {
+  IngestBuffer,
+  type ActivationMode,
+  renderRecord,
+} from "./ingest-buffer.js";
 import { PoolManager, type ChildFactory, type Lease } from "./pool-manager.js";
-import { RpcChild, type RpcEventFrame, type RpcResponseFrame } from "./rpc-child.js";
+import {
+  RpcChild,
+  type RpcEventFrame,
+  type RpcResponseFrame,
+} from "./rpc-child.js";
 import {
   OutboundEmitter,
   type AdapterTarget,
@@ -92,7 +100,9 @@ export class InboundConflictError extends Error {
   readonly adapterId: string;
   readonly messageId: string;
   constructor(adapterId: string, messageId: string) {
-    super(`idempotency conflict for adapter="${adapterId}" message="${messageId}"`);
+    super(
+      `idempotency conflict for adapter="${adapterId}" message="${messageId}"`,
+    );
     this.name = "InboundConflictError";
     this.adapterId = adapterId;
     this.messageId = messageId;
@@ -160,22 +170,28 @@ export class CoreSupervisor {
   private readonly active = new Map<string, ActiveCorrelation>();
   /** Serializes ingest decisions for each adapter-scoped conversation. */
   private readonly inboundChains = new Map<string, Promise<void>>();
+  /** Serializes startup redelivery by conversation without impersonating a live turn. */
+  private readonly recoveryChains = new Map<string, Promise<void>>();
 
   /** Children are wired once even when the pool reuses them across turns. */
   private readonly wiredChildren = new WeakSet<RpcChild>();
 
   private closed = false;
+  private closePromise: Promise<void> | null = null;
 
   constructor(options: CoreSupervisorOptions) {
     this.config = options.config;
     this.now = options.now ?? Date.now;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.uuid = options.uuid ?? (() => randomUUID());
-    this.childFactory = options.childFactory ?? this.defaultChildFactory.bind(this);
+    this.childFactory =
+      options.childFactory ?? this.defaultChildFactory.bind(this);
 
     this.adapters = new AdapterRegistry(this.config.adapters);
     this.sessions = new SessionRegistry({ dbPath: this.config.sessionDbPath });
-    this.idempotency = new IdempotencyStore({ dbPath: this.config.idempotencyDbPath });
+    this.idempotency = new IdempotencyStore({
+      dbPath: this.config.idempotencyDbPath,
+    });
     this.buffer = new IngestBuffer({
       engagementWindowMs: this.config.engagementWindowMs,
       now: this.now,
@@ -192,64 +208,73 @@ export class CoreSupervisor {
   }
 
   /**
-   * Recover pending outbound deliveries after a process restart. For each
-   * pending outbox correlation, instantiate an emitter with durable hooks
-   * wired over the correlation's message ids (from the idempotency store)
-   * and call resumePending(). No model turn is replayed; only undelivered
-   * HTTP POSTs are re-driven.
-   *
-   * Safe to call once at startup. Idempotent: correlations already in the
-   * active map are skipped.
+   * Recover pending outbound deliveries after a process restart. Correlations
+   * sharing a conversation are replayed serially, and new inbound work waits
+   * for that conversation's recovery chain before choosing an active turn.
    */
   async recoverPending(): Promise<void> {
-    const pending: PendingOutboundCorrelation[] = listPendingOutboundCorrelations(
+    const recoverable = new Map<string, PendingOutboundCorrelation>();
+    for (const item of listPendingOutboundCorrelations(
       this.config.outboxDbPath,
-    );
-    if (pending.length === 0) return;
+    )) {
+      recoverable.set(
+        JSON.stringify([item.adapterId, item.correlationId]),
+        item,
+      );
+    }
+    // The prepared hook intentionally saves the terminal response before the
+    // outbox insert. Include those rows so startup repairs that crash window.
+    for (const entry of this.idempotency.listSavedResponses()) {
+      recoverable.set(JSON.stringify([entry.adapterId, entry.correlationId]), {
+        adapterId: entry.adapterId,
+        conversationKey: entry.conversationKey,
+        correlationId: entry.correlationId,
+      });
+    }
+    if (recoverable.size === 0) return;
 
     const recoverPromises: Promise<void>[] = [];
-    for (const p of pending) {
-      const convKey = compositeKey(p.adapterId, p.conversationKey);
-      if (this.active.has(convKey)) continue;
-
-      // Look up all message ids in this correlation from the idempotency store.
-      const entries: IdempotencyEntry[] = this.idempotency.getEntriesByCorrelation(
-        p.adapterId,
-        p.correlationId,
+    for (const item of recoverable.values()) {
+      const convKey = compositeKey(item.adapterId, item.conversationKey);
+      const entries = this.idempotency.getEntriesByCorrelation(
+        item.adapterId,
+        item.correlationId,
       );
       if (entries.length === 0) continue;
 
-      const messageIds = new Set(entries.map((e) => e.messageId));
-      const emitter = this.createEmitterWithMessages(
-        p.adapterId,
-        p.conversationKey,
-        p.correlationId,
-        messageIds,
-      );
-
-      // Track as a terminal correlation (no lease, no child events).
-      const corr: ActiveCorrelation = {
-        correlationId: p.correlationId,
-        adapterId: p.adapterId,
-        conversationKey: p.conversationKey,
-        messageIds,
-        emitter,
-        lease: null,
-        pendingFollowUps: 0,
-        terminalEmitted: true,
-      };
-      this.active.set(convKey, corr);
-
-      recoverPromises.push(
-        emitter.resumePending().then(() => emitter.flush()).then(() => {
-          // Clean up the transient recovery correlation once delivery settles.
-          const c = this.active.get(convKey);
-          if (c && !c.lease) {
-            c.emitter.close();
-            this.active.delete(convKey);
+      const previous = this.recoveryChains.get(convKey) ?? Promise.resolve();
+      const recovery = previous
+        .catch(() => {})
+        .then(async () => {
+          const messageIds = new Set(entries.map((entry) => entry.messageId));
+          const emitter = this.createEmitterWithMessages(
+            item.adapterId,
+            item.conversationKey,
+            item.correlationId,
+            messageIds,
+          );
+          try {
+            const terminal = entries.find(
+              (entry) => entry.deliveryState === "saved" && entry.response,
+            )?.response;
+            if (terminal) {
+              await emitter.redeliverDurable(terminal);
+            } else {
+              await emitter.resumePending();
+            }
+            await emitter.flush();
+          } finally {
+            emitter.close();
           }
-        }),
-      );
+        });
+      let tracked: Promise<void>;
+      tracked = recovery.finally(() => {
+        if (this.recoveryChains.get(convKey) === tracked) {
+          this.recoveryChains.delete(convKey);
+        }
+      });
+      this.recoveryChains.set(convKey, tracked);
+      recoverPromises.push(tracked);
     }
 
     await Promise.allSettled(recoverPromises);
@@ -268,7 +293,11 @@ export class CoreSupervisor {
    * The HTTP layer should respond as soon as this returns; the LLM turn and
    * final callback happen asynchronously.
    */
-  async processInbound(adapterId: string, message: InboundMessage): Promise<InboundResult> {
+  async processInbound(
+    adapterId: string,
+    message: InboundMessage,
+  ): Promise<InboundResult> {
+    if (this.closed) throw new Error("CoreSupervisor is closed");
     const convKey = compositeKey(adapterId, message.conversationKey);
     const previous = this.inboundChains.get(convKey) ?? Promise.resolve();
     const run = previous
@@ -297,6 +326,10 @@ export class CoreSupervisor {
     adapterId: string,
     message: InboundMessage,
   ): Promise<InboundResult> {
+    const recovery = this.recoveryChains.get(
+      compositeKey(adapterId, message.conversationKey),
+    );
+    if (recovery) await recovery.catch(() => {});
     // 1. Idempotency: new messages join the active turn correlation.
     const activeCorrelation = this.active.get(
       compositeKey(adapterId, message.conversationKey),
@@ -317,17 +350,38 @@ export class CoreSupervisor {
 
     switch (beginResult.kind) {
       case "already-sent":
-        return { kind: "duplicate", correlationId: beginResult.correlationId, status: "duplicate" };
+        return {
+          kind: "duplicate",
+          correlationId: beginResult.correlationId,
+          status: "duplicate",
+        };
       case "response-saved":
       case "delivery-failed":
-        // Redeliver the saved terminal response through the emitter without
-        // another agent turn.
         await this.redeliverSaved(adapterId, message, beginResult);
-        return { kind: "duplicate", correlationId: beginResult.correlationId, status: "duplicate" };
+        return {
+          kind: "duplicate",
+          correlationId: beginResult.correlationId,
+          status: "duplicate",
+        };
       case "pending":
         // Duplicate pending: same message still in flight. Return duplicate
         // acceptance without another append/turn.
-        return { kind: "duplicate", correlationId: beginResult.correlationId, status: "duplicate" };
+        if (
+          !activeCorrelation &&
+          this.idempotency.getEntry(adapterId, message.messageId)
+            ?.ingestState === "pending"
+        ) {
+          this.terminalizeAcceptedInbound(
+            adapterId,
+            message,
+            beginResult.correlationId,
+          );
+        }
+        return {
+          kind: "duplicate",
+          correlationId: beginResult.correlationId,
+          status: "duplicate",
+        };
       case "created":
         // New correlation; proceed to ingest.
         break;
@@ -346,10 +400,11 @@ export class CoreSupervisor {
       try {
         await this.appendPassiveMessage(adapterId, message, false);
       } catch (err) {
-        // Passive append failed before the message was persisted. Discard
-        // the pending idempotency row so a retry can reprocess.
-        this.discardPending(adapterId, message.messageId);
-        throw err;
+        console.error(
+          `[ambient ingest] ${err instanceof Error ? err.message : String(err)}`,
+        );
+        this.terminalizeAcceptedInbound(adapterId, message, correlationId);
+        return { kind: "accepted", correlationId, status: "accepted" };
       }
       this.idempotency.markIngestComplete(adapterId, message.messageId);
       return { kind: "accepted", correlationId, status: "accepted" };
@@ -359,10 +414,10 @@ export class CoreSupervisor {
     try {
       await this.activate(adapterId, message, correlationId, ingestResult.mode);
     } catch (err) {
-      // Activation failed before the RPC prompt was acknowledged. Discard
-      // the pending idempotency row so a retry can reprocess.
-      this.discardPending(adapterId, message.messageId);
-      throw err;
+      console.error(
+        `[activation] ${err instanceof Error ? err.message : String(err)}`,
+      );
+      this.terminalizeAcceptedInbound(adapterId, message, correlationId);
     }
 
     return { kind: "accepted", correlationId, status: "accepted" };
@@ -390,14 +445,32 @@ export class CoreSupervisor {
   // ---- lifecycle ----
 
   /** Close the supervisor: drain pool, close stores, close emitters. */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
+    this.closePromise = this.closeImpl();
+    return this.closePromise;
+  }
 
-    // Flush and close all active emitters.
+  private async closeImpl(): Promise<void> {
+    // Closing the pool first stops active children and rejects queued
+    // acquisitions. Preserve its failure while still draining emitters and
+    // closing durable stores.
+    let poolError: unknown;
+    try {
+      await this.pool.close();
+    } catch (error) {
+      poolError = error;
+    }
+
+    // Any inbound work released by pool shutdown must finish its durable
+    // terminal transition before the idempotency store is closed.
+    await Promise.allSettled(this.inboundChains.values());
+    await Promise.allSettled(this.recoveryChains.values());
+
     const emitterPromises: Promise<void>[] = [];
     for (const corr of this.active.values()) {
-      emitterPromises.push(corr.emitter.flush().catch(() => {}));
+      emitterPromises.push(corr.emitter.flush());
     }
     await Promise.allSettled(emitterPromises);
 
@@ -405,17 +478,10 @@ export class CoreSupervisor {
       corr.emitter.close();
     }
     this.active.clear();
-
-    // Close the pool (drains all children).
-    try {
-      await this.pool.close();
-    } catch {
-      // Pool close errors are surfaced but do not block store cleanup.
-    }
-
-    // Close stores.
     this.idempotency.close();
     this.sessions.close();
+
+    if (poolError) throw poolError;
   }
 
   // ---- internals: activation ----
@@ -441,8 +507,6 @@ export class CoreSupervisor {
   ): Promise<void> {
     const convKey = compositeKey(adapterId, message.conversationKey);
     let corr = this.active.get(convKey);
-    let createdCorrelation = false;
-
     // One live lease stays held for an active correlation until terminal
     // completion; later arrivals use that child directly, never re-acquire.
     if (!corr) {
@@ -465,7 +529,6 @@ export class CoreSupervisor {
         terminalEmitted: false,
       };
       this.active.set(convKey, corr);
-      createdCorrelation = true;
 
       // Route this conversation's child once. Pool reuse must not accumulate
       // duplicate event listeners across successive correlations.
@@ -525,15 +588,23 @@ export class CoreSupervisor {
       if (mode === "followUp" && corr.pendingFollowUps > 0) {
         corr.pendingFollowUps--;
       }
-      corr.messageIds.delete(message.messageId);
-      if (createdCorrelation) {
-        this.cleanupCorrelation(convKey, corr);
-      }
+      void this.pool
+        .retireChild(adapterId, message.conversationKey, child)
+        .catch((closeError: unknown) => {
+          console.error(
+            `[rpc child close] ${closeError instanceof Error ? closeError.message : String(closeError)}`,
+          );
+        });
       throw error;
     }
 
-    // Mark ingest complete for this message (the turn has been dispatched).
-    this.idempotency.markIngestComplete(adapterId, message.messageId);
+    // A terminal event may have completed ingest before the prompt ack arrived.
+    if (
+      this.idempotency.getEntry(adapterId, message.messageId)?.ingestState ===
+      "pending"
+    ) {
+      this.idempotency.markIngestComplete(adapterId, message.messageId);
+    }
   }
 
   // ---- internals: passive message append ----
@@ -552,13 +623,28 @@ export class CoreSupervisor {
     const convKey = compositeKey(adapterId, message.conversationKey);
     const corr = this.active.get(convKey);
     if (corr && corr.lease) {
-      await this.runAmbientCommand(corr.lease.child, adapterId, message, triggerTurn);
+      await this.runAmbientCommand(
+        corr.lease.child,
+        adapterId,
+        message,
+        triggerTurn,
+      );
       return;
     }
     // No active child: acquire a lease just for the append, then release.
     const lease = await this.pool.acquire(adapterId, message.conversationKey);
     try {
-      await this.runAmbientCommand(lease.child, adapterId, message, triggerTurn);
+      await this.runAmbientCommand(
+        lease.child,
+        adapterId,
+        message,
+        triggerTurn,
+      );
+    } catch (error) {
+      void this.pool
+        .retireChild(adapterId, message.conversationKey, lease.child)
+        .catch(() => {});
+      throw error;
     } finally {
       lease.release();
     }
@@ -586,7 +672,9 @@ export class CoreSupervisor {
     });
     const payload = JSON.stringify({ content, triggerTurn });
     const encoded = Buffer.from(payload, "utf8").toString("base64url");
-    const response = await child.prompt(`/${AMBIENT_INGEST_COMMAND} ${encoded}`);
+    const response = await child.prompt(
+      `/${AMBIENT_INGEST_COMMAND} ${encoded}`,
+    );
     assertRpcSuccess(response, "ambient ingest");
   }
 
@@ -607,12 +695,14 @@ export class CoreSupervisor {
     });
     child.on("error", (error: Error) => {
       console.error(`[rpc child] ${error.message}`);
+      void this.pool
+        .retireChild(adapterId, conversationKey, child)
+        .catch((closeError: unknown) => {
+          console.error(
+            `[rpc child close] ${closeError instanceof Error ? closeError.message : String(closeError)}`,
+          );
+        });
       this.failCorrelation(convKey);
-      void child.close().catch((closeError: unknown) => {
-        console.error(
-          `[rpc child close] ${closeError instanceof Error ? closeError.message : String(closeError)}`,
-        );
-      });
     });
     child.on("exit", () => {
       if (!this.closed) {
@@ -683,7 +773,6 @@ export class CoreSupervisor {
    * hooks save/deliver across every message id in the group.
    */
   private handleAgentEnd(convKey: string, corr: ActiveCorrelation): void {
-
     if (corr.terminalEmitted) return;
     corr.terminalEmitted = true;
 
@@ -708,11 +797,14 @@ export class CoreSupervisor {
       corr.lease.release();
       corr.lease = null;
     }
-    corr.emitter.flush().then(() => {
-      corr.emitter.close();
-    }).catch(() => {
-      corr.emitter.close();
-    });
+    corr.emitter
+      .flush()
+      .then(() => {
+        corr.emitter.close();
+      })
+      .catch(() => {
+        corr.emitter.close();
+      });
   }
 
   // ---- internals: redelivery ----
@@ -725,13 +817,26 @@ export class CoreSupervisor {
     adapterId: string,
     message: InboundMessage,
     beginResult:
-      | { kind: "response-saved"; correlationId: string; response: OutboundEvent }
-      | { kind: "delivery-failed"; correlationId: string; response: OutboundEvent; error: string },
+      | {
+          kind: "response-saved";
+          correlationId: string;
+          response: OutboundEvent;
+        }
+      | {
+          kind: "delivery-failed";
+          correlationId: string;
+          response: OutboundEvent;
+          error: string;
+        },
   ): Promise<void> {
     const convKey = compositeKey(adapterId, message.conversationKey);
     let corr = this.active.get(convKey);
     if (!corr) {
-      const messageIds = new Set([message.messageId]);
+      const entries = this.idempotency.getEntriesByCorrelation(
+        adapterId,
+        beginResult.correlationId,
+      );
+      const messageIds = new Set(entries.map((entry) => entry.messageId));
       const emitter = this.createEmitter(
         adapterId,
         message.conversationKey,
@@ -750,9 +855,14 @@ export class CoreSupervisor {
       };
       this.active.set(convKey, corr);
     }
+    for (const entry of this.idempotency.getEntriesByCorrelation(
+      adapterId,
+      beginResult.correlationId,
+    )) {
+      corr.messageIds.add(entry.messageId);
+    }
 
-    // Resume any pending durable events for this correlation.
-    await corr.emitter.resumePending();
+    await corr.emitter.redeliverDurable(beginResult.response);
     await corr.emitter.flush();
 
     // If this was a transient redelivery correlation with no lease, clean up.
@@ -767,9 +877,8 @@ export class CoreSupervisor {
   // ---- internals: emitter creation ----
 
   /**
-   * Create an OutboundEmitter whose durable hooks share the correlation's
-   * mutable message-id set. The set remains available after active state is
-   * removed, so callback acknowledgement can still transition every row.
+   * Create an OutboundEmitter whose durable hooks resolve every persisted
+   * inbound row in the correlation at hook time.
    */
   private createEmitter(
     adapterId: string,
@@ -792,14 +901,20 @@ export class CoreSupervisor {
     correlationId: string,
     messageIds: Set<string>,
   ): OutboundEmitter {
-    const supervisor = this;
-    const resolveMessageIds = (): Set<string> => messageIds;
+    const resolveEntries = (): IdempotencyEntry[] => {
+      const entries = this.idempotency.getEntriesByCorrelation(
+        adapterId,
+        correlationId,
+      );
+      for (const entry of entries) messageIds.add(entry.messageId);
+      return entries;
+    };
 
     return new OutboundEmitter({
       adapterId,
       conversationKey,
       correlationId,
-      resolveAdapterTarget: (id) => supervisor.resolveAdapterTarget(id),
+      resolveAdapterTarget: (id) => this.resolveAdapterTarget(id),
       fetchImpl: this.fetchImpl,
       dbPath: this.config.outboxDbPath,
       progressThresholdMs: this.config.progressThresholdMs,
@@ -808,43 +923,94 @@ export class CoreSupervisor {
       now: this.now,
       uuid: this.uuid,
       logger: {
-        warn: (msg, extra) => console.error(`[emitter warn] ${msg}`, extra ?? {}),
-        error: (msg, extra) => console.error(`[emitter error] ${msg}`, extra ?? {}),
+        warn: (msg, extra) =>
+          console.error(`[emitter warn] ${msg}`, extra ?? {}),
+        error: (msg, extra) =>
+          console.error(`[emitter error] ${msg}`, extra ?? {}),
       },
       hooks: {
-        onDurablePrepared(event: OutboundEvent): void {
-          if (event.type !== "turn.reply" && event.type !== "turn.error") return;
-          for (const messageId of resolveMessageIds()) {
-            try {
-              supervisor.idempotency.saveResponse(adapterId, messageId, event);
-            } catch {
-              // A message id may already have its response saved from
-              // a prior attempt; that is fine for redelivery.
-            }
-          }
+        onDurablePrepared: (event: OutboundEvent): void => {
+          if (event.type !== "turn.reply" && event.type !== "turn.error")
+            return;
+          resolveEntries();
+          this.idempotency.saveResponseForCorrelation(
+            adapterId,
+            correlationId,
+            event,
+          );
         },
-        onDurableDelivered(event: OutboundEvent): void {
-          if (event.type !== "turn.reply" && event.type !== "turn.error") return;
-          for (const messageId of resolveMessageIds()) {
-            try {
-              supervisor.idempotency.markSent(adapterId, messageId);
-            } catch {
-              // Already sent or in an unexpected state; non-fatal.
-            }
-          }
+        onDurableDelivered: (event: OutboundEvent): void => {
+          if (event.type !== "turn.reply" && event.type !== "turn.error")
+            return;
+          resolveEntries();
+          this.idempotency.markCorrelationSent(
+            adapterId,
+            correlationId,
+            event.eventId,
+          );
         },
-        onDurableFailed(event: OutboundEvent, error: string): void {
-          if (event.type !== "turn.reply" && event.type !== "turn.error") return;
-          for (const messageId of resolveMessageIds()) {
-            try {
-              supervisor.idempotency.markFailed(adapterId, messageId, error);
-            } catch {
-              // Non-fatal; the response is retained for redelivery.
-            }
-          }
+        onDurableFailed: (event: OutboundEvent, error: string): void => {
+          if (event.type !== "turn.reply" && event.type !== "turn.error")
+            return;
+          resolveEntries();
+          this.idempotency.markCorrelationFailed(
+            adapterId,
+            correlationId,
+            event.eventId,
+            error,
+          );
         },
       },
     });
+  }
+
+  /**
+   * Convert a post-reservation ingest failure into a durable terminal callback.
+   * The terminal save also completes any row whose prompt acknowledgement was
+   * overtaken by child events.
+   */
+  private terminalizeAcceptedInbound(
+    adapterId: string,
+    message: InboundMessage,
+    correlationId: string,
+  ): void {
+    if (this.idempotency.getEntry(adapterId, message.messageId)?.response)
+      return;
+    const convKey = compositeKey(adapterId, message.conversationKey);
+    let corr = this.active.get(convKey);
+    if (!corr) {
+      const entries = this.idempotency.getEntriesByCorrelation(
+        adapterId,
+        correlationId,
+      );
+      const messageIds = new Set(entries.map((entry) => entry.messageId));
+      const emitter = this.createEmitter(
+        adapterId,
+        message.conversationKey,
+        correlationId,
+        messageIds,
+      );
+      corr = {
+        correlationId,
+        adapterId,
+        conversationKey: message.conversationKey,
+        messageIds,
+        emitter,
+        lease: null,
+        pendingFollowUps: 0,
+        terminalEmitted: false,
+      };
+      this.active.set(convKey, corr);
+    }
+    if (corr.terminalEmitted) return;
+    corr.messageIds.add(message.messageId);
+    corr.terminalEmitted = true;
+    corr.emitter.emitProviderError({
+      code: "agent_unavailable",
+      message: "Agent process could not accept the message",
+      retryable: true,
+    });
+    this.cleanupCorrelation(convKey, corr);
   }
 
   /**
@@ -854,7 +1020,8 @@ export class CoreSupervisor {
   private resolveAdapterTarget(adapterId: string): AdapterTarget | null {
     if (!this.adapters.has(adapterId)) return null;
     const callbackUrl = this.adapters.getCallbackUrl(adapterId);
-    const sign = (body: string): string => this.adapters.signOutbound(adapterId, body);
+    const sign = (body: string): string =>
+      this.adapters.signOutbound(adapterId, body);
     return { callbackUrl, sign };
   }
 
@@ -912,18 +1079,6 @@ export class CoreSupervisor {
   // ---- internals: helpers ----
 
   /**
-   * Discard a pending idempotency row, swallowing errors if the row has
-   * already transitioned (e.g. by a concurrent completion).
-   */
-  private discardPending(adapterId: string, messageId: string): void {
-    try {
-      this.idempotency.discardPendingInbound(adapterId, messageId);
-    } catch {
-      // Row may have already transitioned; non-fatal for rollback.
-    }
-  }
-
-  /**
    * Check whether the conversation has an active correlation (a turn is
    * in flight). When true, the IngestBuffer selects streaming modes
    * (steer/followUp) for activation.
@@ -942,7 +1097,9 @@ export class CoreSupervisor {
  * Create a CoreSupervisor from a config and optional injectables. This is
  * the entry point for both the executable boot path and focused smoke tests.
  */
-export function createCoreSupervisor(options: CoreSupervisorOptions): CoreSupervisor {
+export function createCoreSupervisor(
+  options: CoreSupervisorOptions,
+): CoreSupervisor {
   return new CoreSupervisor(options);
 }
 

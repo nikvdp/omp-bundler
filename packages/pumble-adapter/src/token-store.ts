@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 export interface WorkspaceTokens {
@@ -16,32 +17,39 @@ interface TokenStoreData {
 export class TokenStore {
   private data: TokenStoreData = { workspaces: {} };
   private loaded = false;
+  private operationChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly filePath: string) {}
 
-  async saveOAuthPayload(payload: Record<string, unknown>) {
-    const workspaceId = stringField(payload, "workspaceId");
-    await this.load();
-    this.data.workspaces[workspaceId] = {
-      workspaceId,
-      accessToken: optionalString(payload.accessToken),
-      botToken: optionalString(payload.botToken),
-      userId: optionalString(payload.userId),
-      botId: optionalString(payload.botId),
-    };
-    await this.write();
+  saveOAuthPayload(payload: Record<string, unknown>): Promise<void> {
+    return this.serialize(async () => {
+      const workspaceId = stringField(payload, "workspaceId");
+      await this.load();
+      this.data.workspaces[workspaceId] = {
+        workspaceId,
+        accessToken: optionalString(payload.accessToken),
+        botToken: optionalString(payload.botToken),
+        userId: optionalString(payload.userId),
+        botId: optionalString(payload.botId),
+      };
+      await this.write();
+    });
   }
 
-  async getWorkspace(workspaceId: string) {
-    await this.load();
-    const tokens = this.data.workspaces[workspaceId];
-    return tokens ? { ...tokens } : null;
+  getWorkspace(workspaceId: string): Promise<WorkspaceTokens | null> {
+    return this.serialize(async () => {
+      await this.load();
+      const tokens = this.data.workspaces[workspaceId];
+      return tokens ? { ...tokens } : null;
+    });
   }
 
-  async deleteWorkspace(workspaceId: string) {
-    await this.load();
-    delete this.data.workspaces[workspaceId];
-    await this.write();
+  deleteWorkspace(workspaceId: string): Promise<void> {
+    return this.serialize(async () => {
+      await this.load();
+      delete this.data.workspaces[workspaceId];
+      await this.write();
+    });
   }
 
   /**
@@ -53,13 +61,13 @@ export class TokenStore {
     if (this.loaded) {
       return;
     }
-    this.loaded = true;
     let raw: string;
     try {
       raw = await readFile(this.filePath, "utf8");
     } catch (error) {
       if (isEnoent(error)) {
         this.data = { workspaces: {} };
+        this.loaded = true;
         return;
       }
       throw new Error(
@@ -84,18 +92,48 @@ export class TokenStore {
       );
     }
     this.data = parsed;
+    this.loaded = true;
   }
 
   private async write() {
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    const temp = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
-    await rename(temp, this.filePath);
+    const dir = path.dirname(this.filePath);
+    await mkdir(dir, { recursive: true });
+    const tempPath = `${this.filePath}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      const temp = await open(tempPath, "wx", 0o600);
+      try {
+        await temp.writeFile(JSON.stringify(this.data, null, 2), "utf8");
+        await temp.sync();
+      } finally {
+        await temp.close();
+      }
+      await rename(tempPath, this.filePath);
+      const directory = await open(dir, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch (error) {
+      await rm(tempPath, { force: true });
+      throw error;
+    }
+  }
+
+  private serialize<T>(action: () => Promise<T>): Promise<T> {
+    const result = this.operationChain.catch(() => undefined).then(action);
+    this.operationChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 }
 
 function isEnoent(error: unknown): boolean {
-  return error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT";
+  return (
+    error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 function isValidTokenData(value: unknown): value is TokenStoreData {
@@ -104,13 +142,37 @@ function isValidTokenData(value: unknown): value is TokenStoreData {
   }
   const record = value as Record<string, unknown>;
   const workspaces = record.workspaces;
-  if (workspaces === null || typeof workspaces !== "object" || Array.isArray(workspaces)) {
+  if (
+    workspaces === null ||
+    typeof workspaces !== "object" ||
+    Array.isArray(workspaces)
+  ) {
     return false;
   }
   const wsRecord = workspaces as Record<string, unknown>;
-  for (const entry of Object.values(wsRecord)) {
+  for (const [workspaceId, entry] of Object.entries(wsRecord)) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
       return false;
+    }
+    const tokens = entry as Record<string, unknown>;
+    if (
+      !workspaceId ||
+      tokens.workspaceId !== workspaceId ||
+      !Object.keys(tokens).every((key) =>
+        ["workspaceId", "accessToken", "botToken", "userId", "botId"].includes(
+          key,
+        ),
+      )
+    ) {
+      return false;
+    }
+    for (const key of ["accessToken", "botToken", "userId", "botId"] as const) {
+      if (
+        tokens[key] !== undefined &&
+        (typeof tokens[key] !== "string" || tokens[key].length === 0)
+      ) {
+        return false;
+      }
     }
   }
   return true;

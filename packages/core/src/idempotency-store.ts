@@ -478,15 +478,15 @@ export class IdempotencyStore {
 
   /**
    * Save a terminal event before delivery: delivery pending -> saved.
-   * Requires ingest to be complete and the event to be a terminal
-   * `turn.reply` or `turn.error` whose correlationId and conversationKey
-   * match the stored row. A model/turn error IS a `turn.error` event saved
-   * here, never a markFailed from the pending state. The event is
-   * serialized as JSON.
-   * Compare-and-set: throws {@link InvalidStateTransitionError} if the row
-   * is absent, ingest is not complete, or delivery is not pending. Throws
-   * loudly on a non-terminal event type or a correlation/conversation
-   * mismatch (the stored row is never mutated by a mismatched save).
+   * Atomically completes ingest as well, because a terminal child event proves
+   * the prompt was accepted even when it arrives before the RPC acknowledgement.
+   * The event must be a terminal `turn.reply` or `turn.error` whose
+   * correlationId and conversationKey match the stored row. A model/turn error
+   * IS a `turn.error` event saved here, never a markFailed from the pending
+   * state. The event is serialized as JSON.
+   * Compare-and-set: throws {@link InvalidStateTransitionError} if the row is
+   * absent or delivery is not pending. Throws loudly on a non-terminal event
+   * type or a correlation/conversation mismatch.
    */
   saveResponse(
     adapterId: string,
@@ -527,13 +527,13 @@ export class IdempotencyStore {
     const payload = JSON.stringify(event);
     const info = this.db.run(
       `UPDATE idempotency_store
-          SET delivery_state   = 'saved',
+          SET ingest_state     = 'completed',
+              delivery_state   = 'saved',
               response_payload = ?,
               error_text       = NULL,
               updated_at       = ?
-        WHERE adapter_id    = ?
-          AND message_id    = ?
-          AND ingest_state   = 'completed'
+        WHERE adapter_id     = ?
+          AND message_id     = ?
           AND delivery_state = 'pending'`,
       [payload, ts, adapterId, messageId],
     );
@@ -542,10 +542,9 @@ export class IdempotencyStore {
       throw new InvalidStateTransitionError(
         adapterId,
         messageId,
-        `saveResponse requires ingest_state=completed and delivery_state=pending` +
+        `saveResponse requires delivery_state=pending` +
           ` for adapter="${adapterId}" message="${messageId}"` +
-          ` but found ingest_state=${fresh?.ingestState ?? "absent"},` +
-          ` delivery_state=${fresh?.deliveryState ?? "absent"}`,
+          ` but found delivery_state=${fresh?.deliveryState ?? "absent"}`,
       );
     }
   }
@@ -571,7 +570,12 @@ export class IdempotencyStore {
       [ts, adapterId, messageId],
     );
     if (info.changes === 0) {
-      this.assertRowExists(adapterId, messageId, "delivery_state", "saved|failed");
+      this.assertRowExists(
+        adapterId,
+        messageId,
+        "delivery_state",
+        "saved|failed",
+      );
     }
   }
 
@@ -599,6 +603,145 @@ export class IdempotencyStore {
     );
     if (info.changes === 0) {
       this.assertRowExists(adapterId, messageId, "delivery_state", "saved");
+    }
+  }
+
+  /**
+   * Atomically save one terminal response across every inbound row attached to
+   * a correlation. Existing rows already carrying the same event are retained.
+   */
+  saveResponseForCorrelation(
+    adapterId: string,
+    correlationId: string,
+    event: OutboundEvent,
+  ): void {
+    if (event.type !== "turn.reply" && event.type !== "turn.error") {
+      throw new Error(
+        `correlation response must be terminal, got "${event.type}"`,
+      );
+    }
+    if (event.correlationId !== correlationId) {
+      throw new Error(
+        `event.correlationId mismatch for correlation "${correlationId}"`,
+      );
+    }
+    const entries = this.getEntriesByCorrelation(adapterId, correlationId);
+    if (entries.length === 0) {
+      throw new Error(
+        `no idempotency entries for correlation "${correlationId}"`,
+      );
+    }
+    let pending = 0;
+    for (const entry of entries) {
+      if (entry.conversationKey !== event.conversationKey) {
+        throw new Error(
+          `event.conversationKey mismatch for adapter="${adapterId}" message="${entry.messageId}"`,
+        );
+      }
+      if (entry.deliveryState === "pending") {
+        pending++;
+      } else if (entry.response?.eventId !== event.eventId) {
+        throw new Error(
+          `terminal event mismatch for adapter="${adapterId}" message="${entry.messageId}"`,
+        );
+      }
+    }
+    if (pending === 0) return;
+    const info = this.db.run(
+      `UPDATE idempotency_store
+          SET ingest_state     = 'completed',
+              delivery_state   = 'saved',
+              response_payload = ?,
+              error_text       = NULL,
+              updated_at       = ?
+        WHERE adapter_id      = ?
+          AND correlation_id  = ?
+          AND delivery_state  = 'pending'`,
+      [JSON.stringify(event), nowUtc(), adapterId, correlationId],
+    );
+    if (info.changes !== pending) {
+      throw new Error(
+        `correlation "${correlationId}" changed while saving its response`,
+      );
+    }
+  }
+
+  /** Atomically mark the matching terminal response sent for all siblings. */
+  markCorrelationSent(
+    adapterId: string,
+    correlationId: string,
+    eventId: string,
+  ): void {
+    const entries = this.getEntriesByCorrelation(adapterId, correlationId);
+    let unsent = 0;
+    for (const entry of entries) {
+      if (
+        entry.response?.eventId !== eventId ||
+        (entry.deliveryState !== "saved" &&
+          entry.deliveryState !== "failed" &&
+          entry.deliveryState !== "sent")
+      ) {
+        throw new Error(
+          `cannot confirm terminal delivery for adapter="${adapterId}" message="${entry.messageId}"`,
+        );
+      }
+      if (entry.deliveryState !== "sent") unsent++;
+    }
+    if (unsent === 0) return;
+    const info = this.db.run(
+      `UPDATE idempotency_store
+          SET delivery_state = 'sent',
+              error_text     = NULL,
+              updated_at     = ?
+        WHERE adapter_id       = ?
+          AND correlation_id   = ?
+          AND delivery_state IN ('saved', 'failed')`,
+      [nowUtc(), adapterId, correlationId],
+    );
+    if (info.changes !== unsent) {
+      throw new Error(
+        `correlation "${correlationId}" changed while marking it sent`,
+      );
+    }
+  }
+
+  /** Atomically retain one delivery failure across all unsent siblings. */
+  markCorrelationFailed(
+    adapterId: string,
+    correlationId: string,
+    eventId: string,
+    error: unknown,
+  ): void {
+    const entries = this.getEntriesByCorrelation(adapterId, correlationId);
+    let saved = 0;
+    for (const entry of entries) {
+      if (
+        entry.response?.eventId !== eventId ||
+        (entry.deliveryState !== "saved" &&
+          entry.deliveryState !== "failed" &&
+          entry.deliveryState !== "sent")
+      ) {
+        throw new Error(
+          `cannot record terminal failure for adapter="${adapterId}" message="${entry.messageId}"`,
+        );
+      }
+      if (entry.deliveryState === "saved") saved++;
+    }
+    if (saved === 0) return;
+    const info = this.db.run(
+      `UPDATE idempotency_store
+          SET delivery_state = 'failed',
+              error_text     = ?,
+              updated_at     = ?
+        WHERE adapter_id      = ?
+          AND correlation_id  = ?
+          AND delivery_state  = 'saved'`,
+      [curateErrorText(error), nowUtc(), adapterId, correlationId],
+    );
+    if (info.changes !== saved) {
+      throw new Error(
+        `correlation "${correlationId}" changed while marking it failed`,
+      );
     }
   }
 
@@ -652,6 +795,21 @@ export class IdempotencyStore {
       .map((row) => rowToEntry(row as Record<string, unknown>));
   }
 
+  /** Return saved terminal responses that still need delivery reconciliation. */
+  listSavedResponses(): IdempotencyEntry[] {
+    return this.db
+      .query(
+        `SELECT adapter_id, message_id, conversation_key, correlation_id,
+                payload_hash, ingest_state, delivery_state,
+                response_payload, error_text, created_at, updated_at
+           FROM idempotency_store
+          WHERE delivery_state = 'saved'
+          ORDER BY created_at, adapter_id, correlation_id, message_id`,
+      )
+      .all()
+      .map((row) => rowToEntry(row as Record<string, unknown>));
+  }
+
   // ---- close ----
 
   /** Close the database handle. Safe to call multiple times. */
@@ -663,7 +821,10 @@ export class IdempotencyStore {
 
   // ---- internals ----
 
-  private getRaw(adapterId: string, messageId: string): IdempotencyEntry | null {
+  private getRaw(
+    adapterId: string,
+    messageId: string,
+  ): IdempotencyEntry | null {
     const row = this.db
       .query(
         `SELECT adapter_id, message_id, conversation_key, correlation_id,

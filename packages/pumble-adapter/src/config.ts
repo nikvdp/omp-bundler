@@ -39,9 +39,17 @@ export interface BridgeConfig {
 }
 
 export function loadBridgeConfig(env = process.env): BridgeConfig {
-  const dataDir = valueOrDefault(env.PUMBLE_BRIDGE_DATA_DIR, "/data", "PUMBLE_BRIDGE_DATA_DIR");
+  const dataDir = valueOrDefault(
+    env.PUMBLE_BRIDGE_DATA_DIR,
+    "/data",
+    "PUMBLE_BRIDGE_DATA_DIR",
+  );
   return {
-    host: valueOrDefault(env.PUMBLE_BRIDGE_HOST, "0.0.0.0", "PUMBLE_BRIDGE_HOST"),
+    host: valueOrDefault(
+      env.PUMBLE_BRIDGE_HOST,
+      "0.0.0.0",
+      "PUMBLE_BRIDGE_HOST",
+    ),
     port: positiveNumberEnv("PUMBLE_BRIDGE_PORT", env.PUMBLE_BRIDGE_PORT, 8765),
     dataDir,
     pumbleDataDir: valueOrDefault(
@@ -64,14 +72,17 @@ export function loadBridgeConfig(env = process.env): BridgeConfig {
       env.PUMBLE_FILE_MAX_BYTES,
       512 * 1024 * 1024,
     ),
-    publicBaseUrl: requiredEnv(env.PUMBLE_PUBLIC_BASE_URL, "PUMBLE_PUBLIC_BASE_URL").replace(
-      /\/$/,
-      "",
-    ),
+    publicBaseUrl: publicBaseUrlEnv(env.PUMBLE_PUBLIC_BASE_URL),
     appId: requiredEnv(env.PUMBLE_APP_ID, "PUMBLE_APP_ID"),
-    clientSecret: requiredEnv(env.PUMBLE_APP_CLIENT_SECRET, "PUMBLE_APP_CLIENT_SECRET"),
+    clientSecret: requiredEnv(
+      env.PUMBLE_APP_CLIENT_SECRET,
+      "PUMBLE_APP_CLIENT_SECRET",
+    ),
     appKey: requiredEnv(env.PUMBLE_APP_KEY, "PUMBLE_APP_KEY"),
-    signingSecret: requiredEnv(env.PUMBLE_APP_SIGNING_SECRET, "PUMBLE_APP_SIGNING_SECRET"),
+    signingSecret: requiredEnv(
+      env.PUMBLE_APP_SIGNING_SECRET,
+      "PUMBLE_APP_SIGNING_SECRET",
+    ),
     workspaceId: env.PUMBLE_WORKSPACE_ID?.trim() ?? "",
     workspaceUserId: env.PUMBLE_WORKSPACE_USER_ID?.trim() ?? "",
     pumbleApiBaseUrl: valueOrDefault(
@@ -99,8 +110,15 @@ export function loadBridgeConfig(env = process.env): BridgeConfig {
       env.PUMBLE_SIGNATURE_TOLERANCE_SECONDS,
       300,
     ),
-    coreUrl: requiredEnv(env.PUMBLE_CORE_URL, "PUMBLE_CORE_URL").replace(/\/$/, ""),
-    coreAdapterId: valueOrDefault(env.PUMBLE_ADAPTER_ID, "pumble", "PUMBLE_ADAPTER_ID"),
+    coreUrl: requiredEnv(env.PUMBLE_CORE_URL, "PUMBLE_CORE_URL").replace(
+      /\/$/,
+      "",
+    ),
+    coreAdapterId: valueOrDefault(
+      env.PUMBLE_ADAPTER_ID,
+      "pumble",
+      "PUMBLE_ADAPTER_ID",
+    ),
     coreSharedSecret: requiredEnv(
       env.PUMBLE_CORE_SHARED_SECRET,
       "PUMBLE_CORE_SHARED_SECRET",
@@ -146,7 +164,25 @@ function positiveNumberEnv(
   }
   return parsed;
 }
- 
+
+function publicBaseUrlEnv(value: string | undefined): string {
+  const raw = requiredEnv(value, "PUMBLE_PUBLIC_BASE_URL").replace(/\/$/, "");
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("PUMBLE_PUBLIC_BASE_URL must be an absolute URL");
+  }
+  const loopback =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+    throw new Error("PUMBLE_PUBLIC_BASE_URL must use HTTPS outside localhost");
+  }
+  return raw;
+}
+
 function requiredEnv(value: string | undefined, name: string): string {
   const trimmed = value?.trim();
   if (!trimmed) throw new Error(`${name} is required`);

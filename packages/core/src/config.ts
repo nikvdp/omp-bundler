@@ -101,7 +101,11 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
   const idleTimeoutMs = requiredInt(env, "OMP_IDLE_TIMEOUT_MS");
   const engagementWindowMs = requiredInt(env, "OMP_ENGAGEMENT_WINDOW_MS");
   const callbackTimeoutMs = requiredInt(env, "OMP_CALLBACK_TIMEOUT_MS");
-  const progressThresholdMs = optionalInt(env, "OMP_PROGRESS_THRESHOLD_MS", 500);
+  const progressThresholdMs = optionalInt(
+    env,
+    "OMP_PROGRESS_THRESHOLD_MS",
+    500,
+  );
   const retryDelaysMs = parseRetryDelays(env.OMP_RETRY_DELAYS_MS);
 
   const adapters = parseAdapters(env.OMP_ADAPTERS);
@@ -183,7 +187,11 @@ function requiredInt(env: CoreConfigEnv, key: string): number {
   return n;
 }
 
-function optionalInt(env: CoreConfigEnv, key: string, fallback: number): number {
+function optionalInt(
+  env: CoreConfigEnv,
+  key: string,
+  fallback: number,
+): number {
   const raw = env[key]?.trim();
   if (!raw) return fallback;
   const n = Number(raw);
@@ -210,12 +218,17 @@ function parseArgs(raw: string | undefined): string[] {
 function parseRetryDelays(raw: string | undefined): number[] {
   const trimmed = raw?.trim();
   if (!trimmed) return [];
-  const parts = trimmed.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const parts = trimmed
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
   const result: number[] = [];
   for (const p of parts) {
     const n = Number(p);
     if (!Number.isFinite(n) || n < 0) {
-      throw new Error(`OMP_RETRY_DELAYS_MS entries must be nonnegative numbers, got: ${p}`);
+      throw new Error(
+        `OMP_RETRY_DELAYS_MS entries must be nonnegative numbers, got: ${p}`,
+      );
     }
     result.push(Math.floor(n));
   }
@@ -230,16 +243,22 @@ function parseRetryDelays(raw: string | undefined): number[] {
 function parseAdapters(raw: string | undefined): AdapterRegistration[] {
   const trimmed = raw?.trim();
   if (!trimmed) {
-    throw new Error("missing required environment variable: OMP_ADAPTERS (JSON array)");
+    throw new Error(
+      "missing required environment variable: OMP_ADAPTERS (JSON array)",
+    );
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(trimmed);
   } catch (err) {
-    throw new Error(`OMP_ADAPTERS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(
+      `OMP_ADAPTERS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
   if (!Array.isArray(parsed)) {
-    throw new Error("OMP_ADAPTERS must be a JSON array of adapter registrations");
+    throw new Error(
+      "OMP_ADAPTERS must be a JSON array of adapter registrations",
+    );
   }
   const entries: AdapterRegistration[] = [];
   for (let i = 0; i < parsed.length; i++) {
@@ -256,10 +275,16 @@ function parseAdapters(raw: string | undefined): AdapterRegistration[] {
   return entries;
 }
 
-function strField(obj: Record<string, unknown>, name: string, index: number): string {
+function strField(
+  obj: Record<string, unknown>,
+  name: string,
+  index: number,
+): string {
   const v = obj[name];
   if (typeof v !== "string" || v.length === 0) {
-    throw new Error(`OMP_ADAPTERS[${index}].${name} must be a non-empty string`);
+    throw new Error(
+      `OMP_ADAPTERS[${index}].${name} must be a non-empty string`,
+    );
   }
   return v;
 }

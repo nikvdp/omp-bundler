@@ -92,7 +92,9 @@ const NON_HUMAN_AUTHOR_TYPES: Record<string, true> = {
  * activation. Those belong to {@link normalizePumbleMessage}, once channel
  * resolution, display-name lookup, and attachment download have run.
  */
-export function parseNewMessage(payload: Record<string, unknown>): PumbleMessageEvent | null {
+export function parseNewMessage(
+  payload: Record<string, unknown>,
+): PumbleMessageEvent | null {
   const body = bodyMapping(payload.body);
   const workspaceId = stringValue(payload.workspaceId) || stringValue(body.wId);
   const channelId = stringValue(body.cId) || stringValue(payload.channelId);
@@ -100,11 +102,21 @@ export function parseNewMessage(payload: Record<string, unknown>): PumbleMessage
   const authorId = stringValue(body.aId) || stringValue(payload.authorId);
   const text = stringValue(body.tx) || stringValue(payload.text);
   const files = parseFiles(body.f);
-  if (!workspaceId || !channelId || !messageId || !authorId || (!text && files.length === 0)) {
+  if (
+    !workspaceId ||
+    !channelId ||
+    !messageId ||
+    !authorId ||
+    (!text && files.length === 0)
+  ) {
     return null;
   }
-  const channelTypeRaw = stringValue(body.channelType || body.chType || body.cType || payload.channelType).toUpperCase();
-  const authorTypeRaw = stringValue(body.aType || body.authorType || payload.authorType).toUpperCase();
+  const channelTypeRaw = stringValue(
+    body.channelType || body.chType || body.cType || payload.channelType,
+  ).toUpperCase();
+  const authorTypeRaw = stringValue(
+    body.aType || body.authorType || payload.authorType,
+  ).toUpperCase();
   return {
     workspaceId,
     channelId,
@@ -158,7 +170,8 @@ export function normalizePumbleMessage(
 
   const channelType = ctx.channelType.toUpperCase();
   const direct = DIRECT_CHANNEL_TYPES[channelType] === true;
-  const mentioned = Boolean(ctx.botId) && event.mentionedUserIds.includes(ctx.botId!);
+  const mentioned =
+    Boolean(ctx.botId) && event.mentionedUserIds.includes(ctx.botId!);
 
   const text = stripBotMentionToken(event.text, ctx.botId);
   if (!text && ctx.attachments.length === 0) {
@@ -240,7 +253,10 @@ function parseFiles(value: unknown): PumbleMessageFile[] {
         mimeType: optionalString(file.mimeType) ?? undefined,
         path: path || undefined,
         publicPath: publicPath || undefined,
-        size: typeof file.size === "number" && Number.isFinite(file.size) ? file.size : undefined,
+        size:
+          typeof file.size === "number" && Number.isFinite(file.size)
+            ? file.size
+            : undefined,
       },
     ];
   });

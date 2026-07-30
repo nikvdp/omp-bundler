@@ -10,5 +10,7 @@ console.log(
   `>>> orphan sweep: reclaimed=${result.reclaimed.length} stale=${result.stale.length} denied=${result.denied.length}`,
 );
 if (result.denied.length > 0) {
-  throw new Error(`orphan sweep could not reclaim ${result.denied.length} process group(s)`);
+  throw new Error(
+    `orphan sweep could not reclaim ${result.denied.length} process group(s)`,
+  );
 }

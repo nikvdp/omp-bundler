@@ -12,6 +12,11 @@ const botScopes = [
 ];
 const userScopes = ["messages:read"];
 
+export const pumbleAuthorizationScopes = [
+  ...userScopes,
+  ...botScopes.map((scope) => `bot:${scope}`),
+];
+
 export function buildManifest(config: BridgeConfig) {
   return {
     name: config.manifestName,
@@ -28,6 +33,7 @@ export function buildManifest(config: BridgeConfig) {
       events: ["APP_UNAUTHORIZED", "APP_UNINSTALLED", "NEW_MESSAGE"],
     },
     redirectUrls: [joinPublicUrl(config, "/pumble/oauth/callback")],
+    listingUrl: joinPublicUrl(config, "/pumble/oauth/start"),
     offlineMessage: "agent is currently unavailable.",
   };
 }

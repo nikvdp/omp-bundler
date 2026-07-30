@@ -1,4 +1,4 @@
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 interface StringSchema {
@@ -131,17 +131,32 @@ function decodePayload(args: string): AmbientCommandPayload {
   return { content: value.content, triggerTurn: value.triggerTurn };
 }
 
-async function resolveAttachment(params: DeliveryAttachmentParams): Promise<DeliveryAttachment> {
+async function resolveAttachment(
+  params: DeliveryAttachmentParams,
+): Promise<DeliveryAttachment> {
   if (isAbsolute(params.path)) {
     throw new Error("attachment path must be workspace-relative");
   }
-  const workspace = resolve(process.cwd());
+  const workspace = await realpath(process.cwd());
   const absolutePath = resolve(workspace, params.path);
   const workspacePath = relative(workspace, absolutePath);
-  if (!workspacePath || workspacePath === ".." || workspacePath.startsWith(`..${sep}`)) {
+  if (
+    !workspacePath ||
+    workspacePath === ".." ||
+    workspacePath.startsWith(`..${sep}`)
+  ) {
     throw new Error("attachment path must stay inside the workspace");
   }
-  const info = await stat(absolutePath);
+  const realPath = await realpath(absolutePath);
+  const realWorkspacePath = relative(workspace, realPath);
+  if (
+    !realWorkspacePath ||
+    realWorkspacePath === ".." ||
+    realWorkspacePath.startsWith(`..${sep}`)
+  ) {
+    throw new Error("attachment path must stay inside the workspace");
+  }
+  const info = await stat(realPath);
   if (!info.isFile()) {
     throw new Error("attachment path must name a regular file");
   }

@@ -363,9 +363,16 @@ export class OutboundEmitter {
    */
   private deliveryChain: Promise<void> = Promise.resolve();
 
+  /** Shared completion for concurrent recovery calls on this correlation. */
+  private resumePromise: Promise<void> | null = null;
+
+  /** Per-event completion for concurrent explicit permanent-failure retries. */
+  private readonly retryPromises = new Map<string, Promise<void>>();
+
   constructor(options: OutboundEmitterOptions) {
     if (!options.adapterId) throw new Error("adapterId is required");
-    if (!options.conversationKey) throw new Error("conversationKey is required");
+    if (!options.conversationKey)
+      throw new Error("conversationKey is required");
     if (!options.correlationId) throw new Error("correlationId is required");
     if (!options.resolveAdapterTarget) {
       throw new Error("resolveAdapterTarget is required");
@@ -376,7 +383,9 @@ export class OutboundEmitter {
       !Number.isFinite(options.progressThresholdMs) ||
       options.progressThresholdMs < 0
     ) {
-      throw new Error("progressThresholdMs must be a nonnegative finite number");
+      throw new Error(
+        "progressThresholdMs must be a nonnegative finite number",
+      );
     }
     if (
       !Number.isFinite(options.requestTimeoutMs) ||
@@ -389,7 +398,9 @@ export class OutboundEmitter {
     }
     for (const d of options.retryDelaysMs) {
       if (!Number.isFinite(d) || d < 0) {
-        throw new Error("retryDelaysMs entries must be nonnegative finite numbers");
+        throw new Error(
+          "retryDelaysMs entries must be nonnegative finite numbers",
+        );
       }
     }
 
@@ -503,7 +514,11 @@ export class OutboundEmitter {
    * exactly one turn.error event for the correlation. No-op if a terminal
    * event was already emitted.
    */
-  emitProviderError(error: { code: string; message: string; retryable: boolean }): void {
+  emitProviderError(error: {
+    code: string;
+    message: string;
+    retryable: boolean;
+  }): void {
     if (this.terminalEmitted) return;
     this.terminalEmitted = true;
     this.ensureStarted();
@@ -564,31 +579,126 @@ export class OutboundEmitter {
    * exhausted); they are surfaced via {@link permanentFailures}.
    */
   async resumePending(): Promise<void> {
-    const rows = this.db
-      .query(
-        `SELECT payload, attempts FROM outbound_outbox
-          WHERE adapter_id = ? AND correlation_id = ? AND status = 'pending'
-          ORDER BY sequence ASC`,
-      )
-      .all(this.opts.adapterId, this.opts.correlationId) as {
+    if (this.resumePromise) return this.resumePromise;
+    const operation = (async () => {
+      const rows = this.db
+        .query(
+          `SELECT payload, attempts FROM outbound_outbox
+            WHERE adapter_id = ? AND correlation_id = ? AND status = 'pending'
+            ORDER BY sequence ASC`,
+        )
+        .all(this.opts.adapterId, this.opts.correlationId) as {
         payload: string;
         attempts: number;
       }[];
 
-    // Parse each persisted payload back into a concrete OutboundEvent so the
-    // durable hooks (onDurableDelivered/onDurableFailed) receive a real event
-    // object on resume, not a row id. Enqueue onto the shared deliveryChain so
-    // resumed deliveries neither race live ones nor reorder events.
-    const tails: Promise<void>[] = [];
-    for (const row of rows) {
-      const event = JSON.parse(row.payload) as OutboundEvent;
-      tails.push(
-        this.enqueue(() =>
-          this.deliverPayload(event, row.payload, row.attempts),
-        ),
+      // Parse each persisted payload back into a concrete OutboundEvent so the
+      // durable hooks receive the real event on every recovery path.
+      const tails: Promise<void>[] = [];
+      for (const row of rows) {
+        const event = JSON.parse(row.payload) as OutboundEvent;
+        tails.push(
+          this.enqueue(() =>
+            this.deliverPayload(event, row.payload, row.attempts),
+          ),
+        );
+      }
+      await Promise.all(tails);
+    })();
+    let tracked: Promise<void>;
+    tracked = operation.finally(() => {
+      if (this.resumePromise === tracked) this.resumePromise = null;
+    });
+    this.resumePromise = tracked;
+    return tracked;
+  }
+
+  /**
+   * Explicitly retry one retained permanent failure from the beginning of the
+   * configured retry schedule. The persisted payload and eventId are reused.
+   * The row is reset to pending before enqueueing so a crash is recoverable.
+   */
+  async retryPermanentFailure(eventId: string): Promise<void> {
+    const existing = this.retryPromises.get(eventId);
+    if (existing) return existing;
+    const operation = this.retryPermanentFailureOnce(eventId);
+    let tracked: Promise<void>;
+    tracked = operation.finally(() => {
+      if (this.retryPromises.get(eventId) === tracked) {
+        this.retryPromises.delete(eventId);
+      }
+    });
+    this.retryPromises.set(eventId, tracked);
+    return tracked;
+  }
+
+  private async retryPermanentFailureOnce(eventId: string): Promise<void> {
+    const row = this.db
+      .query(
+        `SELECT payload FROM outbound_outbox
+          WHERE event_id = ?
+            AND adapter_id = ?
+            AND correlation_id = ?
+            AND status = 'permanent_failure'`,
+      )
+      .get(eventId, this.opts.adapterId, this.opts.correlationId) as
+      | { payload: string }
+      | undefined;
+    if (!row) {
+      throw new Error(
+        `no permanent outbound failure found for event "${eventId}"`,
       );
     }
-    await Promise.all(tails);
+
+    const event = JSON.parse(row.payload) as OutboundEvent;
+    this.opts.hooks.onDurablePrepared?.(event);
+    const update = this.db.run(
+      `UPDATE outbound_outbox
+          SET status = 'pending', attempts = 0, last_error = NULL, updated_at = ?
+        WHERE event_id = ?
+          AND status = 'permanent_failure'`,
+      [nowUtc(), eventId],
+    );
+    if (update.changes !== 1) {
+      throw new Error(`outbound failure "${eventId}" changed before retry`);
+    }
+    await this.enqueue(() => this.deliverPayload(event, row.payload, 0));
+  }
+
+  /**
+   * Reconcile and redeliver a terminal response retained by the inbound store.
+   * This also repairs a crash between the prepared hook and outbox insertion.
+   */
+  async redeliverDurable(event: OutboundEvent): Promise<void> {
+    const payload = JSON.stringify(event);
+    const row = this.db
+      .query(
+        `SELECT payload, status FROM outbound_outbox
+          WHERE event_id = ?
+            AND adapter_id = ?
+            AND correlation_id = ?`,
+      )
+      .get(event.eventId, this.opts.adapterId, this.opts.correlationId) as
+      | { payload: string; status: OutboxStatus }
+      | undefined;
+    if (!row) {
+      this.deliverDurable(event);
+      await this.flush();
+      return;
+    }
+    if (row.payload !== payload) {
+      throw new DuplicateEventConflictError(
+        event.eventId,
+        new Error("saved terminal payload differs from outbox payload"),
+      );
+    }
+    if (row.status === "pending") {
+      await this.resumePending();
+    } else if (row.status === "permanent_failure") {
+      await this.retryPermanentFailure(event.eventId);
+    } else {
+      this.opts.hooks.onDurableDelivered?.(event);
+    }
   }
 
   /** Await all queued HTTP deliveries (the per-emitter delivery chain). */
@@ -608,9 +718,9 @@ export class OutboundEmitter {
           ORDER BY sequence ASC`,
       )
       .all(this.opts.adapterId, this.opts.correlationId, status) as Record<
-        string,
-        unknown
-      >[];
+      string,
+      unknown
+    >[];
     return rows.map(rowToOutboxRow);
   }
 
@@ -681,6 +791,14 @@ export class OutboundEmitter {
       });
       return;
     }
+    if (this.replyText.length === 0 && this.replyAttachments.length === 0) {
+      this.emitProviderError({
+        code: "empty_response",
+        message: "Agent completed without producing a reply",
+        retryable: false,
+      });
+      return;
+    }
     this.terminalEmitted = true;
     this.ensureStarted();
     // Prefer usage accumulated from turn_end; fall back to agent_end messages.
@@ -699,7 +817,13 @@ export class OutboundEmitter {
       occurredAt: toIsoUtc(this.opts.now()),
       text: this.replyText,
       attachments: this.replyAttachments,
-      usage: usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
+      usage: usage ?? {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        costUsd: 0,
+      },
     };
     this.deliverDurable(event);
   }
@@ -709,7 +833,9 @@ export class OutboundEmitter {
     const attachment = extractDeliveryAttachment(frame);
     if (
       attachment &&
-      !this.replyAttachments.some((candidate) => candidate.path === attachment.path)
+      !this.replyAttachments.some(
+        (candidate) => candidate.path === attachment.path,
+      )
     ) {
       this.replyAttachments.push(attachment);
     }
@@ -773,9 +899,10 @@ export class OutboundEmitter {
           ? "subagent progress"
           : "subagent event";
     const id = typeof frame.id === "string" ? frame.id : "";
-    const name = typeof (frame as { name?: unknown }).name === "string"
-      ? (frame as { name?: string }).name
-      : "";
+    const name =
+      typeof (frame as { name?: unknown }).name === "string"
+        ? (frame as { name?: string }).name
+        : "";
     const detail = name ? `${name}` : id ? id : "";
     return detail ? `${label}: ${detail}` : label;
   }
@@ -830,9 +957,7 @@ export class OutboundEmitter {
       occurredAt,
     );
     if (!inserted) return; // idempotent duplicate eventId already persisted
-    this.enqueue(() =>
-      this.deliverPayload(event, payload, 0),
-    );
+    this.enqueue(() => this.deliverPayload(event, payload, 0));
   }
 
   /**
@@ -1000,7 +1125,11 @@ export class OutboundEmitter {
     );
   }
 
-  private recordAttempt(eventId: string, attempts: number, error: string): void {
+  private recordAttempt(
+    eventId: string,
+    attempts: number,
+    error: string,
+  ): void {
     const ts = nowUtc();
     this.db.run(
       `UPDATE outbound_outbox
@@ -1081,7 +1210,9 @@ export class DuplicateEventConflictError extends Error {
   readonly cause: unknown;
 
   constructor(eventId: string, cause: unknown) {
-    super(`outbox eventId "${eventId}" already exists with conflicting content`);
+    super(
+      `outbox eventId "${eventId}" already exists with conflicting content`,
+    );
     this.name = "DuplicateEventConflictError";
     this.eventId = eventId;
     this.cause = cause;
@@ -1098,7 +1229,8 @@ export class DuplicateEventConflictError extends Error {
  * Returns null when the frame is not a text delta.
  */
 function extractTextDelta(frame: RpcEventFrame): string | null {
-  const ev = (frame as { assistantMessageEvent?: unknown }).assistantMessageEvent;
+  const ev = (frame as { assistantMessageEvent?: unknown })
+    .assistantMessageEvent;
   if (!ev || typeof ev !== "object") return null;
   const type = (ev as { type?: unknown }).type;
   if (type !== "text_delta") return null;
@@ -1107,10 +1239,14 @@ function extractTextDelta(frame: RpcEventFrame): string | null {
 }
 
 /** Extract a validated attachment marker from the extension tool result. */
-function extractDeliveryAttachment(frame: RpcEventFrame): WorkspaceAttachment | null {
-  if (frame.toolName !== DELIVERY_ATTACHMENT_TOOL || frame.isError === true) return null;
+function extractDeliveryAttachment(
+  frame: RpcEventFrame,
+): WorkspaceAttachment | null {
+  if (frame.toolName !== DELIVERY_ATTACHMENT_TOOL || frame.isError === true)
+    return null;
   const result = frame.result;
-  if (result === null || typeof result !== "object" || !("details" in result)) return null;
+  if (result === null || typeof result !== "object" || !("details" in result))
+    return null;
   const details = result.details;
   if (
     details === null ||
@@ -1133,7 +1269,11 @@ function extractDeliveryAttachment(frame: RpcEventFrame): WorkspaceAttachment | 
   if ("name" in value && typeof value.name === "string" && value.name) {
     attachment.name = value.name;
   }
-  if ("mediaType" in value && typeof value.mediaType === "string" && value.mediaType) {
+  if (
+    "mediaType" in value &&
+    typeof value.mediaType === "string" &&
+    value.mediaType
+  ) {
     attachment.mediaType = value.mediaType;
   }
   return attachment;
@@ -1153,7 +1293,8 @@ function extractUsage(frame: RpcEventFrame): TurnUsage | null {
 /** Extract usage from the agent_end message list (first assistant message). */
 function extractUsageFromAgentEnd(frame: RpcEventFrame): TurnUsage {
   const messages = (frame as { messages?: unknown }).messages;
-  if (!Array.isArray(messages)) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
+  if (!Array.isArray(messages))
+    return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
     const role = (msg as { role?: unknown }).role;
@@ -1171,7 +1312,11 @@ function agentEndHasModelError(frame: RpcEventFrame): boolean {
   if (!Array.isArray(messages)) return false;
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
-    if (message === null || typeof message !== "object" || !("role" in message)) {
+    if (
+      message === null ||
+      typeof message !== "object" ||
+      !("role" in message)
+    ) {
       continue;
     }
     if (message.role !== "assistant") continue;
@@ -1195,9 +1340,10 @@ function usageFromMessage(msg: Record<string, unknown>): TurnUsage | null {
     output: nonnegInt(u.output),
     cacheRead: nonnegInt(u.cacheRead),
     cacheWrite: nonnegInt(u.cacheWrite),
-    costUsd: cost && typeof cost === "object"
-      ? nonnegNum((cost as Record<string, unknown>).total)
-      : 0,
+    costUsd:
+      cost && typeof cost === "object"
+        ? nonnegNum((cost as Record<string, unknown>).total)
+        : 0,
   };
 }
 
@@ -1227,9 +1373,10 @@ function rowToOutboxRow(row: Record<string, unknown>): OutboxRow {
     payload: String(row.payload),
     status: String(row.status) as OutboxStatus,
     attempts: Number(row.attempts),
-    lastError: row.last_error === null || row.last_error === undefined
-      ? null
-      : String(row.last_error),
+    lastError:
+      row.last_error === null || row.last_error === undefined
+        ? null
+        : String(row.last_error),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };

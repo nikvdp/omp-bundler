@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { BridgeConfig } from "./config.js";
 import type { PumbleApi } from "./pumble-api.js";
@@ -28,8 +29,14 @@ export class PumbleAttachmentSender implements AttachmentSender {
     private readonly pumble: PumbleApi,
   ) {}
 
-  async send(target: ResolvedTarget, attachment: WorkspaceAttachment): Promise<void> {
-    this.resolveWorkspacePath(attachment.path);
+  async send(
+    target: ResolvedTarget,
+    attachment: WorkspaceAttachment,
+  ): Promise<void> {
+    await PumbleAttachmentSender.resolveWorkspacePathStatic(
+      this.config,
+      attachment.path,
+    );
     const label = attachment.name || path.basename(attachment.path);
     const link = this.signDownloadLink(attachment.path);
     const message = `Attachment: ${label}\n${link}`;
@@ -43,30 +50,44 @@ export class PumbleAttachmentSender implements AttachmentSender {
   }
 
   /**
-   * Resolve a workspace-relative attachment path to an absolute filesystem
-   * path, verifying it stays inside the workspace root. Throws on traversal
-   * escape, absolute paths, or parent-directory references.
+   * Resolve an existing workspace-relative regular file. Both the workspace
+   * root and file path are canonicalized so symlinks cannot escape the root.
    */
-  resolveWorkspacePath(workspacePath: string): string {
-    return PumbleAttachmentSender.resolveWorkspacePathStatic(this.config, workspacePath);
-  }
-
-  /**
-   * Static workspace path containment check. The workspace root is the
-   * parent of pumbleFileDir (the shared volume root). A workspace-relative
-   * path that resolves outside this root is rejected.
-   */
-  static resolveWorkspacePathStatic(config: BridgeConfig, workspacePath: string): string {
+  static async resolveWorkspacePathStatic(
+    config: BridgeConfig,
+    workspacePath: string,
+  ): Promise<string> {
     if (!workspacePath || workspacePath.length === 0) {
       throw new Error("attachment path is empty");
     }
     const workspaceRoot = path.dirname(config.pumbleFileDir);
     const resolved = path.resolve(workspaceRoot, workspacePath);
-    const normalizedRoot = path.resolve(workspaceRoot);
-    if (resolved !== normalizedRoot && !resolved.startsWith(normalizedRoot + path.sep)) {
-      throw new Error(`attachment path "${workspacePath}" escapes workspace root`);
+    const lexicalPath = path.relative(path.resolve(workspaceRoot), resolved);
+    if (
+      !lexicalPath ||
+      lexicalPath === ".." ||
+      lexicalPath.startsWith(`..${path.sep}`)
+    ) {
+      throw new Error(
+        `attachment path "${workspacePath}" escapes workspace root`,
+      );
     }
-    return resolved;
+    const realRoot = await realpath(workspaceRoot);
+    const realPath = await realpath(resolved);
+    const realWorkspacePath = path.relative(realRoot, realPath);
+    if (
+      !realWorkspacePath ||
+      realWorkspacePath === ".." ||
+      realWorkspacePath.startsWith(`..${path.sep}`)
+    ) {
+      throw new Error(
+        `attachment path "${workspacePath}" escapes workspace root`,
+      );
+    }
+    if (!(await stat(realPath)).isFile()) {
+      throw new Error("attachment path must name a regular file");
+    }
+    return realPath;
   }
 
   /**
@@ -85,7 +106,8 @@ export class PumbleAttachmentSender implements AttachmentSender {
         "coreSharedSecret is required to sign download links but is not configured",
       );
     }
-    const expiry = Math.floor(Date.now() / 1000) + this.config.downloadLinkTtlSeconds;
+    const expiry =
+      Math.floor(Date.now() / 1000) + this.config.downloadLinkTtlSeconds;
     const signature = PumbleAttachmentSender.computeSignature(
       this.config.coreSharedSecret,
       workspacePath,
@@ -112,8 +134,11 @@ export class PumbleAttachmentSender implements AttachmentSender {
     if (!queryPath || !queryExp || !querySig) {
       throw new Error("download link missing required query parameters");
     }
+    if (!/^[0-9]+$/.test(queryExp)) {
+      throw new Error("download link has invalid expiry");
+    }
     const expiry = Number(queryExp);
-    if (!Number.isFinite(expiry)) {
+    if (!Number.isSafeInteger(expiry) || expiry < 1) {
       throw new Error("download link has invalid expiry");
     }
     const now = Math.floor(Date.now() / 1000);
@@ -125,6 +150,9 @@ export class PumbleAttachmentSender implements AttachmentSender {
       queryPath,
       expiry,
     );
+    if (!/^[0-9a-f]{64}$/i.test(querySig)) {
+      throw new Error("download link signature mismatch");
+    }
     const provided = Buffer.from(querySig, "hex");
     const expectedBuf = Buffer.from(expected, "hex");
     if (provided.length !== expectedBuf.length) {

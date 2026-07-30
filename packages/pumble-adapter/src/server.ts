@@ -1,36 +1,63 @@
 import http from "node:http";
 import path from "node:path";
-import { mkdir, stat } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { mkdir, open, realpath, type FileHandle } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
 import crypto from "node:crypto";
-import { loadBridgeConfig } from "./config.js";
-import { buildManifest } from "./manifest.js";
+import { joinPublicUrl, loadBridgeConfig } from "./config.js";
+import { buildManifest, pumbleAuthorizationScopes } from "./manifest.js";
 import { PumbleApi } from "./pumble-api.js";
 import { verifyPumbleSignature } from "./security.js";
 import { TokenStore } from "./token-store.js";
 import { TargetStore, type Target } from "./target-store.js";
 import { PumbleAttachmentSender } from "./attachment-sender.js";
 import { DeliveryStore } from "./delivery-store.js";
-import { parseNewMessage, normalizePumbleMessage, type NormalizeContext } from "./pumble-event.js";
-import { savePumbleFiles, type PumbleMessageFilesEvent } from "./pumble-files.js";
-import { PumbleRenderer, type ConversationResolver } from "./pumble-renderer.js";
+import {
+  parseNewMessage,
+  normalizePumbleMessage,
+  type NormalizeContext,
+} from "./pumble-event.js";
+import {
+  savePumbleFiles,
+  type PumbleMessageFilesEvent,
+} from "./pumble-files.js";
+import {
+  PumbleRenderer,
+  type ConversationResolver,
+} from "./pumble-renderer.js";
 import type { OutboundEvent } from "@omp-bundler/contracts/outbound";
-import { OUTBOUND_EVENT_MEDIA_TYPE, OUTBOUND_EVENT_SIGNATURE_HEADER, ADAPTER_API_VERSION } from "@omp-bundler/contracts/outbound";
+import {
+  OUTBOUND_EVENT_MEDIA_TYPE,
+  OUTBOUND_EVENT_SIGNATURE_HEADER,
+  ADAPTER_API_VERSION,
+} from "@omp-bundler/contracts/outbound";
 import { INBOUND_MESSAGE_MEDIA_TYPE } from "@omp-bundler/contracts/inbound";
 
 /** Header carrying the presented shared secret on an inbound adapter request. */
 const INBOUND_SECRET_HEADER = "X-OMP-Bundler-Adapter-Secret";
+const OAUTH_STATE_COOKIE = "pumble_oauth_nonce";
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const MAX_OAUTH_STATES = 1_000;
+const oauthStates = new Map<string, { nonce: string; expiresAt: number }>();
 const config = loadBridgeConfig();
 await mkdir(config.pumbleDataDir, { recursive: true });
 
 const pumble = new PumbleApi(config);
-const tokens = new TokenStore(path.join(config.pumbleDataDir, "workspaces.json"));
-const targetStore = new TargetStore(path.join(config.pumbleDataDir, "targets.json"));
-const deliveryStore = new DeliveryStore(path.join(config.pumbleDataDir, "delivered-events.json"));
+const tokens = new TokenStore(
+  path.join(config.pumbleDataDir, "workspaces.json"),
+);
+const targetStore = new TargetStore(
+  path.join(config.pumbleDataDir, "targets.json"),
+);
+const deliveryStore = new DeliveryStore(
+  path.join(config.pumbleDataDir, "delivered-events.json"),
+);
 
 const attachmentSender = new PumbleAttachmentSender(config, pumble);
 
-const resolver: ConversationResolver = async (conversationKey, correlationId) => {
+const resolver: ConversationResolver = async (
+  conversationKey,
+  correlationId,
+) => {
   const target = await targetStore.resolve(conversationKey, correlationId);
   if (!target) return null;
   const workspaceTokens = await tokens.getWorkspace(target.workspaceId);
@@ -51,6 +78,7 @@ const renderer = new PumbleRenderer({
   resolver,
   logger: console,
   attachmentSender,
+  checkpointStore: deliveryStore,
 });
 
 const server = http.createServer(async (req, res) => {
@@ -64,6 +92,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(config.port, config.host, () => {
+  console.log(
+    `>>> Pumble adapter listening on http://${config.host}:${config.port}`,
+  );
+});
 
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
   process.once(signal, () => {
@@ -75,11 +107,12 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     });
   });
 }
-  console.log(`>>> Pumble adapter listening on http://${config.host}:${config.port}`);
-});
 
 async function route(req: http.IncomingMessage, res: http.ServerResponse) {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const url = new URL(
+    req.url || "/",
+    `http://${req.headers.host || "localhost"}`,
+  );
 
   if (req.method === "GET" && url.pathname === "/health") {
     sendJson(res, 200, { status: "ok", service: "pumble-adapter" });
@@ -91,8 +124,13 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/pumble/oauth/start") {
+    handleOAuthStart(res);
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/pumble/oauth/callback") {
-    await handleOAuthCallback(url, res);
+    await handleOAuthCallback(req, url, res);
     return;
   }
 
@@ -115,10 +153,52 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse) {
 }
 
 // ---------------------------------------------------------------------------
-// OAuth callback
+// OAuth authorization
 // ---------------------------------------------------------------------------
 
-async function handleOAuthCallback(url: URL, res: http.ServerResponse) {
+function handleOAuthStart(res: http.ServerResponse) {
+  pruneOAuthStates();
+  if (oauthStates.size >= MAX_OAUTH_STATES) {
+    sendText(res, 503, "Too many pending OAuth requests");
+    return;
+  }
+  const state = crypto.randomBytes(32).toString("base64url");
+  const nonce = crypto.randomBytes(32).toString("base64url");
+  oauthStates.set(state, { nonce, expiresAt: Date.now() + OAUTH_STATE_TTL_MS });
+
+  const callbackUrl = joinPublicUrl(config, "/pumble/oauth/callback");
+  const authorizationUrl = pumble.authorizationUrl(
+    callbackUrl,
+    state,
+    pumbleAuthorizationScopes,
+  );
+
+  res.writeHead(302, {
+    location: authorizationUrl,
+    "cache-control": "no-store",
+    "set-cookie": `${OAUTH_STATE_COOKIE}=${nonce}; Max-Age=${
+      OAUTH_STATE_TTL_MS / 1000
+    }; Path=/pumble/oauth/callback; HttpOnly; Secure; SameSite=Lax`,
+  });
+  res.end();
+}
+
+async function handleOAuthCallback(
+  req: http.IncomingMessage,
+  url: URL,
+  res: http.ServerResponse,
+) {
+  const state = url.searchParams.get("state")?.trim() || "";
+  const nonce = cookieValue(req.headers.cookie, OAUTH_STATE_COOKIE);
+  if (!consumeOAuthState(state, nonce)) {
+    sendText(res, 400, "Invalid or expired OAuth state");
+    return;
+  }
+
+  res.setHeader(
+    "set-cookie",
+    `${OAUTH_STATE_COOKIE}=; Max-Age=0; Path=/pumble/oauth/callback; HttpOnly; Secure; SameSite=Lax`,
+  );
   const code = url.searchParams.get("code")?.trim();
   if (!code) {
     sendText(res, 400, "Missing code query parameter");
@@ -132,7 +212,11 @@ async function handleOAuthCallback(url: URL, res: http.ServerResponse) {
   try {
     const payload = await pumble.exchangeCode(code);
     await tokens.saveOAuthPayload(payload);
-    sendText(res, 200, "Pumble authorization completed. You can close this window.");
+    sendText(
+      res,
+      200,
+      "Pumble authorization completed. You can close this window.",
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(">>> Pumble OAuth exchange failed:", message);
@@ -144,7 +228,10 @@ async function handleOAuthCallback(url: URL, res: http.ServerResponse) {
 // Pumble webhook: NEW_MESSAGE ingestion
 // ---------------------------------------------------------------------------
 
-async function handlePumbleEvents(req: http.IncomingMessage, res: http.ServerResponse) {
+async function handlePumbleEvents(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+) {
   const rawBody = await readBody(req, config.pumbleEventMaxBytes);
   if (!rawBody) {
     sendText(res, 413, "Request body exceeds maximum size");
@@ -171,10 +258,15 @@ async function handlePumbleEvents(req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
-  const eventType = typeof payload.eventType === "string" ? payload.eventType : "";
-  const workspaceId = typeof payload.workspaceId === "string" ? payload.workspaceId : "";
+  const eventType =
+    typeof payload.eventType === "string" ? payload.eventType : "";
+  const workspaceId =
+    typeof payload.workspaceId === "string" ? payload.workspaceId : "";
 
-  if (workspaceId && (eventType === "APP_UNAUTHORIZED" || eventType === "APP_UNINSTALLED")) {
+  if (
+    workspaceId &&
+    (eventType === "APP_UNAUTHORIZED" || eventType === "APP_UNINSTALLED")
+  ) {
     await tokens.deleteWorkspace(workspaceId);
     sendText(res, 200, "ok");
     return;
@@ -201,7 +293,9 @@ interface NewMessageResult {
   error?: string;
 }
 
-async function processNewMessage(payload: Record<string, unknown>): Promise<NewMessageResult> {
+async function processNewMessage(
+  payload: Record<string, unknown>,
+): Promise<NewMessageResult> {
   const event = parseNewMessage(payload);
   if (!event) {
     // Malformed payload: not retryable, but we ack so Pumble does not retry.
@@ -238,7 +332,10 @@ async function processNewMessage(payload: Record<string, unknown>): Promise<NewM
         workspaceTokens.botToken,
         event.channelId,
       );
-      channelType = stringValue(channelResponse.type) || stringValue(channelResponse.channelType) || "";
+      channelType =
+        stringValue(channelResponse.type) ||
+        stringValue(channelResponse.channelType) ||
+        "";
     } catch (error) {
       return {
         ok: false,
@@ -294,7 +391,12 @@ async function processNewMessage(payload: Record<string, unknown>): Promise<NewM
   };
   let savedFiles;
   try {
-    savedFiles = await savePumbleFiles(config, pumble, workspaceTokens, filesEvent);
+    savedFiles = await savePumbleFiles(
+      config,
+      pumble,
+      workspaceTokens,
+      filesEvent,
+    );
   } catch (error) {
     return {
       ok: false,
@@ -357,28 +459,41 @@ async function processNewMessage(payload: Record<string, unknown>): Promise<NewM
     threadRootId: event.threadRootId,
   };
 
-  // Persist target under conversationKey BEFORE the core POST so an early
-  // outbound callback can resolve via conversationKey fallback.
-  await targetStore.putByConversation(inboundMessage.conversationKey, target);
+  // Serialize the target save, core POST, and correlation binding for this
+  // conversation. Different conversations can proceed concurrently.
+  return targetStore.serializeConversation(
+    inboundMessage.conversationKey,
+    async () => {
+      // Persist target under conversationKey BEFORE the core POST so an early
+      // outbound callback can resolve via conversationKey fallback.
+      await targetStore.putByConversation(
+        inboundMessage.conversationKey,
+        target,
+      );
 
-  // POST the inbound message to the omp-bundler core.
-  const body = JSON.stringify(inboundMessage);
-  let correlationId: string;
-  try {
-    correlationId = await postToCore(body);
-  } catch (error) {
-    return {
-      ok: false,
-      error: `core POST failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    };
-  }
+      // POST the inbound message to the omp-bundler core.
+      const body = JSON.stringify(inboundMessage);
+      let correlationId: string;
+      try {
+        correlationId = await postToCore(body);
+      } catch (error) {
+        return {
+          ok: false,
+          error: `core POST failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        };
+      }
 
-  // Bind the returned correlationId to the same target AFTER acceptance.
-  await targetStore.bindCorrelation(inboundMessage.conversationKey, correlationId);
+      // Bind the returned correlationId to the same target AFTER acceptance.
+      await targetStore.bindCorrelation(
+        inboundMessage.conversationKey,
+        correlationId,
+      );
 
-  return { ok: true };
+      return { ok: true };
+    },
+  );
 }
 
 /**
@@ -398,7 +513,10 @@ async function postToCore(body: string): Promise<string> {
   });
 
   if (response.status === 202 || response.status === 200) {
-    const payload = (await response.json()) as { status: string; correlationId: string };
+    const payload = (await response.json()) as {
+      status: string;
+      correlationId: string;
+    };
     if (payload.status !== "accepted" && payload.status !== "duplicate") {
       throw new Error(`core returned unexpected status: ${payload.status}`);
     }
@@ -420,14 +538,19 @@ async function postToCore(body: string): Promise<string> {
 
   // 5xx: retryable.
   const text = await response.text().catch(() => "");
-  throw new Error(`core returned HTTP ${response.status}${text ? `: ${text}` : ""}`);
+  throw new Error(
+    `core returned HTTP ${response.status}${text ? `: ${text}` : ""}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Core outbound callback: /core/events
 // ---------------------------------------------------------------------------
 
-async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerResponse) {
+async function handleCoreEvents(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+) {
   const rawBody = await readBody(req, config.coreEventMaxBytes);
   if (!rawBody) {
     sendText(res, 413, "Request body exceeds maximum size");
@@ -435,8 +558,13 @@ async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerRespo
   }
 
   // Verify the exact-body HMAC signature.
-  const signatureHeader = headerValue(req.headers[OUTBOUND_EVENT_SIGNATURE_HEADER.toLowerCase()]);
-  if (!signatureHeader || !verifyCoreSignature(signatureHeader, rawBody, config.coreSharedSecret)) {
+  const signatureHeader = headerValue(
+    req.headers[OUTBOUND_EVENT_SIGNATURE_HEADER.toLowerCase()],
+  );
+  if (
+    !signatureHeader ||
+    !verifyCoreSignature(signatureHeader, rawBody, config.coreSharedSecret)
+  ) {
     sendText(res, 401, "Invalid signature");
     return;
   }
@@ -444,7 +572,11 @@ async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerRespo
   // Verify content type.
   const contentType = headerValue(req.headers["content-type"]);
   if (contentType !== OUTBOUND_EVENT_MEDIA_TYPE) {
-    sendText(res, 415, `Unsupported media type; expected ${OUTBOUND_EVENT_MEDIA_TYPE}`);
+    sendText(
+      res,
+      415,
+      `Unsupported media type; expected ${OUTBOUND_EVENT_MEDIA_TYPE}`,
+    );
     return;
   }
 
@@ -472,8 +604,8 @@ async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerRespo
     sendText(res, 200, "ok");
     return;
   }
-  // Deliver the event through the renderer. Only 2xx after the renderer
-  // succeeds; 5xx on retry-safe failure so the core redelivers.
+  // Deliver the event through the renderer. It persists each confirmed side
+  // effect before returning. Only 2xx after final event completion is durable.
   try {
     await renderer.render(event);
   } catch (error) {
@@ -498,7 +630,11 @@ async function handleCoreEvents(req: http.IncomingMessage, res: http.ServerRespo
  * digest is HMAC-SHA256(sharedSecret, exactRequestBody) using the same
  * shared secret as the inbound auth.
  */
-function verifyCoreSignature(sigHeader: string, rawBody: Buffer, secret: string): boolean {
+function verifyCoreSignature(
+  sigHeader: string,
+  rawBody: Buffer,
+  secret: string,
+): boolean {
   if (!secret) {
     return false;
   }
@@ -507,6 +643,9 @@ function verifyCoreSignature(sigHeader: string, rawBody: Buffer, secret: string)
     return false;
   }
   const provided = sigHeader.slice(prefix.length);
+  if (!/^[0-9a-f]{64}$/i.test(provided)) {
+    return false;
+  }
   const expected = crypto
     .createHmac("sha256", secret)
     .update(rawBody)
@@ -523,7 +662,9 @@ function verifyCoreSignature(sigHeader: string, rawBody: Buffer, secret: string)
  * Validate the minimal v1 outbound event shape. Checks the required base
  * fields and the discriminated variant fields without full schema validation.
  */
-function validateOutboundEvent(payload: Record<string, unknown>): string | null {
+function validateOutboundEvent(
+  payload: Record<string, unknown>,
+): string | null {
   if (payload.version !== ADAPTER_API_VERSION) {
     return `version must be "${ADAPTER_API_VERSION}"`;
   }
@@ -550,14 +691,20 @@ function validateOutboundEvent(payload: Record<string, unknown>): string | null 
   if (typeof payload.correlationId !== "string" || !payload.correlationId) {
     return "correlationId must be a non-empty string";
   }
-  if (typeof payload.sequence !== "number" || !Number.isFinite(payload.sequence) || payload.sequence < 1) {
+  if (
+    !Number.isSafeInteger(payload.sequence) ||
+    (payload.sequence as number) < 1
+  ) {
     return "sequence must be a positive integer";
   }
   if (typeof payload.occurredAt !== "string" || !payload.occurredAt) {
     return "occurredAt must be a non-empty string";
   }
 
-  if (type === "turn.progress" && (typeof payload.message !== "string" || !payload.message)) {
+  if (
+    type === "turn.progress" &&
+    (typeof payload.message !== "string" || !payload.message)
+  ) {
     return "turn.progress requires a non-empty message";
   }
   if (type === "turn.reply") {
@@ -581,7 +728,11 @@ function validateOutboundEvent(payload: Record<string, unknown>): string | null 
   }
   if (type === "presence.changed") {
     const presence = payload.presence;
-    const validPresence: Record<string, true> = { active: true, idle: true, offline: true };
+    const validPresence: Record<string, true> = {
+      active: true,
+      idle: true,
+      offline: true,
+    };
     if (typeof presence !== "string" || !validPresence[presence]) {
       return "presence.changed requires a valid presence value";
     }
@@ -614,29 +765,51 @@ async function handleDownload(url: URL, res: http.ServerResponse) {
     return;
   }
 
-  // Resolve the workspace-relative path and verify containment.
   let absolutePath: string;
+  let file: FileHandle;
+  let directory: FileHandle | undefined;
   try {
-    absolutePath = PumbleAttachmentSender.resolveWorkspacePathStatic(config, verifiedPath);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    // Traversal escape is 403 (forbidden).
-    sendText(res, 403, message);
-    return;
-  }
-  // Serve only regular files.
-  let fileStat;
-  try {
-    fileStat = await stat(absolutePath);
+    absolutePath = await PumbleAttachmentSender.resolveWorkspacePathStatic(
+      config,
+      verifiedPath,
+    );
+    const expectedDirectory = path.dirname(absolutePath);
+    directory = await open(
+      expectedDirectory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const directoryRef = secureDirectoryReference(directory.fd);
+    const openedDirectory = await realpath(directoryRef);
+    const workspaceRoot = await realpath(path.dirname(config.pumbleFileDir));
+    assertContained(workspaceRoot, openedDirectory);
+    if (openedDirectory !== expectedDirectory) {
+      throw new Error("Attachment directory changed while opening it");
+    }
+    file = await open(
+      path.join(directoryRef, path.basename(absolutePath)),
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
   } catch {
+    sendText(res, 404, "File not found");
+    return;
+  } finally {
+    await directory?.close();
+  }
+  let fileStat: Stats;
+  try {
+    fileStat = await file.stat();
+  } catch {
+    await file.close();
     sendText(res, 404, "File not found");
     return;
   }
   if (!fileStat.isFile()) {
+    await file.close();
     sendText(res, 403, "Requested path is not a regular file");
     return;
   }
   if (fileStat.size > config.downloadMaxBytes) {
+    await file.close();
     sendText(res, 403, "File exceeds maximum download size");
     return;
   }
@@ -645,7 +818,8 @@ async function handleDownload(url: URL, res: http.ServerResponse) {
     "content-type": "application/octet-stream",
     "content-length": String(fileStat.size),
   });
-  const stream = createReadStream(absolutePath);
+  const stream = file.createReadStream({ autoClose: true });
+  stream.on("error", () => res.destroy());
   stream.pipe(res);
 }
 
@@ -653,7 +827,71 @@ async function handleDownload(url: URL, res: http.ServerResponse) {
 // Utilities
 // ---------------------------------------------------------------------------
 
-async function readBody(req: http.IncomingMessage, maxBytes: number): Promise<Buffer | null> {
+function assertContained(root: string, candidate: string): void {
+  const relative = path.relative(root, candidate);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    throw new Error("Attachment path escapes workspace root");
+  }
+}
+
+function secureDirectoryReference(fd: number): string {
+  if (process.platform !== "linux") {
+    throw new Error(
+      "Secure attachment serving requires the Linux container runtime",
+    );
+  }
+  return `/proc/self/fd/${fd}`;
+}
+
+function pruneOAuthStates() {
+  const now = Date.now();
+  for (const [state, entry] of oauthStates) {
+    if (entry.expiresAt <= now) {
+      oauthStates.delete(state);
+    }
+  }
+}
+
+function consumeOAuthState(state: string, nonce: string): boolean {
+  if (!state || !nonce) {
+    return false;
+  }
+  const entry = oauthStates.get(state);
+  if (!entry || !safeEqual(entry.nonce, nonce)) {
+    pruneOAuthStates();
+    return false;
+  }
+  oauthStates.delete(state);
+  return entry.expiresAt > Date.now();
+}
+
+function safeEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return (
+    leftBuffer.length === rightBuffer.length &&
+    crypto.timingSafeEqual(leftBuffer, rightBuffer)
+  );
+}
+
+function cookieValue(
+  header: string | string[] | undefined,
+  name: string,
+): string {
+  const prefix = `${name}=`;
+  for (const part of headerValue(header).split(";")) {
+    const cookie = part.trim();
+    if (cookie.startsWith(prefix)) {
+      return cookie.slice(prefix.length);
+    }
+  }
+  return "";
+}
+
+async function readBody(
+  req: http.IncomingMessage,
+  maxBytes: number,
+): Promise<Buffer | null> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {

@@ -14,10 +14,9 @@ import type { PumbleApi } from "./pumble-api.js";
  *
  * Consumes the omp-bundler {@link OutboundEvent} stream and translates each
  * event into concrete Pumble side effects on the channel identified by the
- * injected {@link ConversationResolver}. The renderer is stateful but keeps
- * correlation state in memory; the adapter service owns durable event-id
- * dedupe across restarts. Within one process it also checkpoints partial
- * terminal delivery so a retry does not repeat completed steps.
+ * injected {@link ConversationResolver}. Correlation state stays in memory;
+ * the adapter service owns durable event-id completion and per-effect
+ * checkpoints across restarts.
  *
  * Side effect policy
  * ------------------
@@ -30,14 +29,14 @@ import type { PumbleApi } from "./pumble-api.js";
  *                      interim message in place. There is no timer: the
  *                      renderer reacts to events at emitter thresholds.
  *                      Progress is best-effort and never terminal.
- *   - turn.reply     : posts exactly one final message, threaded when needed.
- *                      Output attachments are delivered through the injected
- *                      {@link AttachmentSender} when present. Without a sender,
- *                      or on a per-attachment send failure, the renderer posts a
- *                      best-effort visible notice and then rejects so the core
- *                      retries the durable redelivery; attachments are never
- *                      silently dropped. The correlation is marked terminal only
- *                      once the text and every attachment are delivered.
+ *   - turn.reply     : posts the final message, threaded when needed. Confirmed
+ *                      text and attachment effects are checkpointed before the
+ *                      whole event is completed. Output attachments are
+ *                      delivered through the injected {@link AttachmentSender}
+ *                      when present. Without a sender, or on a per-attachment
+ *                      send failure, the renderer posts a best-effort visible
+ *                      notice and then rejects so the core retries the durable
+ *                      redelivery; attachments are never silently dropped.
  *   - turn.error     : posts the curated error message as the final message.
  *   - presence       : maps active/idle/offline to a low-noise reaction policy
  *                      on the triggering message (a single working reaction that
@@ -51,14 +50,12 @@ import type { PumbleApi } from "./pumble-api.js";
  *
  * Failure semantics
  * -----------------
- * The durable side effects (the final reply or error message, and attachment
- * delivery) are the only operations that can reject from {@link render}: a
- * failed target resolution, final post, or attachment delivery bubbles out so
- * the caller can choose not to acknowledge and let the core retry the durable
- * redelivery. Reactions and progress are best-effort and never reject. The
- * renderer keeps per-correlation checkpoints (text posted, attachment indexes
- * sent) so an in-process retry skips work already completed. Server-level
- * persistent event-id dedupe suppresses events completed before a restart.
+ * Failed target resolution, a final post, attachment delivery, or checkpoint
+ * persistence rejects from {@link render} so the caller does not acknowledge
+ * incomplete durable state. Pumble API failures for reactions and progress
+ * remain best-effort. The renderer combines in-memory correlation state with
+ * durable per-event checkpoints so retries skip effects already confirmed and
+ * recorded.
  */
 
 /** Working/active reaction: "looking at this". */
@@ -106,6 +103,12 @@ export interface AttachmentSender {
   send(target: ResolvedTarget, attachment: WorkspaceAttachment): Promise<void>;
 }
 
+/** Durable per-event rendering progress used to resume interrupted delivery. */
+export interface RenderingCheckpointStore {
+  checkpointsFor(eventId: string): Promise<ReadonlySet<string>>;
+  markCheckpoint(eventId: string, checkpoint: string): Promise<void>;
+}
+
 /** Construction dependencies. Credentials are resolved per workspace target. */
 export interface PumbleRendererOptions {
   pumble: PumbleApi;
@@ -113,6 +116,8 @@ export interface PumbleRendererOptions {
   logger: RendererLogger;
   /** Optional; when omitted attachment delivery fails loudly. */
   attachmentSender?: AttachmentSender;
+  /** Optional persistent checkpoints for confirmed Pumble side effects. */
+  checkpointStore?: RenderingCheckpointStore;
 }
 
 /** In-memory per-correlation delivery checkpoints. */
@@ -146,15 +151,20 @@ export class PumbleRenderer {
   private readonly resolver: ConversationResolver;
   private readonly logger: RendererLogger;
   private readonly attachmentSender?: AttachmentSender;
+  private readonly checkpointStore?: RenderingCheckpointStore;
 
   /** Nested map keyed by (conversationKey, correlationId), never concatenation. */
-  private readonly correlations = new Map<string, Map<string, CorrelationState>>();
+  private readonly correlations = new Map<
+    string,
+    Map<string, CorrelationState>
+  >();
 
   constructor(options: PumbleRendererOptions) {
     this.pumble = options.pumble;
     this.resolver = options.resolver;
     this.logger = options.logger;
     this.attachmentSender = options.attachmentSender;
+    this.checkpointStore = options.checkpointStore;
   }
 
   /**
@@ -163,8 +173,9 @@ export class PumbleRenderer {
    * best-effort operations; rejects when a durable final message could not be
    * posted, when terminal target resolution fails, or when an attachment could
    * not be delivered, so the caller can withhold acknowledgment and let the
-   * core retry the durable redelivery. Per-correlation checkpoints make an
-   * in-process retry skip already-posted text and already-sent attachments.
+   * core retry the durable redelivery. Confirmed side effects are checkpointed
+   * before completion so a restart can resume them, while the unavoidable gap
+   * between Pumble confirmation and the checkpoint remains at-least-once.
    */
   async render(event: OutboundEvent): Promise<void> {
     const state = this.stateFor(event.conversationKey, event.correlationId);
@@ -172,12 +183,22 @@ export class PumbleRenderer {
       .catch(() => {
         // A prior invocation's rejection must not block this one.
       })
-      .then(() => this.apply(event, state));
+      .then(async () => {
+        const checkpoints = new Set<string>(
+          this.checkpointStore
+            ? await this.checkpointStore.checkpointsFor(event.eventId)
+            : undefined,
+        );
+        await this.apply(event, state, checkpoints);
+      });
     state.chain = next;
     return next;
   }
 
-  private stateFor(conversationKey: string, correlationId: string): CorrelationState {
+  private stateFor(
+    conversationKey: string,
+    correlationId: string,
+  ): CorrelationState {
     let perConversation = this.correlations.get(conversationKey);
     if (!perConversation) {
       perConversation = new Map();
@@ -198,39 +219,58 @@ export class PumbleRenderer {
     return state;
   }
 
-  private async apply(event: OutboundEvent, state: CorrelationState): Promise<void> {
+  private async apply(
+    event: OutboundEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
     if (state.seen.has(event.eventId)) {
       return;
     }
     if (state.terminal) {
       return;
     }
-    await this.dispatch(event, state);
+    await this.dispatch(event, state, checkpoints);
     state.seen.add(event.eventId);
   }
 
-  private async dispatch(event: OutboundEvent, state: CorrelationState): Promise<void> {
+  private async dispatch(
+    event: OutboundEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
     switch (event.type) {
       case "turn.started":
-        await this.onStarted(event, state);
+        await this.onStarted(event, state, checkpoints);
         return;
       case "turn.progress":
-        await this.onProgress(event, state);
+        await this.onProgress(event, state, checkpoints);
         return;
       case "turn.reply":
-        await this.onReply(event, state);
+        await this.onReply(event, state, checkpoints);
         return;
       case "turn.error":
-        await this.onError(event, state);
+        await this.onError(event, state, checkpoints);
         return;
       case "presence.changed":
-        await this.onPresence(event, state);
+        await this.onPresence(event, state, checkpoints);
         return;
     }
   }
 
-  private async onStarted(event: TurnStartedEvent, state: CorrelationState): Promise<void> {
+  private async onStarted(
+    event: TurnStartedEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    const checkpoint = `reaction:add:${ACTIVE_REACTION}`;
+    if (checkpoints.has(checkpoint)) {
+      state.startedReaction = true;
+      state.workingEmoji = ACTIVE_REACTION;
+      return;
+    }
     if (state.startedReaction) {
+      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
       return;
     }
     const target = await this.resolve(event);
@@ -241,14 +281,24 @@ export class PumbleRenderer {
     state.startedReaction = true;
     if (ok) {
       state.workingEmoji = ACTIVE_REACTION;
+      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
     }
   }
 
-  private async onProgress(event: TurnProgressEvent, state: CorrelationState): Promise<void> {
+  private async onProgress(
+    event: TurnProgressEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    const checkpoint = "text";
+    if (checkpoints.has(checkpoint)) {
+      return;
+    }
     const target = await this.resolve(event);
     if (!target) {
       return;
     }
+    let confirmed = false;
     if (!state.interimMessageId) {
       try {
         const response = await this.pumble.sendMessage(
@@ -258,6 +308,7 @@ export class PumbleRenderer {
           event.message,
           target.threadRootId,
         );
+        confirmed = true;
         const id = messageIdOf(response);
         if (id) {
           state.interimMessageId = id;
@@ -283,6 +334,7 @@ export class PumbleRenderer {
           state.interimMessageId,
           event.message,
         );
+        confirmed = true;
       } catch (error) {
         this.logger.warn(
           "pumble-renderer: progress edit failed",
@@ -291,33 +343,46 @@ export class PumbleRenderer {
         );
       }
     }
+    if (confirmed) {
+      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
+    }
   }
 
-  private async onReply(event: TurnReplyEvent, state: CorrelationState): Promise<void> {
+  private async onReply(
+    event: TurnReplyEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
     const target = await this.resolveRequired(event);
 
-    // Post the final text exactly once across in-process retries.
-    if (event.text && !state.finalTextPosted) {
-      await this.pumble.sendMessage(
-        target.appKey,
-        target.botToken,
-        target.channelId,
-        event.text,
-        target.threadRootId,
-      );
-      state.finalTextPosted = true;
+    if (event.text) {
+      if (checkpoints.has("text")) {
+        state.finalTextPosted = true;
+      } else if (state.finalTextPosted) {
+        await this.markCheckpoint(event.eventId, checkpoints, "text");
+      } else {
+        await this.pumble.sendMessage(
+          target.appKey,
+          target.botToken,
+          target.channelId,
+          event.text,
+          target.threadRootId,
+        );
+        state.finalTextPosted = true;
+        await this.markCheckpoint(event.eventId, checkpoints, "text");
+      }
     }
 
-    // Deliver every attachment exactly once; reject so the core retries the
-    // durable redelivery when anything remains undelivered. Best-effort
-    // notices are posted before rejecting so the failure is visible.
-    await this.deliverAttachments(target, event.attachments, state);
-
-    await this.clearWorkingReaction(target, state);
+    await this.deliverAttachments(target, event, state, checkpoints);
+    await this.clearWorkingReaction(target, state, event.eventId, checkpoints);
     state.terminal = true;
   }
 
-  private async onError(event: TurnErrorEvent, state: CorrelationState): Promise<void> {
+  private async onError(
+    event: TurnErrorEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
     this.logger.warn(
       "pumble-renderer: turn error",
       this.describeCorrelation(event),
@@ -326,22 +391,24 @@ export class PumbleRenderer {
     );
     const target = await this.resolveRequired(event);
 
-    // The curated error message is the terminal message; a failed post rejects
-    // so the core retries the durable redelivery.
-    await this.pumble.sendMessage(
-      target.appKey,
-      target.botToken,
-      target.channelId,
-      event.message,
-      target.threadRootId,
-    );
-    await this.clearWorkingReaction(target, state);
+    if (!checkpoints.has("text")) {
+      await this.pumble.sendMessage(
+        target.appKey,
+        target.botToken,
+        target.channelId,
+        event.message,
+        target.threadRootId,
+      );
+      await this.markCheckpoint(event.eventId, checkpoints, "text");
+    }
+    await this.clearWorkingReaction(target, state, event.eventId, checkpoints);
     state.terminal = true;
   }
 
   private async onPresence(
     event: PresenceChangedEvent,
     state: CorrelationState,
+    checkpoints: Set<string>,
   ): Promise<void> {
     const target = await this.resolve(event);
     if (!target) {
@@ -349,11 +416,28 @@ export class PumbleRenderer {
     }
     const presence = event.presence;
     if (presence === "active") {
-      await this.setWorkingEmoji(target, state, ACTIVE_REACTION);
+      await this.setWorkingEmoji(
+        target,
+        state,
+        ACTIVE_REACTION,
+        event.eventId,
+        checkpoints,
+      );
     } else if (presence === "idle") {
-      await this.setWorkingEmoji(target, state, IDLE_REACTION);
+      await this.setWorkingEmoji(
+        target,
+        state,
+        IDLE_REACTION,
+        event.eventId,
+        checkpoints,
+      );
     } else {
-      await this.clearWorkingReaction(target, state);
+      await this.clearWorkingReaction(
+        target,
+        state,
+        event.eventId,
+        checkpoints,
+      );
     }
   }
 
@@ -361,35 +445,63 @@ export class PumbleRenderer {
     target: ResolvedTarget,
     state: CorrelationState,
     emoji: string,
+    eventId: string,
+    checkpoints: Set<string>,
   ): Promise<void> {
+    const addCheckpoint = `reaction:add:${emoji}`;
+    if (checkpoints.has(addCheckpoint)) {
+      state.workingEmoji = emoji;
+      return;
+    }
     if (state.workingEmoji === emoji) {
+      await this.markCheckpoint(eventId, checkpoints, addCheckpoint);
       return;
     }
     if (state.workingEmoji) {
-      await this.safeRemoveReaction(target, state.workingEmoji);
+      const removeCheckpoint = `reaction:remove:${state.workingEmoji}`;
+      if (!checkpoints.has(removeCheckpoint)) {
+        const removed = await this.safeRemoveReaction(
+          target,
+          state.workingEmoji,
+        );
+        if (removed) {
+          await this.markCheckpoint(eventId, checkpoints, removeCheckpoint);
+        }
+      }
     }
     const ok = await this.safeAddReaction(target, emoji);
     if (ok) {
       state.workingEmoji = emoji;
+      await this.markCheckpoint(eventId, checkpoints, addCheckpoint);
     }
   }
 
   private async clearWorkingReaction(
     target: ResolvedTarget,
     state: CorrelationState,
+    eventId: string,
+    checkpoints: Set<string>,
   ): Promise<void> {
     if (!state.workingEmoji) {
       return;
     }
-    await this.safeRemoveReaction(target, state.workingEmoji);
+    const checkpoint = `reaction:remove:${state.workingEmoji}`;
+    if (!checkpoints.has(checkpoint)) {
+      const removed = await this.safeRemoveReaction(target, state.workingEmoji);
+      if (removed) {
+        await this.markCheckpoint(eventId, checkpoints, checkpoint);
+      }
+    }
     state.workingEmoji = undefined;
   }
 
   private async deliverAttachments(
     target: ResolvedTarget,
-    attachments: WorkspaceAttachment[],
+    event: TurnReplyEvent,
     state: CorrelationState,
+    checkpoints: Set<string>,
   ): Promise<void> {
+    const attachments = event.attachments;
     if (attachments.length === 0) {
       return;
     }
@@ -398,22 +510,33 @@ export class PumbleRenderer {
         "pumble-renderer: reply included attachments but no attachment sender is configured",
         attachments.length,
       );
-      await this.safeSendNotice(
-        target,
-        `This reply included ${attachments.length} attachment(s) but attachment delivery is not configured for this adapter.`,
-      );
+      const checkpoint = "notice:attachments-unconfigured";
+      if (
+        !checkpoints.has(checkpoint) &&
+        (await this.safeSendNotice(
+          target,
+          `This reply included ${attachments.length} attachment(s) but attachment delivery is not configured for this adapter.`,
+        ))
+      ) {
+        await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
+      }
       throw new Error(
         `attachments present but no AttachmentSender is configured (${attachments.length} undelivered)`,
       );
     }
     for (let index = 0; index < attachments.length; index++) {
+      const checkpoint = `attachment:${index}`;
+      if (checkpoints.has(checkpoint)) {
+        state.sentAttachmentIndexes.add(index);
+        continue;
+      }
       if (state.sentAttachmentIndexes.has(index)) {
+        await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
         continue;
       }
       const attachment = attachments[index];
       try {
         await this.attachmentSender.send(target, attachment);
-        state.sentAttachmentIndexes.add(index);
       } catch (error) {
         const label = attachment.name || attachment.path;
         this.logger.error(
@@ -421,9 +544,24 @@ export class PumbleRenderer {
           attachment.path,
           this.errorText(error),
         );
-        await this.safeSendNotice(target, `Failed to deliver attachment "${label}".`);
+        const noticeCheckpoint = `notice:attachment:${index}:failed`;
+        if (
+          !checkpoints.has(noticeCheckpoint) &&
+          (await this.safeSendNotice(
+            target,
+            `Failed to deliver attachment "${label}".`,
+          ))
+        ) {
+          await this.markCheckpoint(
+            event.eventId,
+            checkpoints,
+            noticeCheckpoint,
+          );
+        }
         throw error;
       }
+      state.sentAttachmentIndexes.add(index);
+      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
     }
   }
 
@@ -440,7 +578,10 @@ export class PumbleRenderer {
       return null;
     }
     if (!target) {
-      this.logger.warn("pumble-renderer: no target resolved", this.describeCorrelation(event));
+      this.logger.warn(
+        "pumble-renderer: no target resolved",
+        this.describeCorrelation(event),
+      );
       return null;
     }
     return target;
@@ -470,7 +611,10 @@ export class PumbleRenderer {
     return target;
   }
 
-  private async safeAddReaction(target: ResolvedTarget, emoji: string): Promise<boolean> {
+  private async safeAddReaction(
+    target: ResolvedTarget,
+    emoji: string,
+  ): Promise<boolean> {
     try {
       await this.pumble.addReaction(
         target.appKey,
@@ -493,7 +637,7 @@ export class PumbleRenderer {
   private async safeRemoveReaction(
     target: ResolvedTarget,
     emoji: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.pumble.removeReaction(
         target.appKey,
@@ -502,16 +646,21 @@ export class PumbleRenderer {
         target.triggerMessageId,
         emoji,
       );
+      return true;
     } catch (error) {
       this.logger.warn(
         "pumble-renderer: remove reaction failed",
         emoji,
         this.errorText(error),
       );
+      return false;
     }
   }
 
-  private async safeSendNotice(target: ResolvedTarget, text: string): Promise<void> {
+  private async safeSendNotice(
+    target: ResolvedTarget,
+    text: string,
+  ): Promise<boolean> {
     try {
       await this.pumble.sendMessage(
         target.appKey,
@@ -520,9 +669,26 @@ export class PumbleRenderer {
         text,
         target.threadRootId,
       );
+      return true;
     } catch (error) {
-      this.logger.error("pumble-renderer: failure notice post failed", this.errorText(error));
+      this.logger.error(
+        "pumble-renderer: failure notice post failed",
+        this.errorText(error),
+      );
+      return false;
     }
+  }
+
+  private async markCheckpoint(
+    eventId: string,
+    checkpoints: Set<string>,
+    checkpoint: string,
+  ): Promise<void> {
+    if (checkpoints.has(checkpoint)) {
+      return;
+    }
+    await this.checkpointStore?.markCheckpoint(eventId, checkpoint);
+    checkpoints.add(checkpoint);
   }
 
   private describeCorrelation(event: OutboundEvent): string {

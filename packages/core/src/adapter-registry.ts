@@ -218,18 +218,18 @@ export class AdapterRegistry {
     }
 
     for (const entry of registrations) {
-      if (
-        entry === null ||
-        typeof entry !== "object" ||
-        Array.isArray(entry)
-      ) {
-        throw new AdapterRegistrationError("each registration must be an object");
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new AdapterRegistrationError(
+          "each registration must be an object",
+        );
       }
 
       const { adapterId, callbackUrl, sharedSecret } = entry;
 
       if (typeof adapterId !== "string" || adapterId.length === 0) {
-        throw new AdapterRegistrationError("adapterId must be a non-empty string");
+        throw new AdapterRegistrationError(
+          "adapterId must be a non-empty string",
+        );
       }
 
       if (parseCallbackUrl(callbackUrl) === null) {
@@ -323,7 +323,6 @@ export class AdapterRegistry {
     }
     return SIGNATURE_PREFIX + hmac.digest("hex");
   }
-
 
   /**
    * Return a collision-proof identity/storage key for a conversation from the

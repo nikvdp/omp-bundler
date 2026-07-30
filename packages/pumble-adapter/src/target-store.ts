@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 
@@ -46,6 +46,37 @@ export class TargetStore {
   private data: TargetStoreData = { byConversation: {}, byCorrelation: {} };
   private loaded = false;
   private writeChain: Promise<void> = Promise.resolve();
+  private readonly conversationChains = new Map<string, Promise<void>>();
+
+  /**
+   * Serialize the target save, core acceptance, and correlation binding for
+   * one conversation while allowing different conversations to proceed
+   * concurrently. A failed action does not poison the next action, and the
+   * per-conversation chain entry is removed once it settles.
+   */
+  serializeConversation<T>(
+    conversationKey: string,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const previous =
+      this.conversationChains.get(conversationKey) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(action);
+    let settled!: Promise<void>;
+    settled = result.then(
+      () => {
+        if (this.conversationChains.get(conversationKey) === settled) {
+          this.conversationChains.delete(conversationKey);
+        }
+      },
+      () => {
+        if (this.conversationChains.get(conversationKey) === settled) {
+          this.conversationChains.delete(conversationKey);
+        }
+      },
+    );
+    this.conversationChains.set(conversationKey, settled);
+    return result;
+  }
 
   constructor(private readonly filePath: string) {}
 
@@ -73,6 +104,7 @@ export class TargetStore {
   ): Promise<void> {
     return this.serialize(async () => {
       await this.load();
+      if (this.data.byCorrelation[correlationId]) return;
       const resolved = target ?? this.data.byConversation[conversationKey];
       if (!resolved) {
         throw new Error(
@@ -89,17 +121,22 @@ export class TargetStore {
    * (precise per-turn), then falls back to conversationKey (same channel
    * has one active turn by contract).
    */
-  async resolve(conversationKey: string, correlationId: string): Promise<Target | null> {
-    await this.load();
-    const byCorrelation = this.data.byCorrelation[correlationId];
-    if (byCorrelation) {
-      return { ...byCorrelation };
-    }
-    const byConversation = this.data.byConversation[conversationKey];
-    if (byConversation) {
-      return { ...byConversation };
-    }
-    return null;
+  resolve(
+    conversationKey: string,
+    correlationId: string,
+  ): Promise<Target | null> {
+    return this.serialize(async () => {
+      await this.load();
+      const byCorrelation = this.data.byCorrelation[correlationId];
+      if (byCorrelation) {
+        return { ...byCorrelation };
+      }
+      const byConversation = this.data.byConversation[conversationKey];
+      if (byConversation) {
+        return { ...byConversation };
+      }
+      return null;
+    });
   }
 
   /**
@@ -123,13 +160,13 @@ export class TargetStore {
     if (this.loaded) {
       return;
     }
-    this.loaded = true;
     let raw: string;
     try {
       raw = await readFile(this.filePath, "utf8");
     } catch (error) {
       if (isEnoent(error)) {
         this.data = { byConversation: {}, byCorrelation: {} };
+        this.loaded = true;
         return;
       }
       throw new Error(
@@ -154,14 +191,32 @@ export class TargetStore {
       );
     }
     this.data = parsed;
+    this.loaded = true;
   }
 
   private async write() {
     const dir = path.dirname(this.filePath);
     await mkdir(dir, { recursive: true });
-    const temp = `${this.filePath}.${randomBytes(6).toString("hex")}.tmp`;
-    await writeFile(temp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
-    await rename(temp, this.filePath);
+    const tempPath = `${this.filePath}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      const temp = await open(tempPath, "wx", 0o600);
+      try {
+        await temp.writeFile(JSON.stringify(this.data, null, 2), "utf8");
+        await temp.sync();
+      } finally {
+        await temp.close();
+      }
+      await rename(tempPath, this.filePath);
+      const directory = await open(dir, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch (error) {
+      await rm(tempPath, { force: true });
+      throw error;
+    }
   }
 
   /**
@@ -169,19 +224,24 @@ export class TargetStore {
    * putByConversation / bindCorrelation / forgetCorrelation calls never
    * interleave their read-modify-write cycles.
    */
-  private serialize(action: () => Promise<void>): Promise<void> {
-    const next = this.writeChain
+  private serialize<T>(action: () => Promise<T>): Promise<T> {
+    const result = this.writeChain
       .catch(() => {
-        // A prior write failure must not block subsequent mutations.
+        // A prior operation failure must not block subsequent operations.
       })
-      .then(() => action());
-    this.writeChain = next;
-    return next;
+      .then(action);
+    this.writeChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 }
 
 function isEnoent(error: unknown): boolean {
-  return error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT";
+  return (
+    error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 function isValidStoreData(value: unknown): value is TargetStoreData {
@@ -219,6 +279,7 @@ function isValidTarget(value: unknown): boolean {
     record.channelId.length > 0 &&
     typeof record.triggerMessageId === "string" &&
     record.triggerMessageId.length > 0 &&
-    (record.threadRootId === undefined || typeof record.threadRootId === "string")
+    (record.threadRootId === undefined ||
+      typeof record.threadRootId === "string")
   );
 }
