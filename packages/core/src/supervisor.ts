@@ -41,13 +41,14 @@
  * supervisor never POSTs directly.
  */
 import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import type { InboundMessage } from "@omp-bundler/contracts/inbound";
 import type { OutboundEvent } from "@omp-bundler/contracts/outbound";
 
-import { AdapterRegistry } from "./adapter-registry.js";
+import { AdapterRegistry, type AdapterRegistration } from "./adapter-registry.js";
 import { SessionRegistry } from "./session-registry.js";
 import {
   IdempotencyStore,
@@ -1038,24 +1039,28 @@ export class CoreSupervisor {
     registryKey: string;
   }): Promise<RpcChild> {
     const extensionPath = this.resolveAmbientExtensionPath();
+    const registration = this.adapters.get(ctx.adapterId);
+    const plan = resolveChildSpawnPlan(this.config, registration);
     const args: string[] = ["--mode", "rpc"];
     // Load the production ambient extension explicitly. The staged agent
     // folder at $HOME/.omp/agent preserves tools/skills/agents through
     // default discovery (no --no-extensions flag).
     args.push("-e", extensionPath);
-    if (this.config.ompModel) {
-      args.push("--model", this.config.ompModel);
+    if (plan.model) {
+      args.push("--model", plan.model);
     }
     if (this.config.ompProfile) {
       args.push("--profile", this.config.ompProfile);
     }
-    args.push("--cwd", this.config.workspaceDir);
-    args.push(...this.config.ompArgs);
+    args.push("--cwd", plan.cwd);
+    args.push(...plan.args);
+
+    mkdirSync(plan.cwd, { recursive: true });
 
     const child = new RpcChild({
       binary: this.config.ompBinary,
       args,
-      cwd: this.config.workspaceDir,
+      cwd: plan.cwd,
       registryPath: this.config.childRegistryPath || undefined,
       conversationKey: ctx.registryKey,
     });
@@ -1117,4 +1122,58 @@ function assertRpcSuccess(response: RpcResponseFrame, operation: string): void {
 /** Composite conversation key (collision-proof, same algorithm as IngestBuffer). */
 function compositeKey(adapterId: string, conversationKey: string): string {
   return `${adapterId.length}:${adapterId}${conversationKey}`;
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent child spawn planning
+// ---------------------------------------------------------------------------
+
+/** Resolved spawn inputs for a child process: cwd, model, and args. */
+export interface ChildSpawnPlan {
+  cwd: string;
+  model: string | null;
+  args: string[];
+}
+
+/**
+ * Resolve the cwd, model, and args to use when spawning a child for the
+ * adapter described by `registration` (or undefined for the legacy path).
+ *
+ * When `registration` is undefined or carries no `agentId`, this returns the
+ * legacy values straight from `config` so behavior is unchanged for adapters
+ * that are not bound to an agent.
+ *
+ * When `registration.agentId` is present, the matching entry in
+ * `config.agents` is consulted. If no entry exists or `config.agentsRootDir`
+ * is null, this throws naming both the adapterId and agentId: `loadCoreConfig`
+ * normally guarantees these invariants, so reaching this branch indicates a
+ * misconfiguration that must surface loudly rather than silently falling back
+ * to the shared workspace. Otherwise the per-agent workspace is
+ * `join(config.agentsRootDir, agent.agentId)`, the model falls back to
+ * `config.ompModel` when the agent pins none, and the args fall back to
+ * `config.ompArgs` when the agent overrides none.
+ */
+export function resolveChildSpawnPlan(
+  config: CoreConfig,
+  registration: AdapterRegistration | undefined,
+): ChildSpawnPlan {
+  if (registration === undefined || registration.agentId === undefined) {
+    return {
+      cwd: config.workspaceDir,
+      model: config.ompModel,
+      args: config.ompArgs,
+    };
+  }
+  const agentId = registration.agentId;
+  const agent = config.agents.find((a) => a.agentId === agentId);
+  if (agent === undefined || config.agentsRootDir === null) {
+    throw new Error(
+      `adapter "${registration.adapterId}" is bound to agent "${agentId}" but no matching agent entry or agentsRootDir is configured`,
+    );
+  }
+  return {
+    cwd: join(config.agentsRootDir, agent.agentId),
+    model: agent.model ?? config.ompModel,
+    args: agent.args.length > 0 ? agent.args : config.ompArgs,
+  };
 }
