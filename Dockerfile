@@ -38,6 +38,14 @@ COPY entrypoint/       ./entrypoint/
 # location to keep every discovery surface on one root.
 COPY template/         "${HOME}/.omp/agent/"
 
+# Bake per-agent personalities at /agents/<agentId>/.omp/. The build
+# script always stages an agents/ directory (empty when --agents is
+# absent), so this COPY is unconditional. At boot the entrypoint seeds
+# each /agents/<agentId>/.omp to /data/agents/<agentId>/.omp and
+# children spawn with cwd=/data/agents/<agentId> so OMP's project-level
+# .omp discovery gives each adapter its own agent personality.
+COPY agents/          /agents/
+
 # ── production dependency install ─────────────────────────────────────
 # Install production dependencies for each package from its lock file.
 # file:../contracts resolves locally within the staged tree; no
@@ -66,6 +74,7 @@ ENV OMP_SESSIONS_DIR=/data/sessions
 ENV OMP_WORKSPACE_DIR=/data/workspace
 ENV OMP_ARTIFACTS_DIR=/data/artifacts
 ENV PI_ARTIFACTS_DIR=/data/artifacts
+ENV OMP_AGENTS_ROOT=/data/agents
 
 # Core runtime invariants. Paths and internal service addresses belong to
 # this image; credentials and adapter registrations remain runtime inputs.
