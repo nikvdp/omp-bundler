@@ -54,7 +54,10 @@ PUMBLE_SERVER="${OMP_PUMBLE_SERVER:-/app/packages/pumble-adapter/src/server.ts}"
 AMBIENT_EXTENSION="${OMP_AMBIENT_EXTENSION:-/app/packages/core/src/ambient-ingest-extension.ts}"
 
 log() { printf '[entrypoint] %s\n' "$*" >&2; }
-die() { printf '[entrypoint] error: %s\n' "$*" >&2; exit 1; }
+die() {
+	printf '[entrypoint] error: %s\n' "$*" >&2
+	exit 1
+}
 
 # -- 0. /data mount paths ----------------------------------------------
 # Ensure the shared volume subdirectories exist. Artifacts are
@@ -65,22 +68,22 @@ die() { printf '[entrypoint] error: %s\n' "$*" >&2; exit 1; }
 mkdir -p "$SESSIONS_DIR" "$WORKSPACE_DIR" "$ARTIFACTS_DIR"
 
 link_into_data() {
-  local target="$1" expected="$2"
-  if [ -e "$target" ] && [ ! -L "$target" ]; then
-    die "refusing to clobber existing $target (expected a symlink or nothing)"
-  fi
-  if [ -L "$target" ]; then
-    # Already a symlink: verify it points at the expected data dir.
-    # A stale link to a different path is a failure, not silently
-    # accepted.
-    local resolved
-    resolved="$(readlink "$target")"
-    if [ "$resolved" != "$expected" ]; then
-      die "$target is a symlink to '$resolved', expected '$expected'"
-    fi
-    return 0
-  fi
-  ln -s "$expected" "$target"
+	local target="$1" expected="$2"
+	if [ -e "$target" ] && [ ! -L "$target" ]; then
+		die "refusing to clobber existing $target (expected a symlink or nothing)"
+	fi
+	if [ -L "$target" ]; then
+		# Already a symlink: verify it points at the expected data dir.
+		# A stale link to a different path is a failure, not silently
+		# accepted.
+		local resolved
+		resolved="$(readlink "$target")"
+		if [ "$resolved" != "$expected" ]; then
+			die "$target is a symlink to '$resolved', expected '$expected'"
+		fi
+		return 0
+	fi
+	ln -s "$expected" "$target"
 }
 link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 
@@ -90,8 +93,8 @@ link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 # malformed, or unresolved values.
 log "rendering models.yml from ${MODELS_TMPL}"
 bun "$BUILD_DIR/render-models.ts" \
-  --input "$MODELS_TMPL" \
-  --output "$MODELS_OUT"
+	--input "$MODELS_TMPL" \
+	--output "$MODELS_OUT"
 log "models rendered to ${MODELS_OUT}"
 
 # Optional central credential vault. Both values are required together. The
@@ -99,20 +102,21 @@ log "models rendered to ${MODELS_OUT}"
 # the broker remains ahead of provider environment variables in OMP's
 # credential cascade.
 if [ -n "${OMP_AUTH_BROKER_URL:-}" ] || [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ]; then
-  [ -n "${OMP_AUTH_BROKER_URL:-}" ] || die "OMP_AUTH_BROKER_URL is required with OMP_AUTH_BROKER_TOKEN"
-  [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ] || die "OMP_AUTH_BROKER_TOKEN is required with OMP_AUTH_BROKER_URL"
-  omp config set auth.broker.url "$OMP_AUTH_BROKER_URL" >/dev/null
-  omp config set auth.broker.token "$OMP_AUTH_BROKER_TOKEN" >/dev/null
-  log "configured OMP auth broker"
+	[ -n "${OMP_AUTH_BROKER_URL:-}" ] || die "OMP_AUTH_BROKER_URL is required with OMP_AUTH_BROKER_TOKEN"
+	[ -n "${OMP_AUTH_BROKER_TOKEN:-}" ] || die "OMP_AUTH_BROKER_TOKEN is required with OMP_AUTH_BROKER_URL"
+	omp config set auth.broker.url "$OMP_AUTH_BROKER_URL" >/dev/null
+	omp config set auth.broker.token "$OMP_AUTH_BROKER_TOKEN" >/dev/null
+	log "configured OMP auth broker"
 fi
 
 # Default image composition: register the bundled Pumble adapter against its
 # loopback callback. OMP_ADAPTERS remains an escape hatch for multi-adapter
 # deployments. Build the JSON with Bun so arbitrary secret bytes are escaped.
 if [ -z "${OMP_ADAPTERS:-}" ]; then
-  [ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
-  export OMP_ADAPTERS="$(
-    bun -e '
+	[ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
+	# shellcheck disable=SC2016
+	OMP_ADAPTERS="$(
+		bun -e '
       const adapterId = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
       const port = process.env.PUMBLE_BRIDGE_PORT?.trim() || "8765";
       const callbackUrl =
@@ -124,8 +128,9 @@ if [ -z "${OMP_ADAPTERS:-}" ]; then
         sharedSecret: process.env.PUMBLE_CORE_SHARED_SECRET,
       }]));
     '
-  )"
-  log "configured bundled Pumble adapter registration"
+	)"
+	export OMP_ADAPTERS
+	log "configured bundled Pumble adapter registration"
 fi
 
 # -- 2. orphan sweep ---------------------------------------------------
@@ -155,13 +160,13 @@ TEARING_DOWN=0
 # Forward a signal to both children. Uses the negative-pid kill to
 # hit the whole process group when the child spawned its own group.
 forward_signal() {
-  local sig="$1"
-  if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-    kill -"$sig" "$PUMBLE_PID" 2>/dev/null || true
-  fi
-  if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
-    kill -"$sig" "$CORE_PID" 2>/dev/null || true
-  fi
+	local sig="$1"
+	if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
+		kill -"$sig" "$PUMBLE_PID" 2>/dev/null || true
+	fi
+	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
+		kill -"$sig" "$CORE_PID" 2>/dev/null || true
+	fi
 }
 
 trap 'TEARING_DOWN=1; forward_signal TERM' TERM
@@ -187,41 +192,41 @@ FIRST_EXIT=$?
 set -e
 
 if [ "$TEARING_DOWN" -eq 1 ]; then
-  # Signal-driven shutdown: forward already sent. Wait for both to
-  # finish, then exit with the first child's status (0 if it exited
-  # cleanly after the signal, non-zero if it had already crashed).
-  EXIT_CODE="$FIRST_EXIT"
+	# Signal-driven shutdown: forward already sent. Wait for both to
+	# finish, then exit with the first child's status (0 if it exited
+	# cleanly after the signal, non-zero if it had already crashed).
+	EXIT_CODE="$FIRST_EXIT"
 else
-  # A child died on its own. Fail fast: tear down the sibling.
-  log "child exited (status ${FIRST_EXIT}); tearing down sibling"
-  EXIT_CODE="$FIRST_EXIT"
-  forward_signal TERM
+	# A child died on its own. Fail fast: tear down the sibling.
+	log "child exited (status ${FIRST_EXIT}); tearing down sibling"
+	EXIT_CODE="$FIRST_EXIT"
+	forward_signal TERM
 fi
 
 # Give both children a bounded grace period, then SIGKILL stragglers.
 for _ in {1..50}; do
-  CORE_ALIVE=0
-  PUMBLE_ALIVE=0
-  if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
-    CORE_ALIVE=1
-  fi
-  if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-    PUMBLE_ALIVE=1
-  fi
-  if [ "$CORE_ALIVE" -eq 0 ] && [ "$PUMBLE_ALIVE" -eq 0 ]; then
-    break
-  fi
-  sleep 0.1
+	CORE_ALIVE=0
+	PUMBLE_ALIVE=0
+	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
+		CORE_ALIVE=1
+	fi
+	if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
+		PUMBLE_ALIVE=1
+	fi
+	if [ "$CORE_ALIVE" -eq 0 ] && [ "$PUMBLE_ALIVE" -eq 0 ]; then
+		break
+	fi
+	sleep 0.1
 done
 if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
-  log "core did not exit; sending SIGKILL"
-  kill -9 "$CORE_PID" 2>/dev/null || true
-  wait "$CORE_PID" 2>/dev/null || true
+	log "core did not exit; sending SIGKILL"
+	kill -9 "$CORE_PID" 2>/dev/null || true
+	wait "$CORE_PID" 2>/dev/null || true
 fi
 if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-  log "pumble did not exit; sending SIGKILL"
-  kill -9 "$PUMBLE_PID" 2>/dev/null || true
-  wait "$PUMBLE_PID" 2>/dev/null || true
+	log "pumble did not exit; sending SIGKILL"
+	kill -9 "$PUMBLE_PID" 2>/dev/null || true
+	wait "$PUMBLE_PID" 2>/dev/null || true
 fi
 
 log "supervisor exiting (status ${EXIT_CODE})"
