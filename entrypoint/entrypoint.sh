@@ -112,6 +112,21 @@ else
 	set --
 fi
 
+# Dotglob exposes the .gitkeep placeholder shipped in agentless
+# images (an /agents directory containing only .gitkeep). It is a
+# regular file, not an agent entry, so drop it from the positional
+# args before the entry-count decision below. An /agents holding
+# only .gitkeep then counts as zero baked agents and boots without
+# seeding or leak guards, matching the agentless-image contract.
+_filtered=()
+for _entry in "$@"; do
+	if [ "$(basename "$_entry")" = ".gitkeep" ] && [ -f "$_entry" ]; then
+		continue
+	fi
+	_filtered+=("$_entry")
+done
+set -- "${_filtered[@]}"
+
 if [ "$#" -gt 0 ]; then
 	# OMP's project-level config discovery walks up from the cwd, so a
 	# /data/.omp or /data/agents/.omp directory would leak config into
