@@ -657,6 +657,44 @@ test("check keeps synthesized Pumble registration validation unchanged", async (
   });
 });
 
+test("check and run reject fixed internal listener overrides in the runtime env file", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(parent, "listener-overrides.env");
+    await writeText(envPath, [
+      ...runtimeEnv().trim().split("\n"),
+      "OMP_HOST=",
+      "OMP_PORT=9999",
+      "PUMBLE_BRIDGE_HOST=127.0.0.1",
+      "PUMBLE_BRIDGE_PORT=not-a-port",
+      "",
+    ].join("\n"));
+
+    const report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, false);
+    for (const name of ["OMP_HOST", "OMP_PORT", "PUMBLE_BRIDGE_HOST", "PUMBLE_BRIDGE_PORT"]) {
+      assert(report.errors.some((entry) => entry.field === name));
+    }
+    assert(report.errors.every((entry) => (
+      !entry.message.includes("9999") && !entry.message.includes("127.0.0.1") && !entry.message.includes("not-a-port")
+    )));
+    assert.equal(report.errors.some((entry) => entry.field === "PUMBLE_BRIDGE_PORT" && entry.message.includes("integer")), false);
+
+    const checked = await invoke(checkCommand, bundle, [], { "env-file": envPath });
+    assert.equal(checked.result, 1);
+    assert.match(checked.stderr, /OMP_HOST/);
+    assert.match(checked.stderr, /OMP_PORT/);
+    assert.match(checked.stderr, /PUMBLE_BRIDGE_HOST/);
+    assert.match(checked.stderr, /PUMBLE_BRIDGE_PORT/);
+
+    const ran = await invoke(runCommand, bundle, [], { "env-file": envPath, "dry-run": true });
+    assert.equal(ran.result, 1);
+    assert.match(ran.stderr, /OMP_PORT/);
+    assert.doesNotMatch(`${ran.stdout}\n${ran.stderr}`, /docker run/);
+  });
+});
+
 test("check scans normalized credential fields without flagging placeholders or opaque identifiers", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["leaky"], { agent: "alpha" });
