@@ -8,6 +8,7 @@ export interface ExecuteOptions {
   readonly stdio?: SpawnOptions["stdio"];
   readonly input?: string | Uint8Array;
   readonly forwardSignals?: boolean;
+  readonly signalMap?: Partial<Record<NodeJS.Signals, NodeJS.Signals>>;
 }
 
 export function executeChild(
@@ -33,26 +34,28 @@ export function executeChild(
 
   const forwardSignals = options.forwardSignals ?? true;
   const onInterrupt = (signal: NodeJS.Signals): void => {
-    if (!child.killed) child.kill(signal);
+    const childSignal = options.signalMap?.[signal] ?? signal;
+    if (!child.killed) child.kill(childSignal);
+  };
+  const onSigint = (): void => onInterrupt("SIGINT");
+  const onSigterm = (): void => onInterrupt("SIGTERM");
+  const removeSignalListeners = (): void => {
+    if (!forwardSignals) return;
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
   };
   if (forwardSignals) {
-    process.on("SIGINT", onInterrupt);
-    process.on("SIGTERM", onInterrupt);
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
   }
 
   return new Promise<ProcessResult>((resolve, reject) => {
     child.once("error", (error) => {
-      if (forwardSignals) {
-        process.off("SIGINT", onInterrupt);
-        process.off("SIGTERM", onInterrupt);
-      }
+      removeSignalListeners();
       reject(new Error(`could not execute ${command}: ${error.message}`));
     });
     child.once("close", (code, signal) => {
-      if (forwardSignals) {
-        process.off("SIGINT", onInterrupt);
-        process.off("SIGTERM", onInterrupt);
-      }
+      removeSignalListeners();
       resolve({ exitCode: code ?? signalExitCode(signal), signal, stdout, stderr });
     });
   });

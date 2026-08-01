@@ -91,6 +91,7 @@ export const runCommand: CommandHandler = async (
   const docker = await executeChild("docker", dockerArgs, {
     stdio: "inherit",
     forwardSignals: true,
+    signalMap: { SIGTERM: "SIGINT" },
   });
   return docker.exitCode;
 };
