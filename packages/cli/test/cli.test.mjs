@@ -441,7 +441,7 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
     assert.equal(dryRun.stderr, "");
     assert.equal(
       dryRun.stdout.trim(),
-      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} bundle:local`,
+      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} override:tag`,
     );
   });
 });
