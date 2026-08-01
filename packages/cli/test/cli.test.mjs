@@ -286,6 +286,80 @@ test("check reports structural and runtime errors without exposing credential va
   });
 });
 
+test("check rejects incomplete explicit adapters without exposing adapter secrets", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(parent, "explicit-incomplete.env");
+    const adapterSecret = "explicit-adapter-secret";
+    await writeText(envPath, [
+      `OMP_ADAPTERS=[{"adapterId":"external","callbackUrl":"http://127.0.0.1:8765/core/events","sharedSecret":"${adapterSecret}","agentId":"alpha"}]`,
+      "",
+    ].join("\n"));
+
+    const report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, false);
+    for (const field of [
+      "PUMBLE_APP_ID",
+      "PUMBLE_APP_CLIENT_SECRET",
+      "PUMBLE_APP_KEY",
+      "PUMBLE_APP_SIGNING_SECRET",
+      "PUMBLE_PUBLIC_BASE_URL",
+      "PUMBLE_CORE_SHARED_SECRET",
+    ]) {
+      assert(report.errors.some((entry) => entry.field === field));
+    }
+    assert.equal(report.errors.some((entry) => entry.field === "PUMBLE_AGENT_ID"), false);
+    assert(report.errors.every((entry) => !entry.message.includes(adapterSecret)));
+
+    const checked = await invoke(checkCommand, bundle, [], { "env-file": envPath });
+    assert.equal(checked.result, 1);
+    assert.doesNotMatch(`${checked.stdout}\n${checked.stderr}`, new RegExp(adapterSecret));
+  });
+});
+
+test("check accepts complete explicit adapters without PUMBLE_AGENT_ID", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(parent, "explicit-complete.env");
+    await writeText(envPath, [
+      "PUMBLE_APP_ID=app",
+      "PUMBLE_APP_CLIENT_SECRET=client-secret",
+      "PUMBLE_APP_KEY=app-key",
+      "PUMBLE_APP_SIGNING_SECRET=signing-secret",
+      "PUMBLE_PUBLIC_BASE_URL=http://localhost:3000",
+      "PUMBLE_CORE_SHARED_SECRET=shared-secret",
+      'OMP_ADAPTERS=[{"adapterId":"external","callbackUrl":"http://127.0.0.1:8765/core/events","sharedSecret":"adapter-secret","agentId":"alpha"}]',
+      "",
+    ].join("\n"));
+
+    const report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.errors, []);
+    const checked = await invoke(checkCommand, bundle, [], { "env-file": envPath });
+    assert.equal(checked.result, 0);
+  });
+});
+
+test("check keeps synthesized Pumble registration validation unchanged", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(parent, "synthesized.env");
+    await writeText(envPath, runtimeEnv("alpha"));
+
+    const report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.errors, []);
+
+    await writeText(envPath, runtimeEnv("alpha").replace("PUMBLE_AGENT_ID=alpha\n", ""));
+    const missingAgent = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(missingAgent.ok, false);
+    assert(missingAgent.errors.some((entry) => entry.field === "PUMBLE_AGENT_ID"));
+  });
+});
+
 test("packaged assets and Docker contexts use allowlists and reject symlinks", async () => {
   await withTempDirectory(async (root) => {
     const source = join(root, "source");
