@@ -20,6 +20,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/cli.test.mjs",
     "prepack": "bun scripts/prepack.ts"
   },
   "devDependencies": {

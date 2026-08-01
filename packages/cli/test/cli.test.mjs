@@ -1,0 +1,363 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile, lstat } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { Readable, Writable } from "node:stream";
+import test from "node:test";
+
+import {
+  agentCommand,
+  checkCommand,
+  commandArgs,
+  destroyCommand,
+  generateCommand,
+  handlerContext,
+  newCommand,
+  PACKAGE_ASSET_PATHS,
+  removeDockerContext,
+  runCommand,
+  stageDockerContext,
+  stagePackagedAssets,
+} from "../src/index.ts";
+import {
+  buildPreviewCommand,
+  resolveBuildTag,
+  resolveRunSettings,
+  runPreviewCommand,
+  validateBundle,
+} from "../src/commands/index.ts";
+
+async function exists(path) {
+  return lstat(path).then(() => true, () => false);
+}
+
+async function writeText(path, content) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, content, "utf8");
+}
+
+function captureIO() {
+  const stdout = [];
+  const stderr = [];
+  const sink = (target) => new Writable({
+    write(chunk, _encoding, callback) {
+      target.push(Buffer.from(chunk).toString("utf8"));
+      callback();
+    },
+  });
+  return {
+    io: {
+      stdin: Readable.from([]),
+      stdout: sink(stdout),
+      stderr: sink(stderr),
+    },
+    stdout: () => stdout.join(""),
+    stderr: () => stderr.join(""),
+  };
+}
+
+async function invoke(handler, cwd, positionals, options = {}) {
+  const capture = captureIO();
+  const result = await handler(
+    commandArgs(positionals, options),
+    handlerContext(cwd, capture.io),
+  );
+  return { result, stdout: capture.stdout(), stderr: capture.stderr() };
+}
+
+async function withTempDirectory(callback) {
+  const root = await mkdtemp(join(tmpdir(), "omp-bundler-cli-test-"));
+  try {
+    return await callback(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function createCanonicalAssetSource(root) {
+  await writeText(join(root, "Dockerfile"), "FROM scratch\n");
+  await writeText(join(root, ".dockerignore"), "node_modules\n");
+  await writeText(join(root, "build", "build-image.ts"), "export {};\n");
+  await writeText(join(root, "entrypoint", "entrypoint.sh"), "#!/bin/sh\n");
+  await writeText(join(root, "template", "config.yml"), "version: 1\n");
+
+  for (const [packageRoot, paths] of Object.entries(PACKAGE_ASSET_PATHS)) {
+    for (const path of paths) {
+      const target = join(root, packageRoot, path);
+      if (path === "src" || path === "schemas") {
+        await writeText(join(target, "index.ts"), "export {};\n");
+      } else {
+        await writeText(target, "{}\n");
+      }
+    }
+  }
+  await writeText(join(root, "dist", "ignored.js"), "ignored\n");
+  await writeText(join(root, "node_modules", "ignored.js"), "ignored\n");
+  await writeText(join(root, "packages", "core", "test", "ignored.test.ts"), "ignored\n");
+}
+
+function runtimeEnv(agentId = "alpha") {
+  return [
+    "PUMBLE_APP_ID=app",
+    "PUMBLE_APP_CLIENT_SECRET=client-secret",
+    "PUMBLE_APP_KEY=app-key",
+    "PUMBLE_APP_SIGNING_SECRET=signing-secret",
+    "PUMBLE_PUBLIC_BASE_URL=http://localhost:3000",
+    "PUMBLE_CORE_SHARED_SECRET=shared-secret",
+    `PUMBLE_AGENT_ID=${agentId}`,
+    "",
+  ].join("\n");
+}
+
+test("new creates empty and full trees, generators cover every surface, and collisions stay safe", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["empty"]);
+    await invoke(newCommand, parent, ["full"], { agent: "alpha" });
+
+    assert.deepEqual(
+      new Set(await readdir(join(parent, "empty"))),
+      new Set([".gitignore", "README.md", "omp-bundler.yml", "runtime.env.example", "agents"]),
+    );
+    assert.equal(await exists(join(parent, "empty", "agents", ".gitkeep")), true);
+    assert.equal(await exists(join(parent, "full", "agents", "alpha", ".omp", "AGENTS.md")), true);
+    assert.equal(await exists(join(parent, "full", "agents", "alpha", ".omp", "config.yml")), true);
+    for (const surface of ["agents", "commands", "extensions", "skills", "tools"]) {
+      assert.equal(await exists(join(parent, "full", "agents", "alpha", ".omp", surface)), true);
+    }
+
+    await assert.rejects(
+      () => invoke(newCommand, parent, ["full"]),
+      /bundle destination already exists/,
+    );
+
+    await invoke(generateCommand, join(parent, "empty"), ["agent", "later"]);
+    assert.equal(await exists(join(parent, "empty", "agents", ".gitkeep")), false);
+    assert.equal(await exists(join(parent, "empty", "agents", "later", ".omp", "config.yml")), true);
+
+    const components = [
+      ["skill", "knowledge-base", join("skills", "knowledge-base", "SKILL.md")],
+      ["command", "summarize", join("commands", "summarize.md")],
+      ["tool", "lookup-record", join("tools", "lookup-record.ts")],
+      ["extension", "lifecycle-log", join("extensions", "lifecycle-log.ts")],
+      ["subagent", "researcher", join("agents", "researcher.md")],
+    ];
+    for (const [kind, name, relativePath] of components) {
+      await invoke(generateCommand, join(parent, "full"), [kind, "alpha", name]);
+      assert.equal(
+        await exists(join(parent, "full", "agents", "alpha", ".omp", relativePath)),
+        true,
+      );
+    }
+
+    const previewPath = join(parent, "full", "agents", "alpha", ".omp", "tools", "preview.ts");
+    const preview = await invoke(
+      generateCommand,
+      join(parent, "full"),
+      ["tool", "alpha", "preview"],
+      { "dry-run": true },
+    );
+    assert.match(preview.stdout, /would create/);
+    assert.equal(await exists(previewPath), false);
+    await assert.rejects(
+      () => invoke(generateCommand, join(parent, "full"), ["tool", "alpha", "lookup-record"]),
+      /refusing to overwrite existing path/,
+    );
+    await assert.rejects(
+      () => invoke(generateCommand, join(parent, "full"), ["command", "alpha", "../escape"]),
+      /unsafe/,
+    );
+  });
+});
+
+test("Pumble generation is idempotent, rejects conflicting agents, and rename preserves model and files", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envExample = join(bundle, "runtime.env.example");
+
+    await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
+    const before = await readFile(envExample, "utf8");
+    assert.match(before, /PUMBLE_AGENT_ID=alpha/);
+    const repeated = await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
+    assert.match(repeated.stdout, /no changes/);
+    assert.equal(await readFile(envExample, "utf8"), before);
+
+    await writeText(envExample, before.replace("PUMBLE_AGENT_ID=alpha", "PUMBLE_AGENT_ID=other"));
+    await assert.rejects(
+      () => invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" }),
+      /already binds PUMBLE_AGENT_ID to 'other'/,
+    );
+    await writeText(envExample, before);
+
+    await invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]);
+    const configPath = join(bundle, "agents", "alpha", ".omp", "config.yml");
+    assert.match(await readFile(configPath, "utf8"), /default: acme\/model-v1/);
+    await writeText(join(bundle, "agents", "alpha", "notes.txt"), "alpha custom state\n");
+    const ignoredRuntime = join(bundle, "runtime.env");
+    await writeText(ignoredRuntime, "PUMBLE_AGENT_ID=alpha\n");
+
+    const renamed = await invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]);
+    assert.match(renamed.stdout, /manual reference/);
+    assert.equal(await exists(join(bundle, "agents", "alpha")), false);
+    assert.equal(await exists(join(bundle, "agents", "renamed", "notes.txt")), true);
+    assert.equal(await readFile(join(bundle, "agents", "renamed", "notes.txt"), "utf8"), "alpha custom state\n");
+    assert.match(await readFile(join(bundle, "agents", "renamed", ".omp", "config.yml"), "utf8"), /default: acme\/model-v1/);
+    assert.match(await readFile(envExample, "utf8"), /PUMBLE_AGENT_ID=renamed/);
+    assert.equal(await readFile(ignoredRuntime, "utf8"), "PUMBLE_AGENT_ID=alpha\n");
+  });
+});
+
+test("destructive commands preview without mutation and require explicit confirmation", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await invoke(generateCommand, bundle, ["skill", "alpha", "temporary"]);
+    const skillPath = join(bundle, "agents", "alpha", ".omp", "skills", "temporary", "SKILL.md");
+
+    const dryRun = await invoke(destroyCommand, bundle, ["skill", "alpha", "temporary"], { "dry-run": true });
+    assert.match(dryRun.stdout, /dry-run: remove/);
+    assert.equal(await exists(skillPath), true);
+    await assert.rejects(
+      () => invoke(destroyCommand, bundle, ["skill", "alpha", "temporary"]),
+      /refusing non-interactive deletion/,
+    );
+    assert.equal(await exists(skillPath), true);
+    await invoke(destroyCommand, bundle, ["skill", "alpha", "temporary"], { yes: true });
+    assert.equal(await exists(skillPath), false);
+
+    await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
+    const agentPath = join(bundle, "agents", "alpha");
+    await invoke(destroyCommand, bundle, ["agent", "alpha"], { "dry-run": true });
+    assert.equal(await exists(agentPath), true);
+    await assert.rejects(
+      () => invoke(destroyCommand, bundle, ["agent", "alpha"]),
+      /refusing non-interactive deletion/,
+    );
+    await invoke(destroyCommand, bundle, ["agent", "alpha"], { yes: true });
+    assert.equal(await exists(agentPath), false);
+    assert.doesNotMatch(await readFile(join(bundle, "runtime.env.example"), "utf8"), /PUMBLE_AGENT_ID=alpha/);
+  });
+});
+
+test("check reports structural and runtime errors without exposing credential values", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const structuralPath = join(bundle, "agents", "alpha", ".omp", "unexpected.txt");
+    await writeText(structuralPath, "not an allowed project surface\n");
+    const leaked = "super-secret-value-42";
+    const envPath = join(parent, "runtime.env");
+    await writeText(envPath, [
+      "PUMBLE_APP_ID=app",
+      `PUMBLE_APP_CLIENT_SECRET=${leaked}`,
+      "PUMBLE_APP_KEY=app-key",
+      "PUMBLE_APP_SIGNING_SECRET=signing-secret",
+      "PUMBLE_PUBLIC_BASE_URL=http://localhost:3000",
+      "PUMBLE_CORE_SHARED_SECRET=shared-secret",
+      "PUMBLE_AGENT_ID=missing-agent",
+      "OMP_AUTH_BROKER_URL=not-a-url",
+      `OMP_AUTH_BROKER_TOKEN=${leaked}`,
+      "",
+    ].join("\n"));
+
+    const report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.path === structuralPath));
+    assert(report.errors.some((entry) => entry.field === "PUMBLE_AGENT_ID"));
+    assert(report.errors.some((entry) => entry.field === "OMP_AUTH_BROKER_URL"));
+    assert(report.credentialNames.includes("PUMBLE_APP_CLIENT_SECRET"));
+    assert(report.errors.every((entry) => !entry.message.includes(leaked)));
+
+    const checked = await invoke(checkCommand, bundle, [], { "env-file": envPath });
+    assert.equal(checked.result, 1);
+    assert.match(checked.stderr, /unexpected\.txt/);
+    assert.match(checked.stderr, /PUMBLE_AGENT_ID/);
+    assert.doesNotMatch(`${checked.stdout}\n${checked.stderr}`, new RegExp(leaked));
+  });
+});
+
+test("packaged assets and Docker contexts use allowlists and reject symlinks", async () => {
+  await withTempDirectory(async (root) => {
+    const source = join(root, "source");
+    const destination = join(root, "destination");
+    await mkdir(source, { recursive: true });
+    await createCanonicalAssetSource(source);
+    await stagePackagedAssets(source, destination);
+
+    assert.equal(await exists(join(destination, "Dockerfile")), true);
+    assert.equal(await exists(join(destination, "dist")), false);
+    assert.equal(await exists(join(destination, "node_modules")), false);
+    assert.equal(await exists(join(destination, "packages", "core", "test")), false);
+
+    await symlink(join(source, "Dockerfile"), join(source, "build", "linked-dockerfile"));
+    await assert.rejects(
+      () => stagePackagedAssets(source, destination),
+      /refusing to stage symlink/,
+    );
+    await rm(join(source, "build", "linked-dockerfile"));
+
+    const agentOmp = join(root, "agent-source", ".omp");
+    await writeText(join(agentOmp, "AGENTS.md"), "# alpha\n");
+    const agent = { id: "alpha", path: dirname(agentOmp), ompPath: agentOmp };
+    const contextPath = await stageDockerContext([agent], source);
+    try {
+      assert.equal(await exists(join(contextPath, "Dockerfile")), true);
+      assert.equal(await exists(join(contextPath, "dist")), false);
+      assert.equal(await exists(join(contextPath, "agents", "alpha", ".omp", "AGENTS.md")), true);
+    } finally {
+      await removeDockerContext(contextPath);
+    }
+
+    await symlink(join(source, "Dockerfile"), join(agentOmp, "linked-file"));
+    await assert.rejects(
+      () => stageDockerContext([agent], source),
+      /refusing to stage symlink/,
+    );
+  });
+});
+
+test("Docker argument precedence is explicit and run dry-run never executes Docker", async () => {
+  await withTempDirectory(async (parent) => {
+    const project = {
+      rootDir: join(parent, "demo"),
+      config: {
+        version: 1,
+        agentsDir: "./agents",
+        image: { tag: "configured:tag" },
+        run: { dataVolume: "configured-data", corePort: 9100, adapterPort: 9200 },
+      },
+    };
+    assert.equal(resolveBuildTag({ project }, undefined), "configured:tag");
+    assert.equal(resolveBuildTag({ project }, "override:tag"), "override:tag");
+    const settings = resolveRunSettings({ project });
+    assert.deepEqual(settings, {
+      image: "configured:tag",
+      dataVolume: "configured-data",
+      corePort: 9100,
+      adapterPort: 9200,
+    });
+    assert.equal(resolveRunSettings({ project }, "override:tag").image, "override:tag");
+    assert.equal(buildPreviewCommand("override:tag", "/tmp/docker-context"), "docker build -t override:tag /tmp/docker-context");
+    assert.equal(
+      runPreviewCommand(settings, "/tmp/runtime.env"),
+      "docker run --rm -p 9100:9100 -p 9200:9200 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
+    );
+
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(bundle, "runtime.env");
+    await writeText(envPath, runtimeEnv());
+    const dryRun = await invoke(
+      runCommand,
+      bundle,
+      [],
+      { "env-file": envPath, image: "override:tag", "dry-run": true },
+    );
+    assert.equal(dryRun.result, 0);
+    assert.equal(dryRun.stderr, "");
+    assert.equal(
+      dryRun.stdout.trim(),
+      runPreviewCommand({ image: "override:tag", dataVolume: "bundle-data", corePort: 8787, adapterPort: 8765 }, envPath),
+    );
+  });
+});
