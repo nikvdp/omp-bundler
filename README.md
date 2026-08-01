@@ -591,8 +591,9 @@ omp-bundler run --env-file runtime.env
 ```
 
 The command uses the image tag, ports, and data volume from
-`omp-bundler.yml`. It validates runtime adapter bindings before starting the
-container, streams logs, and forwards termination signals.
+`omp-bundler.yml`. It validates runtime adapter bindings against the
+effective agent collection before starting the container, streams logs, and
+forwards termination signals.
 
 Run a bundle from another directory:
 
@@ -606,6 +607,19 @@ Override the image:
 omp-bundler run --image registry.example.com/my-bundle:2026-08-01 \
   --env-file runtime.env
 ```
+
+Override the agent collection used for binding validation without changing
+the image or project configuration:
+
+```bash
+omp-bundler run --agents ./alternate-agents --env-file runtime.env
+```
+
+`--agents` takes precedence over `agentsDir` for validation only. It follows
+the same collection rules as `build --agents` and must match the collection
+the image was built with, because only those agents exist inside the
+container. A missing path, a file instead of a directory, or an invalid child
+fails before Docker runs.
 
 Preview the Docker invocation:
 
@@ -726,7 +740,7 @@ omp-bundler agent rename <old-agent-id> <new-agent-id>
 
 omp-bundler check [bundle-path] [--env-file <path>]
 omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]
-omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--dry-run]
+omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]
 ```
 
 Every command supports `--help`. Generators support `--dry-run` and refuse to
