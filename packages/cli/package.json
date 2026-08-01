@@ -1,0 +1,41 @@
+{
+  "name": "@omp-bundler/cli",
+  "version": "0.1.0",
+  "description": "Build and run filesystem-configured OMP agents as a durable service",
+  "type": "module",
+  "bin": {
+    "omp-bundler": "./dist/cli.js"
+  },
+  "files": [
+    "dist/**",
+    "src/**",
+    "assets/**"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./args": "./src/args.ts",
+    "./assets": "./src/assets.ts",
+    "./config": "./src/config.ts",
+    "./file-plan": "./src/file-plan.ts",
+    "./handlers": "./src/handlers.ts",
+    "./identifiers": "./src/identifiers.ts",
+    "./process": "./src/process.ts",
+    "./project": "./src/project.ts",
+    "./types": "./src/types.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "prepack": "bun build src/cli.ts --outfile dist/cli.js --target node"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "typescript": "~5.9.3"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}
