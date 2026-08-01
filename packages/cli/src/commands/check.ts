@@ -97,7 +97,6 @@ const PUMBLE_REQUIRED = [
   "PUMBLE_APP_SIGNING_SECRET",
   "PUMBLE_PUBLIC_BASE_URL",
   "PUMBLE_CORE_SHARED_SECRET",
-  "PUMBLE_AGENT_ID",
 ] as const;
 
 interface EnvValue {
@@ -994,6 +993,9 @@ function validateRuntimeEnv(
 
   const adapters = env.get("OMP_ADAPTERS");
   const pumbleAgent = value("PUMBLE_AGENT_ID");
+  for (const required of PUMBLE_REQUIRED) {
+    if (!value(required)) errors.push(issue(envPath, required, "is required for bundled Pumble startup; fill runtime.env from the adapter template"));
+  }
   if (adapters && adapters.value.trim()) {
     const adapterLineCount = source.split(/\r?\n/).filter((line) => /^\s*OMP_ADAPTERS\s*=/.test(line)).length;
     if (adapters.quoted || adapterLineCount !== 1) {
@@ -1005,9 +1007,7 @@ function validateRuntimeEnv(
     return;
   }
 
-  for (const required of PUMBLE_REQUIRED) {
-    if (!value(required)) errors.push(issue(envPath, required, "is required when OMP_ADAPTERS is unset; fill runtime.env from the adapter template"));
-  }
+  if (!pumbleAgent) errors.push(issue(envPath, "PUMBLE_AGENT_ID", "is required when OMP_ADAPTERS is unset; fill runtime.env from the adapter template"));
   if (pumbleAgent && !isSafeIdentifier(pumbleAgent)) errors.push(issue(envPath, "PUMBLE_AGENT_ID", "must be a safe agent id"));
   if (pumbleAgent && !agents.some((agent) => agent.id === pumbleAgent)) {
     errors.push(issue(envPath, "PUMBLE_AGENT_ID", `references '${pumbleAgent}', which is not a direct child of the effective agent collection`));
