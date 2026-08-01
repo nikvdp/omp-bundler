@@ -216,6 +216,20 @@ providers:
               name: MiniMax M3
             - id: qwen3.7-max
               name: Qwen3.7 Max
+    deepseek:
+        baseUrl: https://api.deepseek.com
+        api: openai-completions
+        apiKey: ${DEEPSEEK_API_KEY}
+        models:
+            - id: deepseek-v4-flash
+              name: DeepSeek V4 Flash
+              input:
+                - text
+              reasoning: true
+              contextWindow: 1000000
+              maxTokens: 384000
+              compat:
+                requiresThinkingAsText: true
     custom-provider:
         baseUrl: ${custom-provider_BASE_URL}
         api: openai-completions
