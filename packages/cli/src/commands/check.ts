@@ -90,6 +90,12 @@ const CREDENTIAL_ENV_NAMES: Record<string, true> = {
   PUMBLE_APP_SIGNING_SECRET: true,
   PUMBLE_CORE_SHARED_SECRET: true,
 };
+const FIXED_LISTENER_ENV: Record<string, true> = {
+  OMP_HOST: true,
+  OMP_PORT: true,
+  PUMBLE_BRIDGE_HOST: true,
+  PUMBLE_BRIDGE_PORT: true,
+};
 const PUMBLE_REQUIRED = [
   "PUMBLE_APP_ID",
   "PUMBLE_APP_CLIENT_SECRET",
@@ -1058,6 +1064,11 @@ function validateRuntimeEnv(
 ): void {
   const value = (name: string): string | undefined => env.get(name)?.value.trim() || undefined;
   if (env.has("OMP_AGENTS")) errors.push(issue(envPath, "OMP_AGENTS", "is unsupported; direct agent directories are the only agent enumeration"));
+  for (const [name] of env) {
+    if (name in FIXED_LISTENER_ENV) {
+      errors.push(issue(envPath, name, "is fixed inside the container; configure host ports with run.corePort and run.adapterPort"));
+    }
+  }
 
   const brokerUrl = value("OMP_AUTH_BROKER_URL");
   const brokerToken = value("OMP_AUTH_BROKER_TOKEN");
@@ -1071,7 +1082,7 @@ function validateRuntimeEnv(
     if (name in URL_ENV_NAMES || name.endsWith("_BASE_URL")) {
       validateUrl(envPath, name, entry.value.trim(), errors, name === "PUMBLE_PUBLIC_BASE_URL");
     }
-    if (name.endsWith("_PORT") || name === "PUMBLE_BRIDGE_PORT") {
+    if ((name.endsWith("_PORT") || name === "PUMBLE_BRIDGE_PORT") && !(name in FIXED_LISTENER_ENV)) {
       const parsed = Number(entry.value.trim());
       if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 65535) errors.push(issue(envPath, name, "must be an integer from 1 through 65535"));
     }
