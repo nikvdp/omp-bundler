@@ -104,12 +104,14 @@ EXPOSE 8787
 EXPOSE 8765
 
 # ── model provider runtime config ─────────────────────────────────────
-# Base URLs are always required. API keys are required unless both
-# OMP_AUTH_BROKER_URL and OMP_AUTH_BROKER_TOKEN are set, in which case the
-# renderer removes provider apiKey fields and OMP resolves credentials through
-# the broker.
-#   CLIPROXY_BASE_URL    cliproxyapi provider base URL
-#   custom-provider_BASE_URL     custom-provider provider base URL
+# Provider definitions with runtime placeholders are optional. Without the
+# broker, set every placeholder for the provider(s) used by the deployment;
+# providers with none configured are omitted and partially configured
+# providers fail at startup. With the broker pair, apiKey fields are removed
+# first, so fixed-base providers remain available without provider keys.
+# Custom providers still need their base URL at runtime.
+#   CLIPROXY_BASE_URL    optional cliproxyapi provider base URL
+#   custom-provider_BASE_URL     optional custom-provider provider base URL
 #   CLIPROXY_API_KEY     cliproxyapi key without a broker
 #   custom-provider_API_KEY      custom-provider key without a broker
 #   OLLAMA_CLOUD_API_KEY ollama-cloud key without a broker

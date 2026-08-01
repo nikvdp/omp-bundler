@@ -9,16 +9,19 @@
  *   - PLACEHOLDER: env-placeholder regex
  *
  * Expands ${VAR} placeholders in a models.yml.tmpl against the process
- * environment, validates the rendered catalog, and writes models.yml.
+ * environment, omits provider definitions whose required placeholders are
+ * all unconfigured, validates the rendered catalog, and writes models.yml.
  * Fails nonzero with named diagnostics on:
- *   - any placeholder whose env var is missing or empty
- *   - any unresolved ${...} surviving expansion
+ *   - a provider whose placeholders are only partially configured
+ *   - any placeholder with a malformed name or unsupported shell syntax
+ *   - a valid placeholder outside an omitted provider whose env var is missing
  *   - a rendered catalog missing a top-level providers object
  *   - any provider with a missing or empty models array
- *
+
  * Model metadata (ids, contextWindow, maxTokens, compat, …) is left
- * literal: only ${VAR} substitutions touch the text, and the raw expanded
- * text is written verbatim so comments and formatting survive.
+ * literal: only ${VAR} substitutions touch the text. When provider cleanup
+ * is needed, the resulting catalog is serialized as valid YAML-compatible
+ * JSON after the optional definitions are removed.
  *
  * Usage:
  *   bun build/render-models.ts --input <tmpl> --output <out>
@@ -131,6 +134,104 @@ export function expand(tmpl: string): { text: string; missing: string[]; survivo
 
   return { text, missing: [...missing].sort(), survivors: [...survivors].sort() };
 }
+type PlaceholderSummary = {
+  names: Set<string>;
+  malformed: Set<string>;
+};
+
+const VALID_PLACEHOLDER = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+
+function collectPlaceholders(value: unknown): PlaceholderSummary {
+  const summary: PlaceholderSummary = {
+    names: new Set<string>(),
+    malformed: new Set<string>(),
+  };
+
+  const visit = (part: unknown): void => {
+    if (typeof part === "string") {
+      const re = new RegExp(SURVIVOR.source, "g");
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(part)) !== null) {
+        const token = match[0]!;
+        const valid = VALID_PLACEHOLDER.exec(token);
+        if (valid) {
+          summary.names.add(valid[1]!);
+        } else {
+          summary.malformed.add(token);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(part)) {
+      for (const item of part) visit(item);
+      return;
+    }
+    if (part !== null && typeof part === "object") {
+      for (const item of Object.values(part)) visit(item);
+    }
+  };
+
+  visit(value);
+  return summary;
+}
+
+function envValueMissing(name: string): boolean {
+  const value = process.env[name];
+  return value === undefined || value === "";
+}
+
+/**
+ * Drop provider definitions that have no configured runtime placeholders.
+ * A provider with some, but not all, required placeholders configured remains
+ * in the catalog so the normal expansion path can report every missing value.
+ * Malformed placeholders also remain so they cannot be hidden by omission.
+ */
+export function omitUnconfiguredProviders(tmpl: string): {
+  text: string;
+  partial: string[];
+} {
+  const parsed = Bun.YAML.parse(tmpl);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { text: tmpl, partial: [] };
+  }
+
+  const providers = (parsed as Catalog).providers;
+  if (
+    providers === null ||
+    typeof providers !== "object" ||
+    Array.isArray(providers)
+  ) {
+    return { text: tmpl, partial: [] };
+  }
+
+  const partial: string[] = [];
+  let changed = false;
+  for (const [name, provider] of Object.entries(providers)) {
+    if (provider === null || typeof provider !== "object" || Array.isArray(provider)) {
+      continue;
+    }
+    const { names, malformed } = collectPlaceholders(provider);
+    if (malformed.size > 0 || names.size === 0) continue;
+
+    const missing = [...names].filter(envValueMissing).sort();
+    if (missing.length === 0) continue;
+    if (missing.length === names.size) {
+      delete providers[name];
+      changed = true;
+      continue;
+    }
+
+    partial.push(
+      `provider '${name}' is partially configured; env var(s) ${missing.join(", ")} are missing or empty`,
+    );
+  }
+
+  return {
+    text: changed ? JSON.stringify(parsed, null, 2) : tmpl,
+    partial,
+  };
+}
+
 
 /**
  * Remove provider apiKey fields when OMP's credential broker owns auth.
@@ -147,6 +248,13 @@ export function omitProviderApiKeys(tmpl: string): string {
   }
   for (const provider of Object.values(providers)) {
     if (provider !== null && typeof provider === "object" && !Array.isArray(provider)) {
+      const apiKey = provider.apiKey;
+      if (
+        typeof apiKey === "string" &&
+        collectPlaceholders(apiKey).malformed.size > 0
+      ) {
+        continue;
+      }
       delete provider.apiKey;
     }
   }
@@ -235,14 +343,23 @@ async function main(): Promise<void> {
       die(`cannot prepare broker-backed model catalog: ${(e as Error).message}`);
     }
   }
+  let partial: string[] = [];
+  try {
+    const prepared = omitUnconfiguredProviders(tmpl);
+    tmpl = prepared.text;
+    partial = prepared.partial;
+  } catch (e) {
+    die(`cannot prepare optional model providers: ${(e as Error).message}`);
+  }
 
   const { text: rendered, missing, survivors } = expand(tmpl);
 
   // Collect every expansion failure up front so a single run names
-  // all offenders: missing/empty valid env vars plus any ${...} that
-  // survived (shell-style expansions, malformed names, or valid
-  // names left because their env var was unset).
+  // all offenders: partially configured providers, missing/empty valid
+  // env vars, plus any ${...} that survived (shell-style expansions,
+  // malformed names, or valid names left because their env var was unset).
   const expansionErrors = [
+    ...partial,
     ...missing.map((n) => `env var '${n}' is missing or empty`),
     ...survivors.map((t) => `unresolved placeholder '${t}' in template`),
   ];

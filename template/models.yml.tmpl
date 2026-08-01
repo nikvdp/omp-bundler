@@ -1,8 +1,7 @@
 # Rendered to models.yml at container start. Environment placeholders
-# (a dollar sign followed by a bare name, optionally braced) resolve
-# against the container's environment; rendering fails if a placeholder
-# is unresolved or a provider has no models.
-
+# resolve against the container's environment. A provider whose
+# placeholders are all absent is omitted; a partially configured provider
+# or a malformed placeholder fails startup.
 providers:
     cliproxyapi:
         baseUrl: ${CLIPROXY_BASE_URL}
