@@ -25,6 +25,8 @@ export type { RootCommandHandlerMap } from "./handlers.ts";
 export { assertSafeIdentifier, assertSafeRelativePath, isSafeIdentifier, resolveInside, SAFE_IDENTIFIER_PATTERN } from "./identifiers.ts";
 export { executeChild } from "./process.ts";
 export { discoverAgents, loadProject, resolveAgentPath, resolveBundleRoot, resolveCommandPath, PROJECT_CONFIG_FILE } from "./project.ts";
+export { agentCommand } from "./commands/agent.ts";
+export { destroyCommand } from "./commands/destroy.ts";
 export type {
   AgentDirectory,
   CliIO,
