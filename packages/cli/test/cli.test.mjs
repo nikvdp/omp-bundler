@@ -724,6 +724,59 @@ export default () => ({ execute: async () => ({}) });
     assert.equal(passed.stderr, "");
   });
 });
+test("check rejects credential fallback literals without printing values", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["fallback"], { agent: "alpha" });
+    const fallback = join(parent, "fallback");
+    const fallbackOmp = join(fallback, "agents", "alpha", ".omp");
+    const fallbackValues = [
+      "fallback-default",
+      "fallback-alternate",
+      "fallback-error",
+      "source-fallback",
+      "source-mixed",
+    ];
+    await writeText(join(fallbackOmp, "settings.json"), JSON.stringify({
+      api_token: "${API_TOKEN:-" + fallbackValues[0] + "}",
+      token: "${TOKEN:+" + fallbackValues[1] + "}",
+      secret: "${SECRET",
+    }));
+    await writeText(join(fallbackOmp, "config.yml"), [
+      "setupVersion: 1",
+      `secret: \${SECRET:?${fallbackValues[2]}}`,
+      "",
+    ].join("\n"));
+    await writeText(join(fallbackOmp, "tools", "fallback.ts"), `const token = "\${TOKEN:-${fallbackValues[3]}}";
+const token = "prefix-\${TOKEN}-${fallbackValues[4]}";
+export default () => ({ execute: async () => ({}) });
+`);
+
+    const rejected = await invoke(checkCommand, fallback, []);
+    assert.equal(rejected.result, 1);
+    assert.match(rejected.stderr, /settings\.json.*api_token/);
+    assert.match(rejected.stderr, /settings\.json.*token/);
+    assert.match(rejected.stderr, /settings\.json.*secret/);
+    assert.match(rejected.stderr, /config\.yml.*secret/);
+    assert.match(rejected.stderr, /fallback\.ts.*token/);
+    for (const value of fallbackValues) {
+      assert.doesNotMatch(`${rejected.stdout}\n${rejected.stderr}`, new RegExp(value));
+    }
+    assert.doesNotMatch(`${rejected.stdout}\n${rejected.stderr}`, /\$\{SECRET/);
+
+    await invoke(newCommand, parent, ["exact"], { agent: "alpha" });
+    const exact = join(parent, "exact");
+    await writeText(join(exact, "agents", "alpha", ".omp", "settings.json"), JSON.stringify({
+      api_token: "${API_TOKEN}",
+      token: "$TOKEN",
+      secret: "process.env.SECRET",
+      credential: "env.CREDENTIAL",
+    }));
+    const passed = await invoke(checkCommand, exact, []);
+    assert.equal(passed.result, 0);
+    assert.match(passed.stdout, /Check passed/);
+    assert.equal(passed.stderr, "");
+  });
+});
 test("packaged assets and Docker contexts use allowlists and reject symlinks", async () => {
   await withTempDirectory(async (root) => {
     const source = join(root, "source");
