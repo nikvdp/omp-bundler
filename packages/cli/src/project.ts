@@ -76,10 +76,12 @@ export async function discoverAgents(
     if (entryInfo.isSymbolicLink()) throw new Error(`agent path must not be a symlink: ${agentPath}`);
     if (!entryInfo.isDirectory()) throw new Error(`agent collection entry is not a directory: ${agentPath}`);
     assertSafeIdentifier(entry.name, "agent id");
-    const ompPath = join(agentPath, ".omp");
-    const ompInfo = await lstat(ompPath).catch(() => null);
-    if (!ompInfo?.isDirectory()) throw new Error(`agent '${entry.name}' is missing .omp/: ${ompPath}`);
-    agents.push({ id: entry.name, path: agentPath, ompPath });
+    const legacyOmpPath = join(agentPath, ".omp");
+    const legacyOmpInfo = await lstat(legacyOmpPath).catch(() => null);
+    if (legacyOmpInfo) {
+      throw new Error(`agent '${entry.name}' has a nested .omp directory; agent source must live at the agent root: ${agentPath}`);
+    }
+    agents.push({ id: entry.name, path: agentPath });
   }
   return agents;
 }

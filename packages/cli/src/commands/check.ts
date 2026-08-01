@@ -143,9 +143,9 @@ export async function validateBundle(options: CheckOptions): Promise<CheckResult
 
   const projectInfo = buildProjectContext(rootDir, configPath, parsedConfig, errors);
   const effectiveAgentsDir = resolveEffectiveAgentsDir(options, projectInfo.project, rootDir, errors);
-  const agents = await validateAgentCollection(effectiveAgentsDir, errors, warnings);
+  const agents = await validateAgentCollection(effectiveAgentsDir, errors);
   for (const agent of agents) {
-    await validateAgent(agent, errors, warnings);
+    await validateAgent(agent, errors);
   }
 
   let resolvedEnvFile: string | undefined;
@@ -358,7 +358,6 @@ function resolveEffectiveAgentsDir(
 async function validateAgentCollection(
   agentsDir: string,
   errors: ValidationIssue[],
-  warnings: ValidationIssue[],
 ): Promise<AgentDirectory[]> {
   const collectionInfo = await lstat(agentsDir).catch(() => null);
   if (!collectionInfo) {
@@ -407,21 +406,13 @@ async function validateAgentCollection(
       errors.push(issue(entryPath, "agent id", "must use 1-64 lowercase letters, numbers, '-' or '_' and start with a letter or number"));
       continue;
     }
-    const ompPath = join(entryPath, ".omp");
-    const ompInfo = await lstat(ompPath).catch(() => null);
-    if (!ompInfo) {
-      errors.push(issue(ompPath, undefined, "is required for every agent"));
+    const legacyOmpPath = join(entryPath, ".omp");
+    const legacyOmpInfo = await lstat(legacyOmpPath).catch(() => null);
+    if (legacyOmpInfo) {
+      errors.push(issue(legacyOmpPath, undefined, "must not be a nested .omp directory; agent source lives directly in the agent root"));
       continue;
     }
-    if (ompInfo.isSymbolicLink()) {
-      errors.push(issue(ompPath, undefined, "must not be a symlink"));
-      continue;
-    }
-    if (!ompInfo.isDirectory()) {
-      errors.push(issue(ompPath, undefined, "must be a directory"));
-      continue;
-    }
-    agents.push({ id: name, path: entryPath, ompPath });
+    agents.push({ id: name, path: entryPath });
   }
   return agents;
 }
@@ -429,15 +420,14 @@ async function validateAgentCollection(
 async function validateAgent(
   agent: AgentDirectory,
   errors: ValidationIssue[],
-  warnings: ValidationIssue[],
 ): Promise<void> {
-  await scanTree(agent.path, agent.path, errors, warnings, true);
-  const entries = await readdir(agent.ompPath).catch(() => [] as string[]);
+  await scanTree(agent.path, errors);
+  const entries = await readdir(agent.path).catch(() => [] as string[]);
   for (const required of OMP_REQUIRED_FILES) {
-    const path = join(agent.ompPath, required);
+    const path = join(agent.path, required);
     const info = await lstat(path).catch(() => null);
     if (!info) {
-      errors.push(issue(path, undefined, "is required in every agent .omp scaffold"));
+      errors.push(issue(path, undefined, "is required in every agent scaffold"));
     } else if (info.isSymbolicLink()) {
       errors.push(issue(path, undefined, "must not be a symlink"));
     } else if (!info.isFile()) {
@@ -445,10 +435,10 @@ async function validateAgent(
     }
   }
   for (const required of OMP_REQUIRED_DIRS) {
-    const path = join(agent.ompPath, required);
+    const path = join(agent.path, required);
     const info = await lstat(path).catch(() => null);
     if (!info) {
-      errors.push(issue(path, undefined, "is required in every agent .omp scaffold"));
+      errors.push(issue(path, undefined, "is required in every agent scaffold"));
     } else if (info.isSymbolicLink()) {
       errors.push(issue(path, undefined, "must not be a symlink"));
     } else if (!info.isDirectory()) {
@@ -456,12 +446,12 @@ async function validateAgent(
     }
   }
   for (const entry of entries) {
-    const path = join(agent.ompPath, entry);
+    const path = join(agent.path, entry);
     const info = await lstat(path).catch(() => null);
     if (!info) continue;
     if (GLOBAL_STATE_NAMES.test(entry) || /^agent\.db/i.test(entry)) continue;
     if (!(entry in OMP_ALLOWED)) {
-      errors.push(issue(path, undefined, "is not an allowed .omp surface; use AGENTS.md, config.yml, settings.json, agents, commands, extensions, skills, or tools"));
+      errors.push(issue(path, undefined, "is not an allowed agent surface; use AGENTS.md, config.yml, settings.json, agents, commands, extensions, skills, or tools"));
       continue;
     }
     const expectsDirectory = (OMP_REQUIRED_DIRS as readonly string[]).includes(entry);
@@ -469,22 +459,19 @@ async function validateAgent(
     if (!expectsDirectory && !info.isFile()) errors.push(issue(path, undefined, "must be a regular file"));
   }
 
-  await validateTextFile(join(agent.ompPath, "AGENTS.md"), "instructions", errors, (source, path) => {
+  await validateTextFile(join(agent.path, "AGENTS.md"), "instructions", errors, (source, path) => {
     if (!source.trim()) errors.push(issue(path, undefined, "must not be empty"));
   });
-  await validateYamlFile(join(agent.ompPath, "config.yml"), "agent config", errors, validateAgentConfig);
-  const settingsPath = join(agent.ompPath, "settings.json");
+  await validateYamlFile(join(agent.path, "config.yml"), "agent config", errors, validateAgentConfig);
+  const settingsPath = join(agent.path, "settings.json");
   const settings = await lstat(settingsPath).catch(() => null);
   if (settings?.isFile()) await validateJsonFile(settingsPath, errors);
   await validateComponents(agent, errors);
 }
 
 async function scanTree(
-  root: string,
   current: string,
   errors: ValidationIssue[],
-  warnings: ValidationIssue[],
-  includeSiblings: boolean,
 ): Promise<void> {
   const entries = await readdir(current).catch(() => [] as string[]);
   for (const name of entries) {
@@ -499,15 +486,12 @@ async function scanTree(
       errors.push(issue(path, undefined, "runtime state, cache, model catalog, or credential material must not be committed in agent source"));
     }
     if (info.isDirectory()) {
-      await scanTree(root, path, errors, warnings, includeSiblings);
+      await scanTree(path, errors);
       continue;
     }
     if (!info.isFile()) {
       errors.push(issue(path, undefined, "must be a regular file"));
       continue;
-    }
-    if (includeSiblings && !path.startsWith(`${join(root, ".omp")}${"/"}`) && !path.endsWith(`${join(root, ".omp")}`)) {
-      warnings.push(issue(path, undefined, "sibling files are not baked into the image; keep deployable OMP content under .omp"));
     }
     if (isTextPath(path)) {
       const source = await readFile(path, "utf8").catch(() => "");
@@ -517,11 +501,11 @@ async function scanTree(
 }
 
 async function validateComponents(agent: AgentDirectory, errors: ValidationIssue[]): Promise<void> {
-  await validateMarkdownDirectory(join(agent.ompPath, "agents"), "agents", errors);
-  await validateMarkdownDirectory(join(agent.ompPath, "commands"), "commands", errors);
-  await validateTypeScriptDirectory(join(agent.ompPath, "extensions"), "extension", errors);
-  await validateTypeScriptDirectory(join(agent.ompPath, "tools"), "tool", errors);
-  await validateSkillsDirectory(join(agent.ompPath, "skills"), errors);
+  await validateMarkdownDirectory(join(agent.path, "agents"), "agents", errors);
+  await validateMarkdownDirectory(join(agent.path, "commands"), "commands", errors);
+  await validateTypeScriptDirectory(join(agent.path, "extensions"), "extension", errors);
+  await validateTypeScriptDirectory(join(agent.path, "tools"), "tool", errors);
+  await validateSkillsDirectory(join(agent.path, "skills"), errors);
 }
 
 async function validateMarkdownDirectory(

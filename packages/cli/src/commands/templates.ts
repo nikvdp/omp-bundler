@@ -31,31 +31,31 @@ export function bundleFiles(bundleName: string): readonly PlannedWrite[] {
 export function agentScaffoldFiles(agentId: string): readonly PlannedWrite[] {
   return [
     {
-      path: ".omp/AGENTS.md",
+      path: "AGENTS.md",
       content: `# ${agentId}\n\nYou are the ${agentId} agent.\n\n## Instructions\n\n- Read the available context before acting.\n- Use tools when they improve correctness.\n- State uncertainty directly.\n`,
     },
     {
-      path: ".omp/config.yml",
+      path: "config.yml",
       content: "setupVersion: 1\n\n# Add agent-local OMP settings here. Shared model selection is inherited.\n# modelRoles:\n#   default: provider/model\n",
     },
     {
-      path: ".omp/agents/example-subagent.md.example",
+      path: "agents/example-subagent.md.example",
       content: exampleSubagentTemplate(),
     },
     {
-      path: ".omp/commands/example-command.md.example",
+      path: "commands/example-command.md.example",
       content: exampleCommandTemplate(),
     },
     {
-      path: ".omp/extensions/example-extension.ts.example",
+      path: "extensions/example-extension.ts.example",
       content: exampleExtensionTemplate(),
     },
     {
-      path: ".omp/skills/example-skill/SKILL.md.example",
+      path: "skills/example-skill/SKILL.md.example",
       content: exampleSkillTemplate(),
     },
     {
-      path: ".omp/tools/example-tool.ts.example",
+      path: "tools/example-tool.ts.example",
       content: exampleToolTemplate(),
     },
   ];
@@ -98,7 +98,7 @@ export function componentFile(
 }
 
 function bundleReadme(bundleName: string): string {
-  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its .omp components.\n2. Run omp-bundler check.\n3. Build and run the bundle.\n\nThe committed runtime.env.example contains placeholders only. Copy it to runtime.env and fill deployment values locally.\n`;
+  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its components.\n2. Run omp-bundler check.\n3. Build and run the bundle.\n\nThe committed runtime.env.example contains placeholders only. Copy it to runtime.env and fill deployment values locally.\n`;
 }
 
 function bundleConfig(bundleName: string): string {

@@ -61,8 +61,10 @@ export interface ProjectContext {
 
 export interface AgentDirectory {
   readonly id: string;
+  /** Complete visible agent source root; required OMP files and component
+   *  directories are direct children. The image build wraps this root under
+   *  .omp separately. */
   readonly path: string;
-  readonly ompPath: string;
 }
 
 export interface PlannedWrite {

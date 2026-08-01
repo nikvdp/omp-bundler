@@ -5,6 +5,7 @@ import { applyFilePlan, createFilePlan, createRemovePlan } from "../file-plan.ts
 import { assertSafeIdentifier } from "../identifiers.ts";
 import { loadProject, resolveAgentPath } from "../project.ts";
 import type { CommandContext, CommandHandler, FilePlan, ParsedArguments } from "../types.ts";
+import { assertNoLegacyOmpSource } from "./common.ts";
 import {
   assertNoSymlinkComponents,
   assertNoSymlinksRecursively,
@@ -64,9 +65,9 @@ async function destroyComponent(
   if (!agentInfo) throw new Error(`agent '${agentId}' does not exist: ${agentPath}`);
   if (agentInfo.isSymbolicLink()) throw new Error(`agent path must not be a symlink: ${agentPath}`);
   if (!agentInfo.isDirectory()) throw new Error(`agent path is not a directory: ${agentPath}`);
+  await assertNoLegacyOmpSource(agentPath, agentId);
 
-  const ompPath = join(agentPath, ".omp");
-  const componentDirectory = join(ompPath, COMPONENT_DIRECTORY[kind]);
+  const componentDirectory = join(agentPath, COMPONENT_DIRECTORY[kind]);
   const componentPath = kind === "skill"
     ? join(componentDirectory, componentName, "SKILL.md")
     : join(componentDirectory, `${componentName}.${kind === "subagent" ? "md" : kind === "command" ? "md" : "ts"}`);
@@ -111,6 +112,7 @@ async function destroyAgent(
   if (agentInfo.isSymbolicLink()) throw new Error(`agent source must not be a symlink: ${agentPath}`);
   if (!agentInfo.isDirectory()) throw new Error(`agent source is not a directory: ${agentPath}`);
   await assertNoSymlinksRecursively(agentPath, "agent source");
+  await assertNoLegacyOmpSource(agentPath, agentId);
 
   const envExamplePath = join(project.rootDir, "runtime.env.example");
   const envExample = await readOptionalTextFile(envExamplePath, "runtime.env.example");

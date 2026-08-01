@@ -102,7 +102,7 @@ async function generateComponent(
   assertSafeIdentifier(name, `${kind} name`);
   const project = await loadProject(undefined, context.cwd);
   const agent = await requireAgent(project, agentId);
-  const plan = await createFilePlan(agent.ompPath, [componentFile(kind, name)]);
+  const plan = await createFilePlan(agent.path, [componentFile(kind, name)]);
   await applyAndReport(plan, context, dryRun);
 }
 

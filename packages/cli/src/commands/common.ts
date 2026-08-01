@@ -38,22 +38,30 @@ export async function assertPathAbsent(
   if (existing) throw new Error(`${label} already exists: ${path}`);
 }
 
+/** Reject agents that still keep their source in a legacy nested .omp layout. */
+export async function assertNoLegacyOmpSource(
+  agentPath: string,
+  agentId: string,
+): Promise<void> {
+  const legacyOmpPath = join(agentPath, ".omp");
+  const legacyOmpInfo = await lstat(legacyOmpPath).catch(() => null);
+  if (legacyOmpInfo) {
+    throw new Error(`agent '${agentId}' has a nested .omp directory; agent source must live at the agent root: ${agentPath}`);
+  }
+}
+
 export async function requireAgent(
   project: ProjectContext,
   agentId: string,
-): Promise<{ readonly path: string; readonly ompPath: string }> {
+): Promise<{ readonly path: string }> {
   const path = resolveAgentPath(project, agentId);
   const info = await lstat(path).catch(() => null);
   if (!info) throw new Error(`agent '${agentId}' does not exist: ${path}`);
   if (info.isSymbolicLink() || !info.isDirectory()) {
     throw new Error(`agent path is not a directory: ${path}`);
   }
-  const ompPath = join(path, ".omp");
-  const ompInfo = await lstat(ompPath).catch(() => null);
-  if (!ompInfo || ompInfo.isSymbolicLink() || !ompInfo.isDirectory()) {
-    throw new Error(`agent '${agentId}' is missing .omp/: ${ompPath}`);
-  }
-  return { path, ompPath };
+  await assertNoLegacyOmpSource(path, agentId);
+  return { path };
 }
 
 export async function applyAndReport(

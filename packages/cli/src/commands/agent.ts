@@ -6,6 +6,7 @@ import { assertSafeIdentifier } from "../identifiers.ts";
 import { loadProject, resolveAgentPath } from "../project.ts";
 import type { CommandContext, CommandHandler, FilePlan, ParsedArguments, YamlValue } from "../types.ts";
 import { parseYaml } from "../config.ts";
+import { assertNoLegacyOmpSource } from "./common.ts";
 import {
   assertNoSymlinkComponents,
   assertNoSymlinksRecursively,
@@ -51,15 +52,9 @@ async function agentModel(
   if (!agentInfo) throw new Error(`agent '${agentId}' does not exist: ${agentPath}`);
   if (agentInfo.isSymbolicLink()) throw new Error(`agent path must not be a symlink: ${agentPath}`);
   if (!agentInfo.isDirectory()) throw new Error(`agent path is not a directory: ${agentPath}`);
+  await assertNoLegacyOmpSource(agentPath, agentId);
 
-  const ompPath = join(agentPath, ".omp");
-  await assertNoSymlinkComponents(project.rootDir, ompPath, "agent .omp path");
-  const ompInfo = await lstat(ompPath).catch(() => null);
-  if (!ompInfo) throw new Error(`agent '${agentId}' is missing .omp/: ${ompPath}`);
-  if (ompInfo.isSymbolicLink()) throw new Error(`agent .omp path must not be a symlink: ${ompPath}`);
-  if (!ompInfo.isDirectory()) throw new Error(`agent .omp path is not a directory: ${ompPath}`);
-
-  const configPath = join(ompPath, "config.yml");
+  const configPath = join(agentPath, "config.yml");
   const configFile = await readOptionalTextFile(configPath, "agent config");
   if (!configFile) throw new Error(`agent '${agentId}' is missing config.yml: ${configPath}`);
   const updated = updateDefaultModel(configFile.content, model);
@@ -101,6 +96,7 @@ async function agentRename(
   if (sourceInfo.isSymbolicLink()) throw new Error(`agent source must not be a symlink: ${source}`);
   if (!sourceInfo.isDirectory()) throw new Error(`agent source is not a directory: ${source}`);
   await assertNoSymlinksRecursively(source, "agent source");
+  await assertNoLegacyOmpSource(source, oldAgentId);
   const destinationInfo = await lstat(destination).catch(() => null);
   if (destinationInfo) throw new Error(`agent destination already exists: ${destination}`);
 
