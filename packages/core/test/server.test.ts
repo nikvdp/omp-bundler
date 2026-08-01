@@ -59,6 +59,17 @@ function closeServer(server: Server): Promise<void> {
   return promise;
 }
 
+function waitForListening(server: Server): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  if (server.listening) {
+    resolve();
+  } else {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  }
+  return promise;
+}
+
 test("boot rejects a durable agent directory without .omp", async () => {
   await withTempDirectory(async (root) => {
     const agentRoot = join(root, "agents");
@@ -77,6 +88,7 @@ test("boot accepts a current durable agent with .omp", async () => {
     await mkdir(join(agentRoot, "current", ".omp"), { recursive: true });
 
     const server = await bootCoreServer(config(root, "current"));
+    await waitForListening(server);
     try {
       assert.equal(server.listening, true);
     } finally {
