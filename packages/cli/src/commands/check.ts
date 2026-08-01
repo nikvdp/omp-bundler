@@ -65,7 +65,7 @@ const GLOBAL_STATE_NAMES = /^(?:models\.ya?ml(?:\.tmpl)?|sessions?|(?:\.?cache|c
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
 const SECRET_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/;
 const SECRET_ASSIGNMENT = /(?:\b(?:const|let|var)\s+|(?:^|[,{.;(])\s*|\.)(?:"([^"]+)"|'([^']+)'|([A-Za-z_$][A-Za-z0-9_$-]*))\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|(\$\{[^}]*\}|[^\s,;}]+))/gm;
-const ENV_REFERENCE = /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::[-+?][^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*|(?:process\.env|env)\.[A-Za-z_][A-Za-z0-9_]*)$/;
+const ENV_REFERENCE = /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|(?:process\.env|env)\.[A-Za-z_][A-Za-z0-9_]*)$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const COMPONENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const URL_ENV_NAMES: Record<string, true> = {
