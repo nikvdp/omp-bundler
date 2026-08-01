@@ -302,6 +302,13 @@ function validateProjectConfig(
           errors.push(issue(path, `run.${field}`, "must be an integer from 1 through 65535"));
         }
       }
+      if (
+        validPort(value.run.corePort) &&
+        validPort(value.run.adapterPort) &&
+        value.run.corePort === value.run.adapterPort
+      ) {
+        errors.push(issue(path, "run.corePort/run.adapterPort", "must be distinct host ports"));
+      }
     }
   }
   if (isRecord(value.image) && value.image.tag !== undefined && (
