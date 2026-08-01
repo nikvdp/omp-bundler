@@ -5,15 +5,17 @@ import type {
   CommandHandlerRegistry,
   ParsedArguments,
 } from "./types.ts";
+import {
+  agentCommand,
+  buildCommand,
+  checkCommand,
+  destroyCommand,
+  generateCommand,
+  newCommand,
+  runCommand,
+} from "./commands/index.ts";
 
 export { type CliIO, type CommandContext, type CommandHandler, type CommandHandlerRegistry } from "./types.ts";
-
-export class PendingCommandError extends Error {
-  constructor(command: string) {
-    super(`the '${command}' command is not integrated yet`);
-    this.name = "PendingCommandError";
-  }
-}
 
 export const ROOT_COMMANDS = [
   "new",
@@ -55,24 +57,18 @@ export const COMMAND_HELP: Record<RootCommand, string> = {
   run: "omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--dry-run]",
 };
 
-export function pendingCommandHandler(command: string): CommandHandler {
-  return () => {
-    throw new PendingCommandError(command);
-  };
-}
 export type RootCommandHandlerMap = {
   readonly [Command in RootCommand]: CommandHandler;
 };
 
-/** Every root command has an explicit handler until its command slice replaces it. */
 export const ROOT_HANDLERS: RootCommandHandlerMap = {
-  new: pendingCommandHandler("new"),
-  generate: pendingCommandHandler("generate"),
-  destroy: pendingCommandHandler("destroy"),
-  agent: pendingCommandHandler("agent"),
-  check: pendingCommandHandler("check"),
-  build: pendingCommandHandler("build"),
-  run: pendingCommandHandler("run"),
+  new: newCommand,
+  generate: generateCommand,
+  destroy: destroyCommand,
+  agent: agentCommand,
+  check: checkCommand,
+  build: buildCommand,
+  run: runCommand,
 };
 
 export function commandArgs(

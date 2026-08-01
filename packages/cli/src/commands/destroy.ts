@@ -42,6 +42,7 @@ export const destroyCommand: CommandHandler = async (args, context) => {
   const kind = args.positionals[0];
   if (kind === "agent") return destroyAgent(args, context);
   if (kind && Object.hasOwn(COMPONENT_DIRECTORY, kind)) return destroyComponent(kind, args, context);
+  throw new Error(`unknown destroy target '${kind ?? ""}'. Run 'omp-bundler destroy --help' for available commands`);
 };
 
 async function destroyComponent(

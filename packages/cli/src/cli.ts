@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 import { ArgumentError, parseArgs } from "./args.ts";
 import {
   COMMAND_HELP,
-  PendingCommandError,
   ROOT_COMMANDS,
   ROOT_HANDLERS,
   commandArgs,
@@ -79,6 +78,10 @@ export async function main(
 
   const commandName = parsed.positionals[0];
   if (commandName === undefined) {
+    const unknownOption = Object.keys(parsed.options).find((name) => name !== "help" && name !== "version");
+    if (unknownOption !== undefined) {
+      return reportError(context.io, `unknown option '--${unknownOption}'`);
+    }
     writeLine(context.io.stdout, ROOT_HELP);
     return 0;
   }
@@ -101,7 +104,6 @@ export async function main(
     const result = await invokeHandler(handler, args, handlerContext(context.cwd, context.io));
     return typeof result === "number" ? result : 0;
   } catch (error) {
-    if (error instanceof PendingCommandError) return reportError(context.io, error.message);
     return reportError(context.io, error instanceof Error ? error.message : String(error));
   }
 }

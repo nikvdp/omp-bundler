@@ -147,7 +147,7 @@ const RUNTIME_IGNORED_DIRS = new Set(["node_modules", "dist"]);
 
 // Agent identities are baked at /agents/<agentId>/.omp/ in the image and
 // seeded to /data/agents/<agentId>/.omp at boot. The agentId is the folder
-// name and must match this regex everywhere OMP_AGENTS is consumed.
+// name and must match this regex for every agent identity.
 const AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 // Entries allowed inside an agent's .omp/ directory. These are the only

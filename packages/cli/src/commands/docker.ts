@@ -1,33 +1,12 @@
 import { copyFile, lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { resolvePackagedAsset } from "../assets.ts";
+import { CANONICAL_ASSET_PATHS, isExcludedAssetName } from "../package-assets.ts";
+export { CANONICAL_ASSET_PATHS } from "../package-assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import type { AgentDirectory } from "../types.ts";
 
-/** The only files and trees that may enter an image build context. */
-export const CANONICAL_ASSET_PATHS = [
-  "Dockerfile",
-  ".dockerignore",
-  "build",
-  "entrypoint",
-  "template",
-  "packages/contracts",
-  "packages/core",
-  "packages/pumble-adapter",
-] as const;
-
-const SKIPPED_ASSET_NAMES: Record<string, true> = {
-  ".git": true,
-  ".lb": true,
-  ".worktrees": true,
-  "node_modules": true,
-  "dist": true,
-  "sessions": true,
-  "credentials": true,
-  "runtime.env": true,
-  "child-registry.json": true,
-};
 
 export interface RunDockerArguments {
   readonly image: string;
@@ -136,7 +115,7 @@ async function copyTreeNoSymlinks(
     await mkdir(destinationPath, { recursive: true });
     const entries = await readdir(sourcePath, { withFileTypes: true });
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (skipPackagedState && isSkippedAssetName(entry.name)) continue;
+      if (skipPackagedState && isExcludedAssetName(entry.name)) continue;
       await copyTreeNoSymlinks(
         join(sourcePath, entry.name),
         join(destinationPath, entry.name),
@@ -148,12 +127,4 @@ async function copyTreeNoSymlinks(
   if (!info.isFile()) throw new Error(`cannot stage non-regular file: ${sourcePath}`);
   await mkdir(dirname(destinationPath), { recursive: true });
   await copyFile(sourcePath, destinationPath);
-}
-
-function isSkippedAssetName(name: string): boolean {
-  const lower = basename(name).toLowerCase();
-  return SKIPPED_ASSET_NAMES[name] === true
-    || SKIPPED_ASSET_NAMES[lower] === true
-    || /^\.env(?:\.|$)/i.test(name)
-    || /\.(?:db|sqlite|sqlite3)(?:[-.]|$)/i.test(name);
 }
