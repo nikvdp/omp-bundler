@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile, lstat } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile, lstat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -51,6 +51,36 @@ async function waitForFile(path, timeoutMs = 2000) {
 async function writeText(path, content) {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, content, "utf8");
+}
+
+async function snapshotTree(root) {
+  const files = [];
+  async function visit(directory, prefix) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const relativePath = prefix ? join(prefix, entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        await visit(path, relativePath);
+      } else {
+        files.push([relativePath, await readFile(path)]);
+      }
+    }
+  }
+  await visit(root, "");
+  return files.sort(([left], [right]) => left.localeCompare(right));
+}
+
+async function transactionArtifacts(root) {
+  const paths = [];
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.name.startsWith(".omp-bundler-txn-")) paths.push(path);
+      if (entry.isDirectory()) await visit(path);
+    }
+  }
+  await visit(root);
+  return paths;
 }
 
 function captureIO() {
@@ -402,6 +432,48 @@ test("applyFilePlan rechecks symlinked components after planning", async () => {
   });
 });
 
+test("rename and destroy rollback late env failures without source or temp changes", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["rename-failure"], { agent: "alpha" });
+    const renameBundle = join(parent, "rename-failure");
+    await invoke(generateCommand, renameBundle, ["adapter", "pumble"], { agent: "alpha" });
+    const renameSource = join(renameBundle, "agents", "alpha");
+    const renameDestination = join(renameBundle, "agents", "renamed");
+    const renameEnv = join(renameBundle, "runtime.env.example");
+    await writeText(join(renameSource, "notes.txt"), "preserve this source\n");
+    const renameSourceBefore = await snapshotTree(renameSource);
+    const renameEnvBefore = await readFile(renameEnv);
+    await chmod(renameEnv, 0o444);
+    await assert.rejects(
+      () => invoke(agentCommand, renameBundle, ["rename", "alpha", "renamed"]),
+      /EACCES|permission denied/i,
+    );
+    assert.deepEqual(await snapshotTree(renameSource), renameSourceBefore);
+    assert.deepEqual(await readFile(renameEnv), renameEnvBefore);
+    assert.equal(await exists(renameDestination), false);
+    assert.deepEqual(await transactionArtifacts(renameBundle), []);
+    await chmod(renameEnv, 0o644);
+
+    await invoke(newCommand, parent, ["destroy-failure"], { agent: "alpha" });
+    const destroyBundle = join(parent, "destroy-failure");
+    await invoke(generateCommand, destroyBundle, ["adapter", "pumble"], { agent: "alpha" });
+    const destroySource = join(destroyBundle, "agents", "alpha");
+    const destroyEnv = join(destroyBundle, "runtime.env.example");
+    await writeText(join(destroySource, "notes.txt"), "preserve this source\n");
+    const destroySourceBefore = await snapshotTree(destroySource);
+    const destroyEnvBefore = await readFile(destroyEnv);
+    await chmod(destroyEnv, 0o444);
+    await assert.rejects(
+      () => invoke(destroyCommand, destroyBundle, ["agent", "alpha"], { yes: true }),
+      /EACCES|permission denied/i,
+    );
+    assert.deepEqual(await snapshotTree(destroySource), destroySourceBefore);
+    assert.deepEqual(await readFile(destroyEnv), destroyEnvBefore);
+    assert.deepEqual(await transactionArtifacts(destroyBundle), []);
+    await chmod(destroyEnv, 0o644);
+  });
+});
+
 test("Pumble generation is idempotent, rejects conflicting agents, and rename preserves model and files", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
@@ -437,6 +509,7 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
     assert.match(await readFile(join(bundle, "agents", "renamed", ".omp", "config.yml"), "utf8"), /default: acme\/model-v1/);
     assert.match(await readFile(envExample, "utf8"), /PUMBLE_AGENT_ID=renamed/);
     assert.equal(await readFile(ignoredRuntime, "utf8"), "PUMBLE_AGENT_ID=alpha\n");
+    assert.deepEqual(await transactionArtifacts(bundle), []);
   });
 });
 
@@ -469,6 +542,7 @@ test("destructive commands preview without mutation and require explicit confirm
     await invoke(destroyCommand, bundle, ["agent", "alpha"], { yes: true });
     assert.equal(await exists(agentPath), false);
     assert.doesNotMatch(await readFile(join(bundle, "runtime.env.example"), "utf8"), /PUMBLE_AGENT_ID=alpha/);
+    assert.deepEqual(await transactionArtifacts(bundle), []);
   });
 });
 
