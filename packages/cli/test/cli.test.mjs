@@ -848,6 +848,49 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
   });
 });
 
+test("check requires distinct run host ports and keeps valid defaults and customs", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(bundle, "runtime.env");
+    await writeText(envPath, runtimeEnv());
+    const configPath = join(bundle, "omp-bundler.yml");
+
+    const generatedConfig = (corePort, adapterPort) => [
+      "version: 1",
+      "agentsDir: ./agents",
+      "run:",
+      "  dataVolume: bundle-data",
+      `  corePort: ${corePort}`,
+      `  adapterPort: ${adapterPort}`,
+      "",
+    ].join("\n");
+
+    let report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.errors, []);
+
+    await writeText(configPath, generatedConfig(9100, 9200));
+    report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.errors, []);
+    const dryRun = await invoke(runCommand, bundle, [], { "env-file": envPath, "dry-run": true });
+    assert.equal(dryRun.result, 0);
+    assert.match(dryRun.stdout, /-p 9100:8787 -p 9200:8765/);
+
+    await writeText(configPath, generatedConfig(9100, 9100));
+    report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.field === "run.corePort/run.adapterPort"));
+    const checked = await invoke(checkCommand, bundle, [], { "env-file": envPath });
+    assert.equal(checked.result, 1);
+    assert.match(checked.stderr, /run\.corePort\/run\.adapterPort/);
+    const ran = await invoke(runCommand, bundle, [], { "env-file": envPath, "dry-run": true });
+    assert.equal(ran.result, 1);
+    assert.doesNotMatch(`${ran.stdout}\n${ran.stderr}`, /docker run/);
+  });
+});
+
 test("run maps SIGTERM to Docker SIGINT, keeps SIGINT unchanged, and waits for close", async () => {
   await withTempDirectory(async (parent) => {
     const startedPath = join(parent, "docker-started");
