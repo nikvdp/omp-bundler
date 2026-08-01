@@ -1,4 +1,4 @@
-import { constants as fsConstants, lstatSync } from "node:fs";
+import { constants as fsConstants, lstatSync, realpathSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
@@ -7,6 +7,7 @@ import {
   link,
   lstat,
   mkdir,
+  realpath,
   rename,
   rm,
   unlink,
@@ -558,7 +559,10 @@ async function assertNoSymlinkComponents(path: string, root: string): Promise<vo
     if (current === resolvedRoot) break;
     current = dirname(current);
   }
-  if (await lstatIfPresent(resolvedRoot)) return;
+  if (await lstatIfPresent(resolvedRoot)) {
+    if ((await realpath(resolvedRoot)) !== resolvedRoot) throw symlinkMutationError(resolvedRoot);
+    return;
+  }
   current = dirname(resolvedRoot);
   while (true) {
     const info = await lstatIfPresent(current);
@@ -594,7 +598,10 @@ function assertNoSymlinkComponentsSync(path: string, root: string): void {
   } catch (error) {
     if (!isMissing(error)) throw error;
   }
-  if (rootInfo) return;
+  if (rootInfo) {
+    if (realpathSync(resolvedRoot) !== resolvedRoot) throw symlinkMutationError(resolvedRoot);
+    return;
+  }
   current = dirname(resolvedRoot);
   while (true) {
     let info: Stats | undefined;
