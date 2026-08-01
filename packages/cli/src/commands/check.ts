@@ -63,9 +63,9 @@ const OMP_REQUIRED_FILES = ["AGENTS.md", "config.yml"] as const;
 const OMP_REQUIRED_DIRS = ["agents", "commands", "extensions", "skills", "tools"] as const;
 const GLOBAL_STATE_NAMES = /^(?:models\.ya?ml(?:\.tmpl)?|sessions?|(?:\.?cache|caches?)(?:[.-].*)?|agent\.db(?:[.-].*)?|runtime(?:[._-].*)?|\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?)$/i;
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
-const SECRET_ASSIGNMENT = /\b(?:api[_-]?key|app[_-]?key|client[_-]?secret|signing[_-]?secret|shared[_-]?secret|password|private[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:entication)?[_-]?token)\b\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s,;}]+))/gi;
 const SECRET_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/;
-const EXACT_ENV_PLACEHOLDER = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/;
+const SECRET_ASSIGNMENT = /(?:"([^"]+)"|'([^']+)'|([A-Za-z_$][A-Za-z0-9_$-]*))\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|(\$\{[^}]*\}|[^\s,;}]+))/g;
+const ENV_REFERENCE = /^(?:\$\{[A-Za-z_][A-Za-z0-9_]*(?::[-+?][^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*|(?:process\.env|env)\.[A-Za-z_][A-Za-z0-9_]*)$/;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const COMPONENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const URL_ENV_NAMES: Record<string, true> = {
@@ -673,6 +673,7 @@ function validateFrontmatter(
     errors.push(issue(path, "frontmatter", "must be a YAML mapping"));
     return;
   }
+  scanStructuredCredentialValues(parsed, path, errors);
   if (kind === "command") {
     if (typeof parsed.description !== "string" || !parsed.description.trim()) {
       errors.push(issue(path, "description", "must be a non-empty string"));
@@ -866,15 +867,100 @@ function balancedDelimiters(source: string): string | null {
   return stack.length > 0 ? "has unbalanced delimiters; fix TypeScript syntax" : null;
 }
 
+type CredentialKeyClass = "api_token" | "token" | "secret" | "credential" | "api_key" | "app_key" | "client_secret" | "signing_secret" | "shared_secret" | "password" | "private_key" | "access_token" | "refresh_token" | "auth_token";
+
 function scanCredentialAssignments(source: string, path: string, errors: ValidationIssue[]): void {
-  SECRET_ASSIGNMENT.lastIndex = 0;
-  for (const match of source.matchAll(SECRET_ASSIGNMENT)) {
-    const value = (match[1] ?? match[2] ?? match[3] ?? "").trim();
-    if (!value || EXACT_ENV_PLACEHOLDER.test(value) || /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(value) || /^(?:process\.env|env)\.[A-Za-z_][A-Za-z0-9_]*$/.test(value)) continue;
-    errors.push(issue(path, undefined, "contains a credential-shaped literal; move the value to runtime configuration and commit only an environment reference"));
+  const structured = /\.(?:json|ya?ml)(?:\.example)?$/i.test(path);
+  if (structured) {
+    try {
+      scanStructuredCredentialValues(
+        /\.(?:json)$/i.test(path) ? (JSON.parse(source) as YamlValue) : parseYaml(source),
+        path,
+        errors,
+      );
+    } catch {
+      scanSourceAssignments(source, path, errors);
+    }
+  } else if (/\.ts(?:\.example)?$/i.test(path)) {
+    scanSourceAssignments(source, path, errors);
   }
-  if (SECRET_TOKEN.test(source)) {
-    errors.push(issue(path, undefined, "contains a credential-shaped token; remove it from agent source"));
+  if (SECRET_TOKEN.test(source)) reportCredentialIssue(path, "token", errors);
+}
+
+function scanStructuredCredentialValues(
+  value: YamlValue,
+  path: string,
+  errors: ValidationIssue[],
+  keyPath = "",
+): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => scanStructuredCredentialValues(item, path, errors, `${keyPath}[${index}]`));
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = keyPath ? `${keyPath}.${key}` : key;
+    const keyClass = credentialKeyClass(key);
+    if (keyClass !== undefined && containsCredentialLiteral(child)) {
+      reportCredentialIssue(path, keyClass, errors, childPath);
+    }
+    scanStructuredCredentialValues(child, path, errors, childPath);
+  }
+}
+
+function containsCredentialLiteral(value: YamlValue): boolean {
+  if (typeof value === "string") return isCredentialLiteral(value);
+  return Array.isArray(value) && value.some((item) => containsCredentialLiteral(item));
+}
+
+function isCredentialLiteral(value: string): boolean {
+  const trimmed = value.trim();
+  return Boolean(trimmed) && !ENV_REFERENCE.test(trimmed);
+}
+
+function credentialKeyClass(name: string): CredentialKeyClass | undefined {
+  const normalized = name.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  if (normalized === "apitoken") return "api_token";
+  if (normalized === "apikey") return "api_key";
+  if (normalized === "appkey") return "app_key";
+  if (normalized === "clientsecret") return "client_secret";
+  if (normalized === "signingsecret") return "signing_secret";
+  if (normalized === "sharedsecret") return "shared_secret";
+  if (normalized === "password") return "password";
+  if (normalized === "privatekey") return "private_key";
+  if (normalized === "accesstoken") return "access_token";
+  if (normalized === "refreshtoken") return "refresh_token";
+  if (normalized === "authtoken" || normalized === "authenticationtoken") return "auth_token";
+  if (/^(?:token|tokens|tokenkey|tokenvalue)$/.test(normalized)) return "token";
+  if (/^(?:secret|secrets|secretkey|secretvalue)$/.test(normalized)) return "secret";
+  if (/^(?:credential|credentials|credentialkey|credentialvalue)$/.test(normalized)) return "credential";
+  return undefined;
+}
+
+function reportCredentialIssue(
+  path: string,
+  keyClass: CredentialKeyClass,
+  errors: ValidationIssue[],
+  keyPath?: string,
+): void {
+  const field = keyPath === undefined ? keyClass : `${keyClass} (${keyPath})`;
+  const message = `contains a literal ${keyClass.replaceAll("_", " ")}; move the value to runtime configuration and commit only an environment reference`;
+  if (errors.some((entry) => entry.path === path && entry.field === field && entry.message === message)) return;
+  errors.push(issue(path, field, message));
+}
+
+function scanSourceAssignments(source: string, path: string, errors: ValidationIssue[]): void {
+  const sourceWithoutComments = source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  SECRET_ASSIGNMENT.lastIndex = 0;
+  for (const match of sourceWithoutComments.matchAll(SECRET_ASSIGNMENT)) {
+    const key = match[1] ?? match[2] ?? match[3] ?? "";
+    const value = (match[4] ?? match[5] ?? match[6] ?? "").trim();
+    const keyClass = credentialKeyClass(key);
+    const quoted = match[4] !== undefined || match[5] !== undefined;
+    const literal = quoted || !/^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*$/.test(value);
+    if (keyClass !== undefined && literal && isCredentialLiteral(value)) reportCredentialIssue(path, keyClass, errors);
   }
 }
 
