@@ -559,7 +559,9 @@ async function main(): Promise<void> {
     fail(`cannot prepare optional model providers: ${(e as Error).message}`);
   }
   const { survivors } = expand(preparedTemplate);
-  const catalogErrors = validateCatalog(preparedTemplate);
+  // Validate the source catalog before optional providers are omitted:
+  // credential-free builds may have no prepared providers yet.
+  const catalogErrors = validateCatalog(tmplText);
   const allErrors = [
     ...partialProviders,
     ...survivors.map((t) => `unresolved placeholder '${t}' in models.yml.tmpl`),
