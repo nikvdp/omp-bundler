@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile, lstat } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile, lstat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -113,7 +113,10 @@ async function invoke(handler, cwd, positionals, options = {}) {
 }
 
 async function withTempDirectory(callback) {
-  const root = await mkdtemp(join(tmpdir(), "omp-bundler-cli-test-"));
+  // Match production process.cwd() by canonicalizing the temp root: physical
+  // bundle paths keep the realpath root guard from tripping on the Darwin
+  // /var alias above canonical temp directories.
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omp-bundler-cli-test-")));
   try {
     return await callback(root);
   } finally {
@@ -410,6 +413,138 @@ test("mutation plans reject symlinked bundle, agents, component, and env paths",
       /symlinked path component/,
     );
     assert.equal(await readFile(externalRuntime, "utf8"), originalRuntime);
+  });
+});
+test("generate, model, rename, and destroy reject an existing bundle reached through a symlinked ancestor", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, [join("real-bundles", "bundle")], { agent: "alpha" });
+    const realBundle = join(parent, "real-bundles", "bundle");
+    await symlink(join(parent, "real-bundles"), join(parent, "linked-bundles"), "dir");
+    const bundle = join(parent, "linked-bundles", "bundle");
+
+    await assert.rejects(
+      () => invoke(generateCommand, bundle, ["agent", "beta"]),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(realBundle, "agents", "beta")), false);
+
+    await assert.rejects(
+      () => invoke(generateCommand, bundle, ["skill", "alpha", "preview"]),
+      /symlinked path component/,
+    );
+    assert.equal(
+      await exists(join(realBundle, "agents", "alpha", ".omp", "skills", "preview")),
+      false,
+    );
+
+    await assert.rejects(
+      () => invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]),
+      /symlinked path component/,
+    );
+    const configPath = join(realBundle, "agents", "alpha", ".omp", "config.yml");
+    assert.doesNotMatch(await readFile(configPath, "utf8"), /default: acme\/model-v1/);
+
+    await assert.rejects(
+      () => invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(realBundle, "agents", "renamed")), false);
+    assert.equal(await exists(join(realBundle, "agents", "alpha")), true);
+
+    await invoke(generateCommand, realBundle, ["skill", "alpha", "temporary"]);
+    const skillPath = join(realBundle, "agents", "alpha", ".omp", "skills", "temporary", "SKILL.md");
+    await assert.rejects(
+      () => invoke(destroyCommand, bundle, ["skill", "alpha", "temporary"], { yes: true }),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(skillPath), true);
+
+    await assert.rejects(
+      () => invoke(destroyCommand, bundle, ["agent", "alpha"], { yes: true }),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(realBundle, "agents", "alpha")), true);
+
+    // A nested invocation cwd inside the symlinked bundle is rejected too,
+    // because the guard compares the physical and lexical bundle roots.
+    const nested = join(bundle, "agents", "alpha");
+    await assert.rejects(
+      () => invoke(generateCommand, nested, ["tool", "alpha", "lookup-record"]),
+      /symlinked path component/,
+    );
+    await assert.rejects(
+      () => invoke(agentCommand, nested, ["model", "alpha", "acme/model-v1"]),
+      /symlinked path component/,
+    );
+    assert.equal(
+      await exists(join(realBundle, "agents", "alpha", ".omp", "tools", "lookup-record.ts")),
+      false,
+    );
+
+    // Grandparent symlinks are caught too: the physical root differs from the
+    // lexical root regardless of how far above the bundle the link sits.
+    await invoke(newCommand, parent, [join("real-bundles", "sub", "grand")], { agent: "alpha" });
+    const grand = join(parent, "linked-bundles", "sub", "grand");
+    await assert.rejects(
+      () => invoke(generateCommand, grand, ["skill", "alpha", "deep"]),
+      /symlinked path component/,
+    );
+    assert.equal(
+      await exists(join(parent, "real-bundles", "sub", "grand", "agents", "alpha", ".omp", "skills", "deep")),
+      false,
+    );
+
+    // Direct plan creation on an existing root under a symlinked ancestor is
+    // rejected before any write is staged.
+    await assert.rejects(
+      () => createFilePlan(bundle, [{ path: "created.txt", content: "must not escape\n" }]),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(realBundle, "created.txt")), false);
+
+    // Applying an already-planned file against a root whose ancestor became a
+    // symlink after planning is rejected by the apply-time recheck.
+    await mkdir(join(parent, "swap-other", "bundle"), { recursive: true });
+    await invoke(newCommand, parent, [join("swap-sub", "bundle")], { agent: "alpha" });
+    const swapPlan = await createFilePlan(join(parent, "swap-sub", "bundle"), [{
+      path: join("agents", "alpha", "notes.txt"),
+      content: "safe\n",
+    }]);
+    await rm(join(parent, "swap-sub"), { recursive: true });
+    await symlink(join(parent, "swap-other"), join(parent, "swap-sub"), "dir");
+    await assert.rejects(
+      () => applyFilePlan(swapPlan),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(parent, "swap-other", "bundle", "agents", "alpha", "notes.txt")), false);
+  });
+});
+
+test("mutation commands pass on a physical bundle path with a macOS-style alias above the trusted cwd", async () => {
+  await withTempDirectory(async (parent) => {
+    // The canonicalized temp root is physical, matching production
+    // process.cwd(); a Darwin-style alias (like /var above /var/folders)
+    // above the physical path is never part of the bundle path, so the
+    // realpath root guard passes.
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+
+    await invoke(generateCommand, bundle, ["skill", "alpha", "preview"]);
+    assert.equal(
+      await exists(join(bundle, "agents", "alpha", ".omp", "skills", "preview", "SKILL.md")),
+      true,
+    );
+
+    await invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]);
+    assert.match(await readFile(join(bundle, "agents", "alpha", ".omp", "config.yml"), "utf8"), /default: acme\/model-v1/);
+
+    await invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]);
+    assert.equal(await exists(join(bundle, "agents", "renamed")), true);
+
+    await invoke(generateCommand, bundle, ["skill", "renamed", "temporary"]);
+    const skillPath = join(bundle, "agents", "renamed", ".omp", "skills", "temporary", "SKILL.md");
+    await invoke(destroyCommand, bundle, ["skill", "renamed", "temporary"], { yes: true });
+    assert.equal(await exists(skillPath), false);
   });
 });
 
