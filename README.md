@@ -6,10 +6,12 @@ Build and run filesystem-configured OMP agents as a durable service.
 > `omp-bundler` CLI. The CLI described below is the target interface and is
 > being implemented through README-driven development.
 
-An agent is a directory containing an OMP project-level `.omp/` folder. The
-filesystem is the source of truth: add an agent directory to add an agent,
-rename the directory to rename it, and remove the directory to remove it.
-There is no agent registry and no agent-list environment variable.
+An agent is a directory holding its OMP project files directly at the root:
+`AGENTS.md`, `config.yml`, and the `agents`, `commands`, `extensions`,
+`skills`, and `tools` component directories. The filesystem is the source of
+truth: add an agent directory to add an agent, rename the directory to rename
+it, and remove the directory to remove it. There is no agent registry and no
+agent-list environment variable.
 
 `omp-bundler` provides a Rails-style CLI for creating a bundle, generating
 agents and their components, validating the result, building a container
@@ -44,7 +46,7 @@ cd my-bundle
 Edit the generated instructions:
 
 ```bash
-$EDITOR agents/my-agent/.omp/AGENTS.md
+$EDITOR agents/my-agent/AGENTS.md
 ```
 
 Check and build the bundle:
@@ -90,20 +92,19 @@ my-bundle/
 ├── runtime.env.example
 └── agents/
     └── my-agent/
-        └── .omp/
-            ├── AGENTS.md
-            ├── config.yml
-            ├── agents/
-            │   └── example-subagent.md.example
-            ├── commands/
-            │   └── example-command.md.example
-            ├── extensions/
-            │   └── example-extension.ts.example
-            ├── skills/
-            │   └── example-skill/
-            │       └── SKILL.md.example
-            └── tools/
-                └── example-tool.ts.example
+        ├── AGENTS.md
+        ├── config.yml
+        ├── agents/
+        │   └── example-subagent.md.example
+        ├── commands/
+        │   └── example-command.md.example
+        ├── extensions/
+        │   └── example-extension.ts.example
+        ├── skills/
+        │   └── example-skill/
+        │       └── SKILL.md.example
+        └── tools/
+            └── example-tool.ts.example
 ```
 
 The agent scaffold creates every supported OMP project surface. A first-time
@@ -117,8 +118,8 @@ activate a customized example directly, copy it without the final `.example`
 suffix. For example:
 
 ```bash
-cp agents/my-agent/.omp/tools/example-tool.ts.example \
-  agents/my-agent/.omp/tools/example-tool.ts
+cp agents/my-agent/tools/example-tool.ts.example \
+  agents/my-agent/tools/example-tool.ts
 ```
 
 If the bundle should start empty, omit `--agent`:
@@ -189,8 +190,9 @@ Generate another complete agent:
 omp-bundler generate agent second-agent
 ```
 
-This creates the same full `.omp/` tree produced by `new --agent`. Generation
-fails rather than overwriting an existing agent.
+This creates the same full source tree produced by `new --agent`: every file
+and directory directly at the agent root, with no nested `.omp/` directory.
+Generation fails rather than overwriting an existing agent.
 
 The generated `AGENTS.md` is immediately valid:
 
@@ -239,7 +241,7 @@ omp-bundler generate skill my-agent knowledge-base
 Creates:
 
 ```text
-agents/my-agent/.omp/skills/knowledge-base/SKILL.md
+agents/my-agent/skills/knowledge-base/SKILL.md
 ```
 
 ### Command
@@ -251,7 +253,7 @@ omp-bundler generate command my-agent summarize
 Creates:
 
 ```text
-agents/my-agent/.omp/commands/summarize.md
+agents/my-agent/commands/summarize.md
 ```
 
 ### Tool
@@ -263,7 +265,7 @@ omp-bundler generate tool my-agent lookup-record
 Creates:
 
 ```text
-agents/my-agent/.omp/tools/lookup-record.ts
+agents/my-agent/tools/lookup-record.ts
 ```
 
 The generated tool contains a valid typed registration and a harmless example
@@ -278,7 +280,7 @@ omp-bundler generate extension my-agent lifecycle-log
 Creates:
 
 ```text
-agents/my-agent/.omp/extensions/lifecycle-log.ts
+agents/my-agent/extensions/lifecycle-log.ts
 ```
 
 The generated extension loads successfully but performs no external work until
@@ -293,7 +295,7 @@ omp-bundler generate subagent my-agent researcher
 Creates:
 
 ```text
-agents/my-agent/.omp/agents/researcher.md
+agents/my-agent/agents/researcher.md
 ```
 
 A subagent is an OMP task-agent definition owned by a deployed agent. It is not
@@ -360,7 +362,7 @@ omp-bundler agent model my-agent anthropic/claude-sonnet-4-5
 This updates only:
 
 ```text
-agents/my-agent/.omp/config.yml
+agents/my-agent/config.yml
 ```
 
 Result:
@@ -454,6 +456,39 @@ Durable `/data/agents/<agent-id>` files are also preserved. A destroyed agent
 no longer receives traffic after its bindings are removed and the image is
 rebuilt, but deleting its durable data is a separate operator action.
 
+## Migrate a legacy agent layout
+
+Earlier versions stored each agent's source in a nested
+`agents/<agent-id>/.omp/` directory. Agent source now lives directly at the
+agent root, and every source command rejects a nested `.omp/` directory.
+Convert a legacy bundle in place with:
+
+```bash
+omp-bundler migrate visible-layout [bundle-path] [--dry-run] [--yes]
+```
+
+For each agent directory under `agentsDir`, the command checks for a nested
+`.omp/` directory. When one exists, it moves every entry of that directory up
+to the agent root and then removes the now-empty `.omp/` directory. Agents
+without a legacy `.omp/` directory are left alone, and `.gitkeep` entries are
+skipped.
+
+Migration is one-way: the source ends up at the agent root, and no command
+writes a nested `.omp/` layout again. It is still safe to run:
+
+- With `--dry-run`, it prints the complete move-and-remove plan and changes
+  nothing.
+- Without `--dry-run`, it prints the same plan and asks for confirmation
+  before applying it. Automation may pass `--yes` to skip the prompt.
+- It refuses to overwrite: if an entry would land on an existing file or
+  directory at the agent root, the command fails before changing anything and
+  names the conflicting path.
+- It rejects symlinked agent and legacy `.omp/` paths.
+- When no agent has a legacy `.omp/` directory, it reports that there is
+  nothing to migrate and exits without prompting.
+
+Rebuild after migrating: existing images still contain the old baked layout.
+
 ## Validate
 
 From a bundle directory:
@@ -472,7 +507,8 @@ omp-bundler check ../another-bundle
 
 - `omp-bundler.yml`
 - Agent directory names
-- Every required `.omp/` directory
+- Required agent-root files and component directories
+- Rejection of a legacy nested `.omp/` directory
 - Active components and ignored `.example` templates
 - OMP YAML and Markdown frontmatter
 - TypeScript extension and tool entrypoints
@@ -520,9 +556,9 @@ omp-bundler build --agents ./alternate-agents --tag alternate-agents:local
 
 `--agents` takes precedence over `agentsDir` for that build only. Its argument
 must be an agent collection: every direct child directory is an agent and must
-contain a valid `.omp/` scaffold. The override receives the same validation as
-the configured collection. A missing path, a file instead of a directory, or
-an invalid child fails before Docker runs.
+contain a valid scaffold directly at its root. The override receives the same
+validation as the configured collection. A missing path, a file instead of a
+directory, or an invalid child fails before Docker runs.
 
 The build command:
 
@@ -532,7 +568,8 @@ The build command:
    `agentsDir` otherwise.
 3. Discovers every direct child of that effective collection.
 4. Stages the shared omp-bundler runtime.
-5. Bakes each agent's `.omp/` folder under `/agents/<agent-id>/.omp/`.
+5. Bakes each agent's visible source root into the internal
+   `/agents/<agent-id>/.omp/` path of the staged context.
 6. Builds the Docker image.
 7. Reports the image tag and included agent IDs.
 
@@ -644,7 +681,8 @@ not the default runtime instructions.
 
 ## Filesystem behavior at startup
 
-The image contains each agent at:
+Inside the container, each agent's source is packaged as an internal `.omp/`
+directory at:
 
 ```text
 /agents/<agent-id>/.omp/
@@ -663,13 +701,15 @@ cwd=/data/agents/<agent-id>
 ```
 
 OMP discovers the agent's project-level instructions, configuration,
-subagents, commands, extensions, skills, and tools from that cwd.
+subagents, commands, extensions, skills, and tools from that cwd. These
+internal paths are the packaged form of the visible agent root; the source
+tree itself never contains a `.omp/` directory.
 
-The image is authoritative for `.omp/`. On every start, the seeded
-`/data/agents/<agent-id>/.omp/` subtree is replaced with the baked copy. Files
-next to `.omp/` in the durable agent workspace are not removed. Restarting
-with a rebuilt image therefore updates agent configuration while preserving
-working files and sessions elsewhere under `/data`.
+The image is authoritative for the internal `.omp/` subtree. On every start,
+the seeded `/data/agents/<agent-id>/.omp/` subtree is replaced with the baked
+copy. Files next to `.omp/` in the durable agent workspace are not removed.
+Restarting with a rebuilt image therefore updates agent configuration while
+preserving working files and sessions elsewhere under `/data`.
 
 If an adapter names an agent directory that was not baked into the image, the
 container fails before accepting traffic and reports the adapter ID, agent ID,
@@ -735,6 +775,7 @@ omp-bundler destroy tool <agent-id> <name> [--dry-run] [--yes]
 omp-bundler destroy extension <agent-id> <name> [--dry-run] [--yes]
 omp-bundler destroy subagent <agent-id> <name> [--dry-run] [--yes]
 
+omp-bundler migrate visible-layout [bundle-path] [--dry-run] [--yes]
 omp-bundler agent model <agent-id> <provider/model>
 omp-bundler agent rename <old-agent-id> <new-agent-id>
 
