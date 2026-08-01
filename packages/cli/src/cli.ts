@@ -38,6 +38,7 @@ Commands:
   ${COMMAND_HELP.check}
   ${COMMAND_HELP.build}
   ${COMMAND_HELP.run}
+  ${COMMAND_HELP.migrate}
 
 Options:
   -h, --help       Show help for a command

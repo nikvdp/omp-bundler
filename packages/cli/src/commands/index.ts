@@ -3,6 +3,7 @@ export { buildCommand, BUILD_HELP, buildPreviewCommand, resolveBuildTag } from "
 export { checkCommand, formatIssue, validateBundle } from "./check.ts";
 export { destroyCommand } from "./destroy.ts";
 export { generateCommand } from "./generate.ts";
+export { migrateCommand } from "./migrate.ts";
 export { newCommand } from "./new.ts";
 export {
   CANONICAL_ASSET_PATHS,

@@ -13,6 +13,7 @@ import {
   generateCommand,
   newCommand,
   runCommand,
+  migrateCommand,
 } from "./commands/index.ts";
 
 export { type CliIO, type CommandContext, type CommandHandler, type CommandHandlerRegistry } from "./types.ts";
@@ -25,6 +26,7 @@ export const ROOT_COMMANDS = [
   "check",
   "build",
   "run",
+  "migrate",
 ] as const;
 
 export type RootCommand = (typeof ROOT_COMMANDS)[number];
@@ -55,6 +57,7 @@ export const COMMAND_HELP: Record<RootCommand, string> = {
   check: "omp-bundler check [bundle-path] [--env-file <path>]",
   build: "omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]",
   run: "omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]",
+  migrate: "omp-bundler migrate visible-layout [bundle-path] [--dry-run] [--yes]",
 };
 
 export type RootCommandHandlerMap = {
@@ -69,6 +72,7 @@ export const ROOT_HANDLERS: RootCommandHandlerMap = {
   check: checkCommand,
   build: buildCommand,
   run: runCommand,
+  migrate: migrateCommand,
 };
 
 export function commandArgs(
