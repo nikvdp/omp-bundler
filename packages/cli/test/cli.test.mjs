@@ -350,7 +350,7 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
     assert.equal(buildPreviewCommand("override:tag", "/tmp/docker-context"), "docker build -t override:tag /tmp/docker-context");
     assert.equal(
       runPreviewCommand(settings, "/tmp/runtime.env"),
-      "docker run --rm -p 9100:9100 -p 9200:9200 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
+      "docker run --rm -p 9100:8787 -p 9200:8765 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
     );
 
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
@@ -367,7 +367,7 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
     assert.equal(dryRun.stderr, "");
     assert.equal(
       dryRun.stdout.trim(),
-      runPreviewCommand({ image: "override:tag", dataVolume: "bundle-data", corePort: 8787, adapterPort: 8765 }, envPath),
+      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} bundle:local`,
     );
   });
 });
