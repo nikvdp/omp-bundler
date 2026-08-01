@@ -60,8 +60,9 @@ export function formatDockerCommand(
 }
 
 /**
- * Stage a fresh context from packaged assets and validated agent .omp trees.
- * Every source entry is lstat-checked, so no symlink is ever copied.
+ * Stage a fresh context from packaged assets and validated agent source
+ * trees. Each agent's visible root is wrapped under agents/<id>/.omp in the
+ * context. Every source entry is lstat-checked, so no symlink is ever copied.
  */
 export async function stageDockerContext(
   agents: readonly AgentDirectory[],
@@ -86,7 +87,7 @@ export async function stageDockerContext(
       if (ids.has(agent.id)) throw new Error(`duplicate agent id: ${agent.id}`);
       ids.add(agent.id);
       await copyTreeNoSymlinks(
-        agent.ompPath,
+        agent.path,
         join(stagedAgents, agent.id, ".omp"),
         false,
       );
