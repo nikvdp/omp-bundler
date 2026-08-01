@@ -9,6 +9,8 @@ import test from "node:test";
 import {
   agentCommand,
   checkCommand,
+  applyFilePlan,
+  createFilePlan,
   commandArgs,
   destroyCommand,
   generateCommand,
@@ -176,6 +178,85 @@ test("new creates empty and full trees, generators cover every surface, and coll
       () => invoke(generateCommand, join(parent, "full"), ["command", "alpha", "../escape"]),
       /unsafe/,
     );
+  });
+});
+
+test("mutation plans reject symlinked bundle, agents, component, and env paths", async () => {
+  await withTempDirectory(async (parent) => {
+    const realBundles = join(parent, "real-bundles");
+    const linkedBundles = join(parent, "linked-bundles");
+    await mkdir(realBundles);
+    await symlink(realBundles, linkedBundles, "dir");
+    await assert.rejects(
+      () => invoke(newCommand, parent, [join(linkedBundles, "bundle")]),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(realBundles, "bundle")), false);
+
+    await invoke(newCommand, parent, ["agents-dir"]);
+    const agentsBundle = join(parent, "agents-dir");
+    const externalAgents = join(parent, "external-agents");
+    await mkdir(externalAgents);
+    await rm(join(agentsBundle, "agents"), { recursive: true });
+    await symlink(externalAgents, join(agentsBundle, "agents"), "dir");
+    await assert.rejects(
+      () => invoke(generateCommand, agentsBundle, ["agent", "alpha"]),
+      /symlinked path component/,
+    );
+    assert.deepEqual(await readdir(externalAgents), []);
+
+    await invoke(newCommand, parent, ["surfaces"], { agent: "alpha" });
+    const surfacesBundle = join(parent, "surfaces");
+    const componentCases = [
+      ["skill", "skills", "knowledge-base"],
+      ["command", "commands", "summarize"],
+      ["tool", "tools", "lookup-record"],
+      ["extension", "extensions", "lifecycle-log"],
+      ["subagent", "agents", "researcher"],
+    ];
+    for (const [kind, surface, name] of componentCases) {
+      const componentSurface = join(surfacesBundle, "agents", "alpha", ".omp", surface);
+      const externalSurface = join(parent, `${kind}-surface`);
+      await mkdir(externalSurface);
+      await rm(componentSurface, { recursive: true });
+      await symlink(externalSurface, componentSurface, "dir");
+      await assert.rejects(
+        () => invoke(generateCommand, surfacesBundle, [kind, "alpha", name]),
+        /symlinked path component/,
+      );
+      assert.deepEqual(await readdir(externalSurface), []);
+    }
+
+    const runtimePath = join(surfacesBundle, "runtime.env.example");
+    const externalRuntime = join(parent, "external-runtime.env.example");
+    const originalRuntime = await readFile(runtimePath, "utf8");
+    await writeFile(externalRuntime, originalRuntime, "utf8");
+    await rm(runtimePath);
+    await symlink(externalRuntime, runtimePath, "file");
+    await assert.rejects(
+      () => invoke(generateCommand, surfacesBundle, ["adapter", "pumble"], { agent: "alpha" }),
+      /symlinked path component/,
+    );
+    assert.equal(await readFile(externalRuntime, "utf8"), originalRuntime);
+  });
+});
+
+test("applyFilePlan rechecks symlinked components after planning", async () => {
+  await withTempDirectory(async (parent) => {
+    const bundle = join(parent, "bundle");
+    const external = join(parent, "external");
+    await mkdir(bundle);
+    await mkdir(external);
+    const plan = await createFilePlan(bundle, [{
+      path: join("nested", "created.txt"),
+      content: "must not escape\n",
+    }]);
+    await symlink(external, join(bundle, "nested"), "dir");
+    await assert.rejects(
+      () => applyFilePlan(plan),
+      /symlinked path component/,
+    );
+    assert.equal(await exists(join(external, "created.txt")), false);
   });
 });
 
