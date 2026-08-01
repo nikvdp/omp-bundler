@@ -79,6 +79,7 @@ export type FileOperation =
   | { readonly kind: "remove"; readonly path: string };
 
 export interface FilePlan {
+  readonly root: string;
   readonly operations: readonly FileOperation[];
 }
 

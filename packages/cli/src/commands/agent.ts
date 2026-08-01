@@ -130,7 +130,7 @@ async function agentRename(
     }]);
     operations.push(...envPlan.operations);
   }
-  const plan: FilePlan = { operations };
+  const plan: FilePlan = { root: movePlan.root, operations };
   const dryRun = optionBoolean(args, "dry-run");
   printPlan(context, plan, dryRun);
   printReferences(context, references);

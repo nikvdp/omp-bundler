@@ -135,7 +135,7 @@ async function destroyAgent(
     }]);
     operations.push(...envPlan.operations);
   }
-  return executeDestruction({ operations }, args, context, references);
+  return executeDestruction({ root: removePlan.root, operations }, args, context, references);
 }
 
 async function executeDestruction(

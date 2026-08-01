@@ -84,7 +84,7 @@ async function generateAgent(
     }
     operations.push(...createRemovePlan(project.agentsDir, [".gitkeep"]).operations);
   }
-  await applyAndReport({ operations } satisfies FilePlan, context, dryRun);
+  await applyAndReport({ root: scaffoldPlan.root, operations } satisfies FilePlan, context, dryRun);
 }
 
 async function generateComponent(
