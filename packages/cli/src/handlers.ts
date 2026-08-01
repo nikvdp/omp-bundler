@@ -54,7 +54,7 @@ export const COMMAND_HELP: Record<RootCommand, string> = {
   ].join("\n"),
   check: "omp-bundler check [bundle-path] [--env-file <path>]",
   build: "omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]",
-  run: "omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--dry-run]",
+  run: "omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]",
 };
 
 export type RootCommandHandlerMap = {

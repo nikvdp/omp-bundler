@@ -10,10 +10,12 @@ import {
 import type { CheckResult } from "./check.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 
-export const RUN_HELP = `omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--dry-run]
+export const RUN_HELP = `omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]
 
 Validate runtime bindings, then run the configured image with its ports and
-named data volume. --dry-run prints the Docker command without executing it.`;
+named data volume. --agents selects the agent collection used to validate
+adapter bindings without changing the image. --dry-run prints the Docker
+command without executing it.`;
 
 const SAFE_IMAGE_TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
 const SAFE_VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -38,7 +40,7 @@ export const runCommand: CommandHandler = async (
   }
 
   try {
-    assertAllowedOptions(args, ["env-file", "image", "dry-run"]);
+    assertAllowedOptions(args, ["env-file", "image", "agents", "dry-run"]);
   } catch (error) {
     return usageError(context, error instanceof Error ? error.message : String(error));
   }
@@ -68,10 +70,20 @@ export const runCommand: CommandHandler = async (
     }
   }
 
+  let agentsOverride: string | undefined;
+  if (args.options.agents !== undefined) {
+    try {
+      agentsOverride = requiredOptionString(args, "agents");
+    } catch (error) {
+      return usageError(context, error instanceof Error ? error.message : String(error));
+    }
+  }
+
   const result = await validateBundle({
     cwd: context.cwd,
     ...(args.positionals[0] === undefined ? {} : { bundlePath: args.positionals[0] }),
     envFile,
+    ...(agentsOverride === undefined ? {} : { agentsDirOverride: agentsOverride }),
   });
   if (!result.ok) {
     writeValidationErrors(context, result);
