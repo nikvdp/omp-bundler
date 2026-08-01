@@ -286,6 +286,74 @@ test("check reports structural and runtime errors without exposing credential va
   });
 });
 
+test("check scans normalized credential fields without flagging placeholders or opaque identifiers", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["leaky"], { agent: "alpha" });
+    const leaky = join(parent, "leaky");
+    const leakyOmp = join(leaky, "agents", "alpha", ".omp");
+    const leakedValues = [
+      "json-api-token-literal",
+      "json-uppercase-token-literal",
+      "yaml-secret-literal",
+      "yaml-credential-literal",
+      "source-token-literal",
+    ];
+    await writeText(join(leakyOmp, "settings.json"), JSON.stringify({
+      api_token: leakedValues[0],
+      API_TOKEN: leakedValues[1],
+    }));
+    await writeText(join(leakyOmp, "config.yml"), [
+      "setupVersion: 1",
+      `secret: ${leakedValues[2]}`,
+      `credential: ${leakedValues[3]}`,
+      "",
+    ].join("\n"));
+    await writeText(join(leakyOmp, "tools", "literal.ts"), `export default () => ({
+  execute: async () => ({ token: "${leakedValues[4]}" }),
+});
+`);
+
+    const rejected = await invoke(checkCommand, leaky, []);
+    assert.equal(rejected.result, 1);
+    assert.match(rejected.stderr, /settings\.json.*api_token/);
+    assert.match(rejected.stderr, /config\.yml.*secret/);
+    assert.match(rejected.stderr, /config\.yml.*credential/);
+    assert.match(rejected.stderr, /literal\.ts.*token/);
+    for (const value of leakedValues) {
+      assert.doesNotMatch(`${rejected.stdout}\n${rejected.stderr}`, new RegExp(value));
+    }
+
+    await invoke(newCommand, parent, ["safe"], { agent: "alpha" });
+    const safe = join(parent, "safe");
+    const safeOmp = join(safe, "agents", "alpha", ".omp");
+    await writeText(join(safeOmp, "settings.json"), JSON.stringify({
+      api_token: "${API_TOKEN}",
+      token: "$TOKEN",
+      secret: "process.env.SECRET",
+      credential: "env.CREDENTIAL",
+      tokenId: "opaque-token-id",
+      maxTokens: 128000,
+    }));
+    await writeText(join(safeOmp, "config.yml"), [
+      "setupVersion: 1",
+      "api_token: ${API_TOKEN}",
+      "secret:",
+      "",
+    ].join("\n"));
+    await writeText(join(safeOmp, "AGENTS.md"), "# alpha\n\nOrdinary prose may mention token: examples.\n");
+    await writeText(join(safeOmp, "tools", "safe.ts"), `const token = process.env.API_TOKEN;
+const tokenId = "opaque-token-id";
+const note = "token: ordinary prose";
+export default () => ({ execute: async () => ({}) });
+`);
+
+    const passed = await invoke(checkCommand, safe, []);
+    assert.equal(passed.result, 0);
+    assert.match(passed.stdout, /Check passed/);
+    assert.equal(passed.stderr, "");
+  });
+});
+
 test("packaged assets and Docker contexts use allowlists and reject symlinks", async () => {
   await withTempDirectory(async (root) => {
     const source = join(root, "source");
