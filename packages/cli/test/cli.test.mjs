@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile, lstat } from
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable, Writable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import {
@@ -29,6 +30,15 @@ import {
 
 async function exists(path) {
   return lstat(path).then(() => true, () => false);
+}
+
+async function waitForFile(path, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await exists(path)) return;
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for ${path}`);
 }
 
 async function writeText(path, content) {
@@ -359,5 +369,83 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
       dryRun.stdout.trim(),
       runPreviewCommand({ image: "override:tag", dataVolume: "bundle-data", corePort: 8787, adapterPort: 8765 }, envPath),
     );
+  });
+});
+
+test("run maps SIGTERM to Docker SIGINT, keeps SIGINT unchanged, and waits for close", async () => {
+  await withTempDirectory(async (parent) => {
+    const startedPath = join(parent, "docker-started");
+    const signalPath = join(parent, "docker-signal");
+    const dockerPath = join(parent, "docker");
+    await writeFile(
+      dockerPath,
+      `#!${process.execPath}
+const { writeFileSync } = require("node:fs");
+const startedPath = ${JSON.stringify(startedPath)};
+const signalPath = ${JSON.stringify(signalPath)};
+writeFileSync(startedPath, "started");
+const shutdown = (signal) => {
+  writeFileSync(signalPath, signal);
+  setTimeout(() => process.exit(0), 100);
+};
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+setTimeout(() => process.exit(2), 1000);
+`,
+      { mode: 0o755 },
+    );
+
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(bundle, "runtime.env");
+    await writeText(envPath, runtimeEnv());
+
+    const previousPath = process.env.PATH;
+    const baselineSigint = process.listenerCount("SIGINT");
+    const baselineSigterm = process.listenerCount("SIGTERM");
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    let runPromise;
+    let settled = false;
+    try {
+      runPromise = invoke(runCommand, bundle, [], { "env-file": envPath }).then((value) => {
+        settled = true;
+        return value;
+      });
+      await waitForFile(startedPath);
+      process.emit("SIGTERM");
+      await waitForFile(signalPath);
+      assert.equal(await readFile(signalPath, "utf8"), "SIGINT");
+      await delay(20);
+      assert.equal(settled, false);
+      const termResult = await runPromise;
+      assert.equal(termResult.result, 0);
+      assert.equal(process.listenerCount("SIGINT"), baselineSigint);
+      assert.equal(process.listenerCount("SIGTERM"), baselineSigterm);
+
+      await rm(startedPath, { force: true });
+      await rm(signalPath, { force: true });
+      settled = false;
+      runPromise = invoke(runCommand, bundle, [], { "env-file": envPath }).then((value) => {
+        settled = true;
+        return value;
+      });
+      await waitForFile(startedPath);
+      process.emit("SIGINT");
+      await waitForFile(signalPath);
+      assert.equal(await readFile(signalPath, "utf8"), "SIGINT");
+      await delay(20);
+      assert.equal(settled, false);
+      const intResult = await runPromise;
+      assert.equal(intResult.result, 0);
+      assert.equal(process.listenerCount("SIGINT"), baselineSigint);
+      assert.equal(process.listenerCount("SIGTERM"), baselineSigterm);
+    } finally {
+      if (runPromise !== undefined && !settled) {
+        process.emit("SIGTERM");
+        await runPromise.catch(() => {});
+      }
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
   });
 });
