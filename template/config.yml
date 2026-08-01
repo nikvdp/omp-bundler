@@ -1,25 +1,4 @@
-# Sample settings for the agent-folder container. Rendered/edited in place;
-# this file is read directly as ~/.omp/agent/config.yml once
-# OMP_AGENT_DIR points at this folder.
-
-modelRoles:
-  default: cliproxyapi/claude-haiku-4-5-20251001
-  smol: cliproxyapi/claude-3-5-haiku-20241022
-  slow: custom-provider/claude-fable-5
-
-enabledModels:
-  - cliproxyapi/claude-haiku-4-5-20251001
-  - cliproxyapi/claude-3-5-haiku-20241022
-  - custom-provider/claude-fable-5
-
-modelProviderOrder:
-  - cliproxyapi
-  - custom-provider
-
-modelTags:
-  fast: cliproxyapi/claude-3-5-haiku-20241022
-
-disabledProviders:
-  - ollama
-  - llama.cpp
-  - lm-studio
+# Shared OMP settings for the bundled agent. Model selection belongs to
+# the deployment or an agent-specific config, not this provider-neutral
+# default.
+setupVersion: 1
