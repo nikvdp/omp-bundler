@@ -26,16 +26,17 @@ set -euo pipefail
 
 # -- paths -------------------------------------------------------------
 AGENT_DIR="${HOME}/.omp/agent"
-BUILD_DIR="/app/build"
+BUILD_DIR="${OMP_BUILD_DIR:-/app/build}"
 MODELS_TMPL="${AGENT_DIR}/models.yml.tmpl"
 MODELS_OUT="${AGENT_DIR}/models.yml"
 
 # Explicit /data mount paths. The volume is shared with the pumble
 # adapter, which writes attachments under /data/workspace.
-DATA_DIR="/data"
+DATA_DIR="${OMP_DATA_DIR:-/data}"
 SESSIONS_DIR="${DATA_DIR}/sessions"
 WORKSPACE_DIR="${DATA_DIR}/workspace"
 ARTIFACTS_DIR="${DATA_DIR}/artifacts"
+DURABLE_AGENTS_DIR="${DATA_DIR}/agents"
 
 # Child registry: the orphan sweep and the core server both read and
 # write this JSON file to track live RPC child process groups. It
@@ -94,6 +95,10 @@ link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 # discovery picks up that agent's personality. The image is
 # authoritative: the .omp tree is reseeded at every boot. Sibling
 # working files under /data/agents/<agentId> are left untouched.
+#
+# Durable agent directories from an older image are retained for their
+# sibling workspace files, but their stale .omp trees are removed before
+# current baked agents are seeded.
 
 # Source root for baked agent identities. Overridable for local
 # development; defaults to the image /agents mount.
@@ -104,6 +109,9 @@ AGENTS_SRC="${AGENTS_SRC:-/agents}"
 # seeding and without enforcing the leak guards below: an agentless
 # image must start cleanly even if a stale /data/.omp exists, since
 # no agent cwd will ever walk up into it.
+if [ -L "$AGENTS_SRC" ]; then
+	die "${AGENTS_SRC} must not be a symlink"
+fi
 if [ -d "$AGENTS_SRC" ]; then
 	shopt -s nullglob dotglob
 	set -- "$AGENTS_SRC"/*
@@ -120,13 +128,14 @@ fi
 # seeding or leak guards, matching the agentless-image contract.
 _filtered=()
 for _entry in "$@"; do
-	if [ "$(basename "$_entry")" = ".gitkeep" ] && [ -f "$_entry" ]; then
+	if [ "$(basename "$_entry")" = ".gitkeep" ] && [ -f "$_entry" ] && [ ! -L "$_entry" ]; then
 		continue
 	fi
 	_filtered+=("$_entry")
 done
 set -- "${_filtered[@]}"
 
+_baked_ids=()
 if [ "$#" -gt 0 ]; then
 	# OMP's project-level config discovery walks up from the cwd, so a
 	# /data/.omp or /data/agents/.omp directory would leak config into
@@ -135,21 +144,82 @@ if [ "$#" -gt 0 ]; then
 	if [ -d "${DATA_DIR}/.omp" ]; then
 		die "${DATA_DIR}/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/.omp would leak config into every agent"
 	fi
-	if [ -d "${DATA_DIR}/agents/.omp" ]; then
-		die "${DATA_DIR}/agents/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/agents/.omp would leak config into every agent"
+	if [ -d "${DURABLE_AGENTS_DIR}/.omp" ]; then
+		die "${DURABLE_AGENTS_DIR}/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/agents/.omp would leak config into every agent"
 	fi
 
+	# Validate the image-side paths before any durable state is changed.
 	for _agent_src in "$@"; do
 		_agent_id="$(basename "$_agent_src")"
+		if [ -L "$_agent_src" ]; then
+			die "${AGENTS_SRC}/${_agent_id} must not be a symlink"
+		fi
 		if [ ! -d "$_agent_src" ]; then
 			die "${AGENTS_SRC}/${_agent_id} is not a directory (bake validation should make this unreachable; failing loudly anyway)"
+		fi
+		if [ -L "${_agent_src}/.omp" ]; then
+			die "${AGENTS_SRC}/${_agent_id}/.omp must not be a symlink"
 		fi
 		if [ ! -d "${_agent_src}/.omp" ]; then
 			die "${AGENTS_SRC}/${_agent_id} has no .omp directory (bake validation should make this unreachable; failing loudly anyway)"
 		fi
-		mkdir -p "${DATA_DIR}/agents/${_agent_id}"
-		rm -rf "${DATA_DIR}/agents/${_agent_id}/.omp"
-		cp -R "${_agent_src}/.omp" "${DATA_DIR}/agents/${_agent_id}/.omp"
+		_baked_ids+=("$_agent_id")
+	done
+fi
+
+# The durable agent root and each agent directory are operator state. Never
+# follow a symlink at either level while reconciling image-owned .omp trees.
+if [ -L "$DURABLE_AGENTS_DIR" ]; then
+	die "${DURABLE_AGENTS_DIR} must not be a symlink"
+fi
+if [ -e "$DURABLE_AGENTS_DIR" ] && [ ! -d "$DURABLE_AGENTS_DIR" ]; then
+	die "${DURABLE_AGENTS_DIR} must be a directory"
+fi
+
+_durable_agents=()
+if [ -d "$DURABLE_AGENTS_DIR" ]; then
+	shopt -s nullglob dotglob
+	_durable_agents=("$DURABLE_AGENTS_DIR"/*)
+	shopt -u nullglob dotglob
+
+	# Preflight every durable path before removing any stale tree.
+	for _durable_agent in "${_durable_agents[@]}"; do
+		_agent_id="$(basename "$_durable_agent")"
+		if [ -L "$_durable_agent" ]; then
+			die "${DURABLE_AGENTS_DIR}/${_agent_id} must not be a symlink"
+		fi
+		if [ ! -d "$_durable_agent" ]; then
+			die "${DURABLE_AGENTS_DIR}/${_agent_id} must be a directory"
+		fi
+		if [ -L "${_durable_agent}/.omp" ]; then
+			die "${DURABLE_AGENTS_DIR}/${_agent_id}/.omp must not be a symlink"
+		fi
+	done
+
+	# Remove only the image-owned subtree for IDs absent from this image.
+	for _durable_agent in "${_durable_agents[@]}"; do
+		_agent_id="$(basename "$_durable_agent")"
+		_is_baked=0
+		for _baked_id in "${_baked_ids[@]}"; do
+			if [ "$_baked_id" = "$_agent_id" ]; then
+				_is_baked=1
+				break
+			fi
+		done
+		if [ "$_is_baked" -eq 0 ] && [ -e "${_durable_agent}/.omp" ]; then
+			rm -rf "${_durable_agent}/.omp"
+			log "removed stale agent ${_agent_id}"
+		fi
+	done
+fi
+
+if [ "$#" -gt 0 ]; then
+	for _agent_src in "$@"; do
+		_agent_id="$(basename "$_agent_src")"
+		_durable_agent="${DURABLE_AGENTS_DIR}/${_agent_id}"
+		mkdir -p "$_durable_agent"
+		rm -rf "${_durable_agent}/.omp"
+		cp -R "${_agent_src}/.omp" "${_durable_agent}/.omp"
 		log "seeded agent ${_agent_id}"
 	done
 fi

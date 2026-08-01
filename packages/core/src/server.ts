@@ -25,7 +25,7 @@ import http, {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { existsSync, statSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -116,19 +116,25 @@ export function createCoreServer(options: CoreServerOptions): CoreServer {
 
 /**
  * Validate that every adapter bound to an agentId resolves to an existing
- * agent directory under OMP_AGENTS_ROOT. Runs at boot, before the HTTP
- * server listens, so a misconfigured binding fails fast instead of surfacing
- * on the first inbound message. Pure config construction (CoreSupervisor with
- * an injected childFactory) never reaches this path, so focused unit tests
- * are not forced to create agent directories.
+ * durable agent directory with an image-owned .omp directory under
+ * OMP_AGENTS_ROOT. Runs at boot, before the HTTP server listens, so a
+ * misconfigured binding fails fast instead of surfacing on the first inbound
+ * message. Pure config construction (CoreSupervisor with an injected
+ * childFactory) never reaches this path, so focused unit tests are not forced
+ * to create agent directories.
  */
 function validateAgentBindings(config: CoreConfig): void {
   const bound = config.adapters.filter((a) => a.agentId !== undefined);
   if (bound.length === 0) return;
+
+  const agentsRootInfo =
+    config.agentsRootDir === null
+      ? undefined
+      : lstatSync(config.agentsRootDir, { throwIfNoEntry: false });
   if (
     config.agentsRootDir === null ||
-    !existsSync(config.agentsRootDir) ||
-    !statSync(config.agentsRootDir).isDirectory()
+    !agentsRootInfo?.isDirectory() ||
+    agentsRootInfo?.isSymbolicLink()
   ) {
     throw new Error(
       `OMP_AGENTS_ROOT "${config.agentsRootDir ?? "<unset>"}" is not a directory; required by adapters bound to an agentId`,
@@ -137,9 +143,17 @@ function validateAgentBindings(config: CoreConfig): void {
   for (const adapter of bound) {
     const agentId = adapter.agentId!;
     const agentDir = join(config.agentsRootDir, agentId);
-    if (!existsSync(agentDir) || !statSync(agentDir).isDirectory()) {
+    const agentInfo = lstatSync(agentDir, { throwIfNoEntry: false });
+    if (!agentInfo?.isDirectory() || agentInfo?.isSymbolicLink()) {
       throw new Error(
         `adapter "${adapter.adapterId}" is bound to agent "${agentId}" but agent directory "${agentDir}" does not exist`,
+      );
+    }
+    const ompPath = join(agentDir, ".omp");
+    const ompInfo = lstatSync(ompPath, { throwIfNoEntry: false });
+    if (!ompInfo?.isDirectory() || ompInfo?.isSymbolicLink()) {
+      throw new Error(
+        `adapter "${adapter.adapterId}" is bound to agent "${agentId}" but agent .omp directory "${ompPath}" does not exist`,
       );
     }
   }
