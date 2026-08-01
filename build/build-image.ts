@@ -53,7 +53,7 @@ import {
 import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { expand, validate } from "./render-models";
+import { expand, omitUnconfiguredProviders, validate } from "./render-models";
 
 // ── arg parsing ────────────────────────────────────────────────────────
 
@@ -547,14 +547,21 @@ async function main(): Promise<void> {
   if (tmplText.length === 0) {
     fail("models.yml.tmpl is empty");
   }
-  // Confirm placeholder expansion would resolve cleanly against the
-  // current environment too; the renderer runs at container start with
-  // the same env, so surface unresolved placeholders now. We do NOT
-  // require the env vars to be set here (they are runtime secrets);
-  // we only reject survivors that are not valid-name placeholders.
-  const { survivors } = expand(tmplText);
-  const catalogErrors = validateCatalog(tmplText);
+  // Prepare the catalog exactly as container-time renderer does: omit
+  // wholly unconfigured optional providers before checking placeholders.
+  let preparedTemplate = tmplText;
+  let partialProviders: string[] = [];
+  try {
+    const prepared = omitUnconfiguredProviders(tmplText);
+    preparedTemplate = prepared.text;
+    partialProviders = prepared.partial;
+  } catch (e) {
+    fail(`cannot prepare optional model providers: ${(e as Error).message}`);
+  }
+  const { survivors } = expand(preparedTemplate);
+  const catalogErrors = validateCatalog(preparedTemplate);
   const allErrors = [
+    ...partialProviders,
     ...survivors.map((t) => `unresolved placeholder '${t}' in models.yml.tmpl`),
     ...catalogErrors,
   ];
