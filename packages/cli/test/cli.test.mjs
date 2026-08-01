@@ -10,9 +10,11 @@ import test from "node:test";
 
 import {
   agentCommand,
+  buildCommand,
   checkCommand,
   applyFilePlan,
   createFilePlan,
+  discoverAgents,
   commandArgs,
   destroyCommand,
   generateCommand,
@@ -27,6 +29,7 @@ import {
 import {
   buildPreviewCommand,
   resolveBuildTag,
+  migrateCommand,
   resolveRunSettings,
   runPreviewCommand,
   validateBundle,
@@ -202,6 +205,18 @@ async function createBakedAgents(root, name, agents) {
   }
   return source;
 }
+async function createLegacyAgent(root, agentId) {
+  const agentRoot = join(root, "agents", agentId);
+  const omp = join(agentRoot, ".omp");
+  await writeText(join(omp, "AGENTS.md"), `# ${agentId}\n\nLegacy hidden-layout instructions.\n`);
+  await writeText(join(omp, "config.yml"), "setupVersion: 1\n");
+  await writeText(join(omp, "agents", "researcher.md"), "---\nname: researcher\ndescription: Legacy researcher subagent.\ntools: read, grep, glob\nspawns: \"\"\n---\n\nYou are researcher.\n");
+  await writeText(join(omp, "commands", "summarize.md"), "---\ndescription: Legacy summarize command.\n---\n\nSummarize the context.\n");
+  await writeText(join(omp, "extensions", "lifecycle.ts"), "export default function lifecycle() {}\n");
+  await writeText(join(omp, "skills", "knowledge-base", "SKILL.md"), "---\nname: knowledge-base\ndescription: Legacy skill.\n---\n\nSkill body.\n");
+  await writeText(join(omp, "tools", "lookup.ts"), "export default () => ({ execute: async () => ({}) });\n");
+  return { agentRoot, omp };
+}
 
 async function createCanonicalAssetSource(root) {
   await writeText(join(root, "Dockerfile"), "FROM scratch\n");
@@ -306,10 +321,10 @@ test("new creates empty and full trees, generators cover every surface, and coll
       new Set([".gitignore", "README.md", "omp-bundler.yml", "runtime.env.example", "agents"]),
     );
     assert.equal(await exists(join(parent, "empty", "agents", ".gitkeep")), true);
-    assert.equal(await exists(join(parent, "full", "agents", "alpha", ".omp", "AGENTS.md")), true);
-    assert.equal(await exists(join(parent, "full", "agents", "alpha", ".omp", "config.yml")), true);
+    assert.equal(await exists(join(parent, "full", "agents", "alpha", "AGENTS.md")), true);
+    assert.equal(await exists(join(parent, "full", "agents", "alpha", "config.yml")), true);
     for (const surface of ["agents", "commands", "extensions", "skills", "tools"]) {
-      assert.equal(await exists(join(parent, "full", "agents", "alpha", ".omp", surface)), true);
+      assert.equal(await exists(join(parent, "full", "agents", "alpha", surface)), true);
     }
 
     await assert.rejects(
@@ -319,7 +334,7 @@ test("new creates empty and full trees, generators cover every surface, and coll
 
     await invoke(generateCommand, join(parent, "empty"), ["agent", "later"]);
     assert.equal(await exists(join(parent, "empty", "agents", ".gitkeep")), false);
-    assert.equal(await exists(join(parent, "empty", "agents", "later", ".omp", "config.yml")), true);
+    assert.equal(await exists(join(parent, "empty", "agents", "later", "config.yml")), true);
 
     const components = [
       ["skill", "knowledge-base", join("skills", "knowledge-base", "SKILL.md")],
@@ -331,12 +346,12 @@ test("new creates empty and full trees, generators cover every surface, and coll
     for (const [kind, name, relativePath] of components) {
       await invoke(generateCommand, join(parent, "full"), [kind, "alpha", name]);
       assert.equal(
-        await exists(join(parent, "full", "agents", "alpha", ".omp", relativePath)),
+        await exists(join(parent, "full", "agents", "alpha", relativePath)),
         true,
       );
     }
 
-    const previewPath = join(parent, "full", "agents", "alpha", ".omp", "tools", "preview.ts");
+    const previewPath = join(parent, "full", "agents", "alpha", "tools", "preview.ts");
     const preview = await invoke(
       generateCommand,
       join(parent, "full"),
@@ -390,7 +405,7 @@ test("mutation plans reject symlinked bundle, agents, component, and env paths",
       ["subagent", "agents", "researcher"],
     ];
     for (const [kind, surface, name] of componentCases) {
-      const componentSurface = join(surfacesBundle, "agents", "alpha", ".omp", surface);
+      const componentSurface = join(surfacesBundle, "agents", "alpha", surface);
       const externalSurface = join(parent, `${kind}-surface`);
       await mkdir(externalSurface);
       await rm(componentSurface, { recursive: true });
@@ -433,7 +448,7 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
       /symlinked path component/,
     );
     assert.equal(
-      await exists(join(realBundle, "agents", "alpha", ".omp", "skills", "preview")),
+      await exists(join(realBundle, "agents", "alpha", "skills", "preview")),
       false,
     );
 
@@ -441,7 +456,7 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
       () => invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]),
       /symlinked path component/,
     );
-    const configPath = join(realBundle, "agents", "alpha", ".omp", "config.yml");
+    const configPath = join(realBundle, "agents", "alpha", "config.yml");
     assert.doesNotMatch(await readFile(configPath, "utf8"), /default: acme\/model-v1/);
 
     await assert.rejects(
@@ -452,7 +467,7 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
     assert.equal(await exists(join(realBundle, "agents", "alpha")), true);
 
     await invoke(generateCommand, realBundle, ["skill", "alpha", "temporary"]);
-    const skillPath = join(realBundle, "agents", "alpha", ".omp", "skills", "temporary", "SKILL.md");
+    const skillPath = join(realBundle, "agents", "alpha", "skills", "temporary", "SKILL.md");
     await assert.rejects(
       () => invoke(destroyCommand, bundle, ["skill", "alpha", "temporary"], { yes: true }),
       /symlinked path component/,
@@ -477,7 +492,7 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
       /symlinked path component/,
     );
     assert.equal(
-      await exists(join(realBundle, "agents", "alpha", ".omp", "tools", "lookup-record.ts")),
+      await exists(join(realBundle, "agents", "alpha", "tools", "lookup-record.ts")),
       false,
     );
 
@@ -490,7 +505,7 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
       /symlinked path component/,
     );
     assert.equal(
-      await exists(join(parent, "real-bundles", "sub", "grand", "agents", "alpha", ".omp", "skills", "deep")),
+      await exists(join(parent, "real-bundles", "sub", "grand", "agents", "alpha", "skills", "deep")),
       false,
     );
 
@@ -531,18 +546,18 @@ test("mutation commands pass on a physical bundle path with a macOS-style alias 
 
     await invoke(generateCommand, bundle, ["skill", "alpha", "preview"]);
     assert.equal(
-      await exists(join(bundle, "agents", "alpha", ".omp", "skills", "preview", "SKILL.md")),
+      await exists(join(bundle, "agents", "alpha", "skills", "preview", "SKILL.md")),
       true,
     );
 
     await invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]);
-    assert.match(await readFile(join(bundle, "agents", "alpha", ".omp", "config.yml"), "utf8"), /default: acme\/model-v1/);
+    assert.match(await readFile(join(bundle, "agents", "alpha", "config.yml"), "utf8"), /default: acme\/model-v1/);
 
     await invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]);
     assert.equal(await exists(join(bundle, "agents", "renamed")), true);
 
     await invoke(generateCommand, bundle, ["skill", "renamed", "temporary"]);
-    const skillPath = join(bundle, "agents", "renamed", ".omp", "skills", "temporary", "SKILL.md");
+    const skillPath = join(bundle, "agents", "renamed", "skills", "temporary", "SKILL.md");
     await invoke(destroyCommand, bundle, ["skill", "renamed", "temporary"], { yes: true });
     assert.equal(await exists(skillPath), false);
   });
@@ -630,7 +645,7 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
     await writeText(envExample, before);
 
     await invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]);
-    const configPath = join(bundle, "agents", "alpha", ".omp", "config.yml");
+    const configPath = join(bundle, "agents", "alpha", "config.yml");
     assert.match(await readFile(configPath, "utf8"), /default: acme\/model-v1/);
     await writeText(join(bundle, "agents", "alpha", "notes.txt"), "alpha custom state\n");
     const ignoredRuntime = join(bundle, "runtime.env");
@@ -641,7 +656,7 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
     assert.equal(await exists(join(bundle, "agents", "alpha")), false);
     assert.equal(await exists(join(bundle, "agents", "renamed", "notes.txt")), true);
     assert.equal(await readFile(join(bundle, "agents", "renamed", "notes.txt"), "utf8"), "alpha custom state\n");
-    assert.match(await readFile(join(bundle, "agents", "renamed", ".omp", "config.yml"), "utf8"), /default: acme\/model-v1/);
+    assert.match(await readFile(join(bundle, "agents", "renamed", "config.yml"), "utf8"), /default: acme\/model-v1/);
     assert.match(await readFile(envExample, "utf8"), /PUMBLE_AGENT_ID=renamed/);
     assert.equal(await readFile(ignoredRuntime, "utf8"), "PUMBLE_AGENT_ID=alpha\n");
     assert.deepEqual(await transactionArtifacts(bundle), []);
@@ -653,7 +668,7 @@ test("destructive commands preview without mutation and require explicit confirm
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
     await invoke(generateCommand, bundle, ["skill", "alpha", "temporary"]);
-    const skillPath = join(bundle, "agents", "alpha", ".omp", "skills", "temporary", "SKILL.md");
+    const skillPath = join(bundle, "agents", "alpha", "skills", "temporary", "SKILL.md");
 
     const dryRun = await invoke(destroyCommand, bundle, ["skill", "alpha", "temporary"], { "dry-run": true });
     assert.match(dryRun.stdout, /dry-run: remove/);
@@ -685,7 +700,7 @@ test("check reports structural and runtime errors without exposing credential va
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
-    const structuralPath = join(bundle, "agents", "alpha", ".omp", "unexpected.txt");
+    const structuralPath = join(bundle, "agents", "alpha", "unexpected.txt");
     await writeText(structuralPath, "not an allowed project surface\n");
     const leaked = "super-secret-value-42";
     const envPath = join(parent, "runtime.env");
@@ -834,7 +849,7 @@ test("check scans normalized credential fields without flagging placeholders or 
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["leaky"], { agent: "alpha" });
     const leaky = join(parent, "leaky");
-    const leakyOmp = join(leaky, "agents", "alpha", ".omp");
+    const leakyOmp = join(leaky, "agents", "alpha");
     const leakedValues = [
       "json-api-token-literal",
       "json-uppercase-token-literal",
@@ -869,7 +884,7 @@ test("check scans normalized credential fields without flagging placeholders or 
 
     await invoke(newCommand, parent, ["safe"], { agent: "alpha" });
     const safe = join(parent, "safe");
-    const safeOmp = join(safe, "agents", "alpha", ".omp");
+    const safeOmp = join(safe, "agents", "alpha");
     await writeText(join(safeOmp, "settings.json"), JSON.stringify({
       api_token: "${API_TOKEN}",
       token: "$TOKEN",
@@ -901,7 +916,7 @@ test("check rejects credential fallback literals without printing values", async
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["fallback"], { agent: "alpha" });
     const fallback = join(parent, "fallback");
-    const fallbackOmp = join(fallback, "agents", "alpha", ".omp");
+    const fallbackOmp = join(fallback, "agents", "alpha");
     const fallbackValues = [
       "fallback-default",
       "fallback-alternate",
@@ -938,7 +953,7 @@ export default () => ({ execute: async () => ({}) });
 
     await invoke(newCommand, parent, ["exact"], { agent: "alpha" });
     const exact = join(parent, "exact");
-    await writeText(join(exact, "agents", "alpha", ".omp", "settings.json"), JSON.stringify({
+    await writeText(join(exact, "agents", "alpha", "settings.json"), JSON.stringify({
       api_token: "${API_TOKEN}",
       token: "$TOKEN",
       secret: "process.env.SECRET",
@@ -970,19 +985,22 @@ test("packaged assets and Docker contexts use allowlists and reject symlinks", a
     );
     await rm(join(source, "build", "linked-dockerfile"));
 
-    const agentOmp = join(root, "agent-source", ".omp");
-    await writeText(join(agentOmp, "AGENTS.md"), "# alpha\n");
-    const agent = { id: "alpha", path: dirname(agentOmp), ompPath: agentOmp };
+    const agentSource = join(root, "agent-source", "alpha");
+    await writeText(join(agentSource, "AGENTS.md"), "# alpha\n");
+    await writeText(join(agentSource, "tools", "lookup.ts"), "export default () => ({ execute: async () => ({}) });\n");
+    const agent = { id: "alpha", path: agentSource };
     const contextPath = await stageDockerContext([agent], source);
     try {
       assert.equal(await exists(join(contextPath, "Dockerfile")), true);
       assert.equal(await exists(join(contextPath, "dist")), false);
       assert.equal(await exists(join(contextPath, "agents", "alpha", ".omp", "AGENTS.md")), true);
+      assert.equal(await exists(join(contextPath, "agents", "alpha", ".omp", "tools", "lookup.ts")), true);
+      assert.equal(await exists(join(contextPath, "agents", "alpha", "AGENTS.md")), false);
     } finally {
       await removeDockerContext(contextPath);
     }
 
-    await symlink(join(source, "Dockerfile"), join(agentOmp, "linked-file"));
+    await symlink(join(source, "Dockerfile"), join(agentSource, "linked-file"));
     await assert.rejects(
       () => stageDockerContext([agent], source),
       /refusing to stage symlink/,
@@ -1041,10 +1059,10 @@ test("run --agents validates bindings against the same alternate collection as b
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
     const alternate = join(parent, "alternate-agents");
-    await writeText(join(alternate, "beta", ".omp", "AGENTS.md"), "# beta\n");
-    await writeText(join(alternate, "beta", ".omp", "config.yml"), "setupVersion: 1\n");
+    await writeText(join(alternate, "beta", "AGENTS.md"), "# beta\n");
+    await writeText(join(alternate, "beta", "config.yml"), "setupVersion: 1\n");
     for (const surface of ["agents", "commands", "extensions", "skills", "tools"]) {
-      await mkdir(join(alternate, "beta", ".omp", surface), { recursive: true });
+      await mkdir(join(alternate, "beta", surface), { recursive: true });
     }
 
     const betaEnv = join(bundle, "beta.env");
@@ -1208,4 +1226,209 @@ setTimeout(() => process.exit(2), 1000);
       else process.env.PATH = previousPath;
     }
   });
+});
+test("source commands reject a direct legacy .omp agent layout", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"]);
+    const bundle = join(parent, "bundle");
+    await createLegacyAgent(bundle, "alpha");
+    const envPath = join(bundle, "runtime.env");
+    await writeText(envPath, runtimeEnv());
+
+    const checked = await invoke(checkCommand, bundle, []);
+    assert.equal(checked.result, 1);
+    assert.match(checked.stderr, /must not be a nested \.omp directory/);
+
+    await assert.rejects(
+      () => invoke(generateCommand, bundle, ["skill", "alpha", "preview"]),
+      /nested \.omp directory/,
+    );
+    await assert.rejects(
+      () => invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]),
+      /nested \.omp directory/,
+    );
+
+    const built = await invoke(buildCommand, bundle, []);
+    assert.equal(built.result, 1);
+    assert.match(built.stderr, /must not be a nested \.omp directory/);
+
+    const ran = await invoke(runCommand, bundle, [], { "env-file": envPath, "dry-run": true });
+    assert.equal(ran.result, 1);
+    assert.match(ran.stderr, /must not be a nested \.omp directory/);
+    assert.doesNotMatch(`${ran.stdout}\n${ran.stderr}`, /docker run/);
+
+    await assert.rejects(
+      () => discoverAgents(join(bundle, "agents")),
+      /nested \.omp directory/,
+    );
+  });
+});
+
+test("migrate visible-layout dry-run previews without moving legacy .omp source", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"]);
+    const bundle = join(parent, "bundle");
+    const { agentRoot, omp } = await createLegacyAgent(bundle, "alpha");
+
+    const dryRun = await invoke(migrateCommand, bundle, ["visible-layout"], { "dry-run": true });
+    assert.equal(dryRun.result, 0);
+    assert.match(dryRun.stdout, /dry-run: move .*\.omp[\\/]AGENTS\.md -> .*agents[\\/]alpha[\\/]AGENTS\.md/);
+    assert.match(dryRun.stdout, /dry-run: move .*\.omp[\\/]tools -> .*agents[\\/]alpha[\\/]tools/);
+    assert.match(dryRun.stdout, /dry-run: remove .*agents[\\/]alpha[\\/]\.omp$/m);
+    assert.equal(await exists(join(omp, "AGENTS.md")), true);
+    assert.equal(await exists(join(omp, "tools", "lookup.ts")), true);
+    assert.equal(await exists(join(agentRoot, "AGENTS.md")), false);
+    assert.equal(await exists(join(agentRoot, ".omp")), true);
+  });
+});
+
+test("migrate visible-layout is confirmation-gated, promotes legacy children, and is idempotent", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const { agentRoot, omp } = await createLegacyAgent(bundle, "beta");
+    await writeText(join(agentRoot, "settings.json"), JSON.stringify({ note: "visible state" }));
+
+    // Non-interactive runs without --yes refuse before any mutation.
+    await assert.rejects(
+      () => invoke(migrateCommand, bundle, ["visible-layout"]),
+      /refusing non-interactive deletion; pass --yes to confirm/,
+    );
+    assert.equal(await exists(join(omp, "AGENTS.md")), true);
+    assert.equal(await exists(join(agentRoot, ".omp")), true);
+    assert.equal(await exists(join(agentRoot, "AGENTS.md")), false);
+
+    const migrated = await invoke(migrateCommand, bundle, ["visible-layout"], { yes: true });
+    assert.equal(migrated.result, 0, migrated.stderr);
+    assert.equal(await readFile(join(agentRoot, "AGENTS.md"), "utf8"), "# beta\n\nLegacy hidden-layout instructions.\n");
+    assert.equal(await exists(join(agentRoot, "config.yml")), true);
+    assert.equal(await exists(join(agentRoot, "tools", "lookup.ts")), true);
+    assert.equal(await exists(join(agentRoot, "skills", "knowledge-base", "SKILL.md")), true);
+    assert.equal(await exists(join(agentRoot, ".omp")), false);
+    assert.deepEqual(JSON.parse(await readFile(join(agentRoot, "settings.json"), "utf8")), { note: "visible state" });
+    // The already-visible alpha agent is left untouched.
+    assert.equal(await exists(join(bundle, "agents", "alpha", "AGENTS.md")), true);
+    assert.equal(await exists(join(bundle, "agents", "alpha", ".omp")), false);
+    assert.deepEqual(await transactionArtifacts(bundle), []);
+
+    // The migrated bundle is a valid visible-layout bundle.
+    const checked = await invoke(checkCommand, bundle, []);
+    assert.equal(checked.result, 0, checked.stderr);
+    assert.match(checked.stdout, /Agents: alpha, beta/);
+
+    // A second run has nothing left to migrate.
+    const repeated = await invoke(migrateCommand, bundle, ["visible-layout"], { yes: true });
+    assert.equal(repeated.result, 0);
+    assert.match(repeated.stdout, /nothing to migrate/);
+    assert.equal(await exists(join(agentRoot, "AGENTS.md")), true);
+    assert.equal(await exists(join(agentRoot, ".omp")), false);
+  });
+});
+
+test("migrate visible-layout refuses to overwrite existing agent surface paths", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"]);
+    const bundle = join(parent, "bundle");
+    const { agentRoot, omp } = await createLegacyAgent(bundle, "alpha");
+    await writeText(join(agentRoot, "AGENTS.md"), "visible instructions\n");
+
+    await assert.rejects(
+      () => invoke(migrateCommand, bundle, ["visible-layout"], { yes: true }),
+      /refusing to overwrite existing agent surface path/,
+    );
+    assert.equal(await readFile(join(agentRoot, "AGENTS.md"), "utf8"), "visible instructions\n");
+    assert.equal(await exists(join(omp, "AGENTS.md")), true);
+    assert.equal(await exists(join(omp, "tools", "lookup.ts")), true);
+  });
+});
+
+test("migrate visible-layout rejects symlinked legacy .omp source", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"]);
+    const bundle = join(parent, "bundle");
+    const { agentRoot, omp } = await createLegacyAgent(bundle, "alpha");
+
+    // A symlink nested inside the legacy .omp tree is rejected before any move.
+    const outside = join(parent, "outside-tool.ts");
+    await writeText(outside, "export {};\n");
+    await symlink(outside, join(omp, "tools", "linked.ts"));
+    await assert.rejects(
+      () => invoke(migrateCommand, bundle, ["visible-layout"], { yes: true }),
+      /legacy \.omp path contains a symlink/,
+    );
+    assert.equal(await exists(join(agentRoot, ".omp")), true);
+    assert.equal(await exists(join(agentRoot, "AGENTS.md")), false);
+    await rm(join(omp, "tools", "linked.ts"));
+
+    // A legacy .omp that is itself a symlink is rejected too.
+    await rm(omp, { recursive: true });
+    await mkdir(join(parent, "outside-omp"));
+    await symlink(join(parent, "outside-omp"), omp);
+    await assert.rejects(
+      () => invoke(migrateCommand, bundle, ["visible-layout"], { yes: true }),
+      /legacy \.omp must not be a symlink/,
+    );
+    assert.equal(await exists(join(agentRoot, ".omp")), true);
+    assert.deepEqual(await readdir(join(parent, "outside-omp")), []);
+  });
+});
+
+test("build stages visible agent roots into .omp destination wrappers", async () => {
+  // build stages the packaged runtime from packages/cli/assets, which is
+  // gitignored and produced by prepack; materialize it from the repository
+  // root the same way prepack does, and restore the original state after.
+  const assetsPath = join(REPO_ROOT, "packages", "cli", "assets");
+  const assetsPreExisted = await exists(assetsPath);
+  if (!assetsPreExisted) await stagePackagedAssets(REPO_ROOT, assetsPath);
+  try {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await invoke(generateCommand, bundle, ["tool", "alpha", "lookup-record"]);
+
+    const capturePath = join(parent, "docker-capture.json");
+    const dockerPath = join(parent, "docker");
+    await writeFile(
+      dockerPath,
+      `#!${process.execPath}
+const { readdirSync, statSync, writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+const contextPath = process.argv[process.argv.length - 1];
+const files = [];
+const walk = (directory) => {
+  for (const name of readdirSync(directory)) {
+    const path = join(directory, name);
+    if (statSync(path).isDirectory()) walk(path);
+    else files.push(path.slice(contextPath.length + 1));
+  }
+};
+walk(contextPath);
+writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), files }));
+`,
+      { mode: 0o755 },
+    );
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      const built = await invoke(buildCommand, bundle, []);
+      assert.equal(built.result, 0, built.stderr);
+      assert.match(built.stdout, /Built image: bundle:local/);
+      assert.match(built.stdout, /Included agents: alpha/);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    const captured = JSON.parse(await readFile(capturePath, "utf8"));
+    assert.deepEqual(captured.args.slice(0, 2), ["build", "-t"]);
+    assert(captured.files.includes(join("agents", "alpha", ".omp", "AGENTS.md")));
+    assert(captured.files.includes(join("agents", "alpha", ".omp", "config.yml")));
+    assert(captured.files.includes(join("agents", "alpha", ".omp", "tools", "lookup-record.ts")));
+    assert.equal(captured.files.includes(join("agents", "alpha", "AGENTS.md")), false);
+    assert(captured.files.includes("Dockerfile"));
+  });
+  } finally {
+    if (!assetsPreExisted) await rm(assetsPath, { recursive: true, force: true });
+  }
 });
