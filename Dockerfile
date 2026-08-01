@@ -121,14 +121,16 @@ EXPOSE 8765
 # ── Pumble adapter runtime config ────────────────────────────────────
 # PUMBLE_CORE_URL        core base URL for posting inbound messages
 # PUMBLE_ADAPTER_ID      adapter id (schema default: pumble)
+# PUMBLE_AGENT_ID        filesystem agent id for the synthesized registration
 # PUMBLE_CORE_SHARED_SECRET  shared secret for inbound auth + outbound HMAC
 # PUMBLE_PUBLIC_BASE_URL public base URL for attachment links (required
 #                        for signed download links to resolve externally)
 # PUMBLE_CORE_CALLBACK_URL optional core-to-adapter callback override
 #                          (default: http://127.0.0.1:8765/core/events)
 #
-# OMP_ADAPTERS may override the generated Pumble registration with a JSON
-# array of {adapterId,callbackUrl,sharedSecret} entries.
+# OMP_ADAPTERS is caller-owned and may override the generated Pumble
+# registration with a JSON array of {adapterId,callbackUrl,sharedSecret,agentId}
+# entries. PUMBLE_AGENT_ID is required only when OMP_ADAPTERS is unset.
 
 # ── child registry ──────────────────────────────────────────────────
 # The orphan sweep and core server share a JSON registry of live RPC

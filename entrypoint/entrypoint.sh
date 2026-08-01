@@ -155,9 +155,8 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # -- 1. render models --------------------------------------------------
-# bun build/render-models.ts expands the template's ${VAR} placeholders
-# against the container environment and fails loudly on missing, empty,
-# malformed, or unresolved values.
+# bun build/render-models.ts expands runtime placeholders, omits providers
+# with no configured placeholders, and fails on partial or malformed values.
 log "rendering models.yml from ${MODELS_TMPL}"
 bun "$BUILD_DIR/render-models.ts" \
 	--input "$MODELS_TMPL" \
@@ -177,14 +176,17 @@ if [ -n "${OMP_AUTH_BROKER_URL:-}" ] || [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ]; the
 fi
 
 # Default image composition: register the bundled Pumble adapter against its
-# loopback callback. OMP_ADAPTERS remains an escape hatch for multi-adapter
-# deployments. Build the JSON with Bun so arbitrary secret bytes are escaped.
+# loopback callback and the selected filesystem agent. OMP_ADAPTERS remains
+# caller-owned for multi-adapter deployments. Build the JSON with Bun so
+# arbitrary secret bytes are escaped.
 if [ -z "${OMP_ADAPTERS:-}" ]; then
+	[ -n "${PUMBLE_AGENT_ID:-}" ] || die "PUMBLE_AGENT_ID is required when OMP_ADAPTERS is unset"
 	[ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
 	# shellcheck disable=SC2016
 	OMP_ADAPTERS="$(
 		bun -e '
       const adapterId = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
+      const agentId = process.env.PUMBLE_AGENT_ID;
       const port = process.env.PUMBLE_BRIDGE_PORT?.trim() || "8765";
       const callbackUrl =
         process.env.PUMBLE_CORE_CALLBACK_URL?.trim() ||
@@ -193,6 +195,7 @@ if [ -z "${OMP_ADAPTERS:-}" ]; then
         adapterId,
         callbackUrl,
         sharedSecret: process.env.PUMBLE_CORE_SHARED_SECRET,
+        agentId,
       }]));
     '
 	)"
