@@ -1,6 +1,7 @@
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { rm } from "node:fs/promises";
+import { generateEmbeddedAssetsModule } from "./embedded-assets.ts";
 import { stagePackagedAssets } from "../src/package-assets.ts";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -9,6 +10,10 @@ const assetsRoot = join(packageRoot, "assets");
 const distRoot = join(packageRoot, "dist");
 
 await stagePackagedAssets(repositoryRoot, assetsRoot);
+await generateEmbeddedAssetsModule(
+  assetsRoot,
+  join(packageRoot, "src", "embedded-assets.generated.ts"),
+);
 await rm(distRoot, { recursive: true, force: true });
 
 const result = await Bun.build({

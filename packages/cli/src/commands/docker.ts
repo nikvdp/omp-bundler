@@ -17,8 +17,8 @@ export interface RunDockerArguments {
 }
 
 /** Resolve the package asset directory without depending on process.cwd(). */
-export function packagedAssetsRoot(): string {
-  return dirname(resolvePackagedAsset("Dockerfile"));
+export async function packagedAssetsRoot(): Promise<string> {
+  return dirname(await resolvePackagedAsset("Dockerfile"));
 }
 
 export function buildDockerArgs(
@@ -65,11 +65,11 @@ export function formatDockerCommand(
  */
 export async function stageDockerContext(
   agents: readonly AgentDirectory[],
-  assetsRoot = packagedAssetsRoot(),
+  assetsRoot?: string,
 ): Promise<string> {
   const contextPath = await mkdtemp(join(tmpdir(), "omp-bundler-build-"));
   try {
-    const sourceRoot = resolve(assetsRoot);
+    const sourceRoot = resolve(assetsRoot ?? await packagedAssetsRoot());
     for (const assetPath of CANONICAL_ASSET_PATHS) {
       await copyTreeNoSymlinks(
         join(sourceRoot, assetPath),

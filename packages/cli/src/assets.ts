@@ -1,17 +1,65 @@
-import { access } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { BUILD_ID, EMBEDDED_ASSETS } from "./embedded-assets.generated.ts";
+
+/** Resolve the package root that owns `moduleUrl`: the directory above `assets/`. */
+function packageRootFor(moduleUrl: string): string {
+  return resolve(dirname(fileURLToPath(moduleUrl)), "..");
+}
+
+let materializedRoot: string | undefined;
+
+/**
+ * Extract every embedded asset to a real cache directory.
+ *
+ * A standalone compiled binary has no real filesystem for its modules:
+ * `import.meta.url` is a virtual `file:///$bunfs/...` path. The binary carries
+ * its assets inside the executable (bundled from
+ * `embedded-assets.generated.ts` during prepack), so the first asset read
+ * materializes them under `~/.cache/omp-bundler/assets` — Docker builds need
+ * real files on disk. A rebuilt binary with a different build ID replaces the
+ * stale tree.
+ */
+async function materializedAssetsRoot(): Promise<string> {
+  if (materializedRoot) return materializedRoot;
+  const root = join(homedir(), ".cache", "omp-bundler", "assets");
+  const stampPath = join(root, ".stamp");
+  let stamp = "";
+  try {
+    stamp = await readFile(stampPath, "utf8");
+  } catch {
+    // Missing stamp: extract below.
+  }
+  if (stamp !== BUILD_ID) {
+    await rm(root, { recursive: true, force: true });
+    await mkdir(root, { recursive: true });
+    for (const [assetPath, content] of Object.entries(EMBEDDED_ASSETS)) {
+      const target = join(root, assetPath);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, content);
+    }
+    await writeFile(stampPath, BUILD_ID);
+  }
+  materializedRoot = root;
+  return root;
+}
 
 /** Resolve a file shipped with this npm package, independent of process.cwd(). */
-export function resolvePackagedAsset(
+export async function resolvePackagedAsset(
   assetPath: string,
   moduleUrl = import.meta.url,
-): string {
+): Promise<string> {
   if (!assetPath || isAbsolute(assetPath)) {
     throw new Error(`asset path must be a non-empty relative path: ${assetPath || "<empty>"}`);
   }
-  const packageRoot = resolve(dirname(fileURLToPath(moduleUrl)), "..");
-  const assetsRoot = resolve(packageRoot, "assets");
+  // A compiled binary resolves assets from the embedded copy, extracted to a
+  // real cache directory; the npm package and source tree keep them on disk
+  // next to the module.
+  const assetsRoot = moduleUrl.startsWith("file:///$bunfs/")
+    ? await materializedAssetsRoot()
+    : resolve(packageRootFor(moduleUrl), "assets");
   const resolved = resolve(assetsRoot, assetPath);
   const escaped = relative(assetsRoot, resolved);
   if (escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) {
@@ -24,7 +72,7 @@ export async function requirePackagedAsset(
   assetPath: string,
   moduleUrl = import.meta.url,
 ): Promise<string> {
-  const resolved = resolvePackagedAsset(assetPath, moduleUrl);
+  const resolved = await resolvePackagedAsset(assetPath, moduleUrl);
   try {
     await access(resolved);
   } catch (error) {

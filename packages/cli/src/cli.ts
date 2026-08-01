@@ -118,10 +118,16 @@ function reportError(io: CliIO, message: string): number {
 }
 
 function isInvokedAsCli(): boolean {
+  const moduleUrl = import.meta.url;
+  if (moduleUrl.startsWith("file:///$bunfs/")) {
+    // Standalone compiled binary: this module is always the entrypoint and
+    // its URL is a virtual path that realpathSync cannot resolve.
+    return true;
+  }
   const invokedPath = process.argv[1];
   if (!invokedPath) return false;
   try {
-    return realpathSync(invokedPath) === realpathSync(fileURLToPath(import.meta.url));
+    return realpathSync(invokedPath) === realpathSync(fileURLToPath(moduleUrl));
   } catch {
     return false;
   }
