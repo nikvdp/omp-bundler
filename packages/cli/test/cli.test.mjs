@@ -810,6 +810,60 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
   });
 });
 
+test("run --agents validates bindings against the same alternate collection as build", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const alternate = join(parent, "alternate-agents");
+    await writeText(join(alternate, "beta", ".omp", "AGENTS.md"), "# beta\n");
+    await writeText(join(alternate, "beta", ".omp", "config.yml"), "setupVersion: 1\n");
+    for (const surface of ["agents", "commands", "extensions", "skills", "tools"]) {
+      await mkdir(join(alternate, "beta", ".omp", surface), { recursive: true });
+    }
+
+    const betaEnv = join(bundle, "beta.env");
+    await writeText(betaEnv, runtimeEnv("beta"));
+
+    const buildReport = await validateBundle({ cwd: bundle, agentsDirOverride: alternate });
+    assert.equal(buildReport.ok, true);
+    assert.deepEqual(buildReport.agents.map((agent) => agent.id), ["beta"]);
+
+    const rejected = await invoke(runCommand, bundle, [], { "env-file": betaEnv, "dry-run": true });
+    assert.equal(rejected.result, 1);
+    assert.match(rejected.stderr, /references 'beta', which is not a direct child of the effective agent collection/);
+
+    const passed = await invoke(runCommand, bundle, [], { "env-file": betaEnv, agents: alternate, "dry-run": true });
+    assert.equal(passed.result, 0);
+    assert.equal(passed.stderr, "");
+    assert.equal(
+      passed.stdout.trim(),
+      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${betaEnv} bundle:local`,
+    );
+
+    const alphaEnv = join(bundle, "alpha.env");
+    await writeText(alphaEnv, runtimeEnv("alpha"));
+    const defaulted = await invoke(runCommand, bundle, [], { "env-file": alphaEnv, "dry-run": true });
+    assert.equal(defaulted.result, 0);
+    assert.equal(defaulted.stderr, "");
+
+    const missing = await invoke(runCommand, bundle, [], { "env-file": alphaEnv, agents: join(parent, "no-such-agents"), "dry-run": true });
+    assert.equal(missing.result, 1);
+    assert.match(missing.stderr, /agent collection is missing/);
+
+    const filePath = join(parent, "not-a-directory");
+    await writeText(filePath, "plain file\n");
+    const fileOverride = await invoke(runCommand, bundle, [], { "env-file": alphaEnv, agents: filePath, "dry-run": true });
+    assert.equal(fileOverride.result, 1);
+    assert.match(fileOverride.stderr, /agent collection must be a directory/);
+
+    const invalid = join(parent, "invalid-agents");
+    await writeText(join(invalid, "stray.txt"), "not an agent\n");
+    const invalidOverride = await invoke(runCommand, bundle, [], { "env-file": alphaEnv, agents: invalid, "dry-run": true });
+    assert.equal(invalidOverride.result, 1);
+    assert.match(invalidOverride.stderr, /every direct child of agentsDir must be an agent directory/);
+  });
+});
+
 test("run maps SIGTERM to Docker SIGINT, keeps SIGINT unchanged, and waits for close", async () => {
   await withTempDirectory(async (parent) => {
     const startedPath = join(parent, "docker-started");
