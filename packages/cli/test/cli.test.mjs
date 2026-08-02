@@ -133,6 +133,7 @@ async function createEntrypointHarness(root) {
   const homeDir = join(root, "entrypoint-home");
   const orphanSweep = join(root, "orphan-sweep.ts");
   const coreServer = join(root, "core-server.ts");
+  const httpServer = join(root, "http-server.ts");
   const pumbleServer = join(root, "pumble-server.ts");
   const ambientExtension = join(root, "ambient-ingest-extension.ts");
   await mkdir(binDir, { recursive: true });
@@ -140,6 +141,7 @@ async function createEntrypointHarness(root) {
   await writeText(join(homeDir, ".omp", "agent", "models.yml.tmpl"), "{}\n");
   await writeText(orphanSweep, "export {};\n");
   await writeText(coreServer, "export {};\n");
+  await writeText(httpServer, "export {};\n");
   await writeText(pumbleServer, "export {};\n");
   await writeText(ambientExtension, "export {};\n");
   await writeFile(
@@ -168,6 +170,7 @@ if (args[0]?.endsWith("/render-models.ts")) {
         OMP_BUILD_DIR: buildDir,
         OMP_ORPHAN_SWEEP: orphanSweep,
         OMP_CORE_SERVER: coreServer,
+        OMP_HTTP_SERVER: httpServer,
         OMP_PUMBLE_SERVER: pumbleServer,
         OMP_AMBIENT_EXTENSION: ambientExtension,
         OMP_CHILD_REGISTRY_PATH: join(dataDir, "child-registry.json"),
