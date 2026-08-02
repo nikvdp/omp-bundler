@@ -31,8 +31,8 @@ Confirm that it is available:
 omp-bundler --version
 ```
 
-Docker is required to build and run images. Model and adapter credentials are
-not required until runtime.
+Docker is required to build and run images. Model credentials are runtime
+inputs; the default HTTP adapter needs no platform credentials.
 
 ## Quick start
 
@@ -56,19 +56,26 @@ omp-bundler check
 omp-bundler build
 ```
 
-To connect a Pumble application to the agent, generate its runtime template:
+Create the local runtime file, fill the model authentication values, and run:
 
 ```bash
-omp-bundler generate adapter pumble --agent my-agent
 cp runtime.env.example runtime.env
 $EDITOR runtime.env
-```
-
-Run the bundle:
-
-```bash
 omp-bundler run --env-file runtime.env
 ```
+
+Send a turn through the default HTTP adapter:
+
+```bash
+curl -X POST \
+  http://localhost:8765/v1/agents/my-agent/conversations/local/messages \
+  -H 'content-type: application/json' \
+  -d '{"message":"What can you help me with?"}'
+```
+
+The request waits for the completed turn and returns JSON containing `text`,
+`attachments`, and `usage`. Pumble is optional; generate its template only
+when this bundle will receive Pumble events.
 
 The complete development loop is:
 
@@ -593,31 +600,39 @@ runtime, not while building the image.
 
 ## Runtime configuration
 
-`new` creates `runtime.env.example` with the standard authentication fields:
+`new` creates `runtime.env.example` with HTTP mode and standard authentication
+fields:
 
 ```env
+OMP_BUNDLER_ADAPTER=http
+OMP_HTTP_API_TOKEN=
 OMP_AUTH_BROKER_URL=
 OMP_AUTH_BROKER_TOKEN=
 ```
 
-The documented standard runtime uses the OMP auth broker, so both values are
-required when running the bundle. They must identify a broker reachable from
-inside the container. Agent files select models but never contain
-credentials.
+HTTP is the default bundled adapter. `OMP_HTTP_API_TOKEN` is optional; when
+set, message requests must send `Authorization: Bearer <token>`. Set it, or
+place the adapter behind an authenticated local reverse proxy, before exposing
+port 8765 outside a trusted development machine.
 
-Generate an adapter template before making a local runtime file. For Pumble:
+The documented model-authentication path uses the OMP auth broker. Supply both
+broker values together, or omit both and use the selected provider's direct
+runtime credentials. Agent files select models but never contain credentials.
+
+For a Pumble deployment, generate its fields before making the local file:
 
 ```bash
 omp-bundler generate adapter pumble --agent my-agent
 cp runtime.env.example runtime.env
 ```
 
-Fill `runtime.env` with deployment values. It is ignored by Git.
+The generator changes `OMP_BUNDLER_ADAPTER` to `pumble` and merges the
+required Pumble fields. Fill `runtime.env` with deployment values; it is
+ignored by Git.
 
-Direct provider credentials are an alternative advanced authentication mode,
-not an addition to the standard broker mode. Their names depend on the
-selected OMP provider, so there is no universal list of provider-key variables.
-They remain runtime inputs and are never build inputs.
+Direct provider credential names depend on the selected OMP provider, so
+there is no universal list. They remain runtime inputs and are never build
+inputs.
 
 ## Run
 
@@ -675,6 +690,46 @@ docker run --rm \
   my-bundle:local
 ```
 
+### Default HTTP API
+
+The public adapter listens on `adapterPort` (8765 by default):
+
+```text
+GET  /health
+POST /v1/agents/<agent-id>/conversations/<conversation-key>/messages
+```
+
+Percent-encode the agent ID and conversation key when constructing the URL.
+The conversation key is stable client-owned session identity. The request
+body is deliberately smaller than an OpenAI chat-completions request:
+
+```json
+{ "message": "Summarize today's meeting" }
+```
+
+A successful request waits for the terminal core event and returns:
+
+```json
+{
+  "agentId": "my-agent",
+  "conversationKey": "local",
+  "correlationId": "opaque-core-id",
+  "text": "The meeting covered...",
+  "attachments": [],
+  "usage": {
+    "input": 120,
+    "output": 42,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "costUsd": 0
+  }
+}
+```
+
+Only one turn may be in flight per agent/conversation pair. Concurrent turns
+return HTTP 409. Agent errors return HTTP 502; turn timeouts return HTTP 504.
+This is a session-oriented agent API like agent's, not an OpenAI-compatible API.
+
 No `OMP_ARGS` value is required for normal operation. Flags such as
 `--no-tools` and short `--max-time` values belong to deliberate diagnostics,
 not the default runtime instructions.
@@ -715,45 +770,42 @@ If an adapter names an agent directory that was not baked into the image, the
 container fails before accepting traffic and reports the adapter ID, agent ID,
 and expected path.
 
-## Multiple adapters
+## Bundled adapters and explicit registrations
 
-`PUMBLE_AGENT_ID` covers the common case of one bundled Pumble application
-routed to one agent.
+`OMP_BUNDLER_ADAPTER` selects the one adapter process supervised beside core:
 
-The two modes are mutually exclusive. When `OMP_ADAPTERS` is unset, the
-entrypoint synthesizes the single bundled Pumble registration using
-`PUMBLE_AGENT_ID`. When `OMP_ADAPTERS` is set, that explicit array is
-authoritative and no registration is synthesized from `PUMBLE_AGENT_ID`.
+- `http` (default) registers every agent baked into the image and exposes the
+  session-oriented HTTP API.
+- `pumble` starts the Pumble bridge and uses `PUMBLE_AGENT_ID` to bind one
+  Pumble application to one baked agent.
 
-Use runtime `OMP_ADAPTERS` when core must accept registrations from multiple
-adapter instances or custom adapters. In a Docker `--env-file`, write the
-entire JSON array on one line with no surrounding shell quotes:
+When `OMP_ADAPTERS` is unset, the entrypoint synthesizes registrations for the
+selected mode. In HTTP mode each agent receives its own internal adapter ID,
+callback path, and an ephemeral core shared secret. In Pumble mode the
+registration uses the generated Pumble fields.
+
+Advanced deployments may provide `OMP_ADAPTERS` directly. In a Docker
+`--env-file`, write the complete JSON array on one line without shell quotes.
+An HTTP registration callback includes its agent ID:
 
 ```env
-OMP_ADAPTERS=[{"adapterId":"first-adapter","callbackUrl":"http://127.0.0.1:8765/core/events","sharedSecret":"first-secret","agentId":"my-agent"},{"adapterId":"second-adapter","callbackUrl":"http://127.0.0.1:8765/core/events","sharedSecret":"second-secret","agentId":"second-agent"}]
+OMP_ADAPTERS=[{"adapterId":"http-my-agent","callbackUrl":"http://127.0.0.1:8765/core/events/my-agent","sharedSecret":"first-secret","agentId":"my-agent"},{"adapterId":"http-second-agent","callbackUrl":"http://127.0.0.1:8765/core/events/second-agent","sharedSecret":"second-secret","agentId":"second-agent"}]
 ```
 
-Then validate and run it:
+Then validate and run:
 
 ```bash
 omp-bundler check --env-file runtime.env
 omp-bundler run --env-file runtime.env
 ```
 
-Each registration binds an already-running adapter instance to a
-filesystem-defined agent. Platform-specific credentials configure those
-adapter processes separately. The generated Pumble fields configure the one
-bundled Pumble adapter; they do not create multiple Pumble applications.
-
-The omp-bundler image starts the one bundled Pumble adapter. Deploying
-additional platform adapter processes, including another Pumble application,
-is outside the `omp-bundler run` command; those processes have their own
-platform-specific startup and credential configuration.
-
-`OMP_ADAPTERS` belongs in runtime deployment configuration. It does not
-declare agents. The direct children of `agentsDir` declare agents, and
-`check --env-file` rejects registrations that name any other ID. There is no
+Each registration binds an adapter callback to an existing filesystem agent.
+`OMP_ADAPTERS` never declares agents; direct children of `agentsDir` do that.
+`check --env-file` rejects registrations naming any other ID. There is no
 `OMP_AGENTS` variable.
+
+The selected bundled process is the only adapter process started by the image.
+Additional external adapters have their own deployment and credentials.
 
 ## CLI reference
 
