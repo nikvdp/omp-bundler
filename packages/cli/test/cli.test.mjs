@@ -1617,6 +1617,7 @@ test("set-model template, editor, wizard, direct flags, and legacy migration are
     const template = await invoke(setModelCommand, bundle, ["alpha"], { "print-template": true });
     assert.equal(template.result, 0);
     assert.equal(await exists(join(bundle, "models", "alpha.yml")), false);
+    assert.match(template.stdout, /templates for baseUrl, model, and apiKey/);
     const editedYaml = "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: edited\napiKey: \"\"\n# edited\n";
     const capturedTemplate = join(parent, "editor-template.yml");
     const editor = await writeEditorScript(parent, "editor", `const fs = require("node:fs"); const target = process.argv[2]; fs.writeFileSync(${JSON.stringify(capturedTemplate)}, fs.readFileSync(target)); fs.writeFileSync(target, ${JSON.stringify(editedYaml)});`);
@@ -1664,6 +1665,21 @@ test("model validation rejects ownership and YAML boundaries without exposing se
     report = await validateBundle({ cwd: bundle });
     assert.equal(report.ok, false);
     assert(report.errors.every((entry) => !entry.message.includes("secret-value")));
+    const malformedSecret = "malformed-parser-secret";
+    const malformedSource = String.raw`version: 1
+baseUrl: https://api.test/v1
+dialect: openai-responses
+model: valid
+apiKey: "${malformedSecret}\q"
+`;
+    await writeText(join(bundle, "models", "alpha.yml"), malformedSource);
+    report = await validateBundle({ cwd: bundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.message.includes("invalid quoted scalar")));
+    assert(report.errors.every((entry) => !entry.message.includes(malformedSecret)));
+    const checked = await invoke(checkCommand, bundle, []);
+    assert.equal(checked.result, 1);
+    assert.doesNotMatch(`${checked.stdout}\n${checked.stderr}`, new RegExp(malformedSecret));
     await seedModel(bundle, "alpha", { model: "${MODEL_NAME}", apiKey: "${MODEL_KEY}" });
     report = await validateBundle({ cwd: bundle });
     assert.equal(report.ok, true);
@@ -1693,6 +1709,27 @@ test("set-model editor preserves unchanged files and failure or cancellation nev
     const runtimeBefore = await readFile(runtimePath, "utf8");
     const invalid = await writeEditorScript(parent, "invalid", 'require("node:fs").writeFileSync(process.argv[2], "version: 1\\nbaseUrl: https://api.test/v1\\ndialect: unknown\\nmodel: invalid\\napiKey: \\"\\"\\n");');
     await assert.rejects(() => withEditor(invalid, () => invoke(setModelCommand, bundle, ["alpha"])), /dialect/);
+    assert.equal(await readFile(modelPath, "utf8"), before);
+    assert.equal(await readFile(configPath, "utf8"), configBefore);
+    assert.equal(await readFile(runtimePath, "utf8"), runtimeBefore);
+    assert.deepEqual(await transactionArtifacts(bundle), []);
+    const malformedSecret = "malformed-editor-secret";
+    const malformedSource = String.raw`version: 1
+baseUrl: https://api.test/v1
+dialect: openai-responses
+model: valid
+apiKey: "${malformedSecret}\q"
+`;
+    const malformed = await writeEditorScript(parent, "malformed", `require("node:fs").writeFileSync(process.argv[2], ${JSON.stringify(malformedSource)});`);
+    let malformedError;
+    try {
+      await withEditor(malformed, () => invoke(setModelCommand, bundle, ["alpha"]));
+    } catch (error) {
+      malformedError = error;
+    }
+    assert(malformedError instanceof Error);
+    assert.match(malformedError.message, /invalid quoted scalar/);
+    assert.doesNotMatch(malformedError.message, new RegExp(malformedSecret));
     assert.equal(await readFile(modelPath, "utf8"), before);
     assert.equal(await readFile(configPath, "utf8"), configBefore);
     assert.equal(await readFile(runtimePath, "utf8"), runtimeBefore);
