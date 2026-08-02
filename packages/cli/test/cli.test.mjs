@@ -20,9 +20,10 @@ import {
   generateCommand,
   handlerContext,
   newCommand,
+  runCommand,
   PACKAGE_ASSET_PATHS,
   removeDockerContext,
-  runCommand,
+  setModelCommand,
   stageDockerContext,
   stagePackagedAssets,
 } from "../src/index.ts";
@@ -34,6 +35,7 @@ import {
   runPreviewCommand,
   validateBundle,
 } from "../src/commands/index.ts";
+import { parseYaml } from "../src/config.ts";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const ENTRYPOINT = join(REPO_ROOT, "entrypoint", "entrypoint.sh");
@@ -108,6 +110,21 @@ function captureIO() {
 
 async function invoke(handler, cwd, positionals, options = {}) {
   const capture = captureIO();
+  const result = await handler(
+    commandArgs(positionals, options),
+    handlerContext(cwd, capture.io),
+  );
+  return { result, stdout: capture.stdout(), stderr: capture.stderr() };
+}
+
+async function invokeWithInput(handler, cwd, positionals, options, input) {
+  const capture = captureIO();
+  capture.io.stdin = Readable.from((async function* () {
+    for (const line of input.matchAll(/[^\n]*\n/g)) {
+      yield line[0];
+      await delay(1);
+    }
+  })());
   const result = await handler(
     commandArgs(positionals, options),
     handlerContext(cwd, capture.io),
@@ -255,6 +272,51 @@ function runtimeEnv(agentId = "alpha") {
     `PUMBLE_AGENT_ID=${agentId}`,
     "",
   ].join("\n");
+}
+
+function quoteYamlValue(value) {
+  if (value === "") return '""';
+  if (/^[A-Za-z0-9_./:@+-]+$/.test(value) && !/^(?:true|false|null|~)$/i.test(value)) return value;
+  return JSON.stringify(value);
+}
+
+/** Write a valid <agentId>.yml under models/ for an effective agent. */
+async function seedModel(root, agentId, overrides = {}) {
+  const baseUrl = overrides.baseUrl ?? "https://api.test.example/v1";
+  const dialect = overrides.dialect ?? "openai-responses";
+  const model = overrides.model ?? "gpt-test";
+  const apiKey = overrides.apiKey ?? "";
+  await writeText(join(root, "models", `${agentId}.yml`), [
+    "version: 1",
+    `baseUrl: ${quoteYamlValue(baseUrl)}`,
+    `dialect: ${dialect}`,
+    `model: ${quoteYamlValue(model)}`,
+    `apiKey: ${apiKey === "" ? '""' : quoteYamlValue(apiKey)}`,
+    "",
+  ].join("\n"));
+}
+
+/** Run an async callback with process.env.EDITOR pointed at a fake node editor. */
+async function withEditor(editorPath, callback) {
+  const previousEditor = process.env.EDITOR;
+  const previousVisual = process.env.VISUAL;
+  process.env.EDITOR = editorPath;
+  delete process.env.VISUAL;
+  try {
+    return await callback();
+  } finally {
+    if (previousEditor === undefined) delete process.env.EDITOR;
+    else process.env.EDITOR = previousEditor;
+    if (previousVisual === undefined) delete process.env.VISUAL;
+    else process.env.VISUAL = previousVisual;
+  }
+}
+
+/** A fake npm/js editor script that rewrites its argument (or exits). */
+async function writeEditorScript(parent, name, body) {
+  const script = join(parent, name);
+  await writeFile(script, `#!${process.execPath}\n${body}`, { mode: 0o755 });
+  return script;
 }
 
 test("entrypoint removes stale durable .omp trees while preserving workspaces", async () => {
@@ -461,11 +523,10 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
     );
 
     await assert.rejects(
-      () => invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]),
+      () => invoke(setModelCommand, bundle, ["alpha"], { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "acme/model-v1" }),
       /symlinked path component/,
     );
-    const configPath = join(realBundle, "agents", "alpha", "config.yml");
-    assert.doesNotMatch(await readFile(configPath, "utf8"), /default: acme\/model-v1/);
+    assert.equal(await exists(join(realBundle, "models", "alpha.yml")), false);
 
     await assert.rejects(
       () => invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]),
@@ -496,9 +557,10 @@ test("generate, model, rename, and destroy reject an existing bundle reached thr
       /symlinked path component/,
     );
     await assert.rejects(
-      () => invoke(agentCommand, nested, ["model", "alpha", "acme/model-v1"]),
+      () => invoke(setModelCommand, nested, ["alpha"], { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "acme/model-v1" }),
       /symlinked path component/,
     );
+
     assert.equal(
       await exists(join(realBundle, "agents", "alpha", "tools", "lookup-record.ts")),
       false,
@@ -558,8 +620,8 @@ test("mutation commands pass on a physical bundle path with a macOS-style alias 
       true,
     );
 
-    await invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]);
-    assert.match(await readFile(join(bundle, "agents", "alpha", "config.yml"), "utf8"), /default: acme\/model-v1/);
+    await invoke(setModelCommand, bundle, ["alpha"], { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "acme/model-v1" });
+    assert.match(await readFile(join(bundle, "models", "alpha.yml"), "utf8"), /model: acme\/model-v1/);
 
     await invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]);
     assert.equal(await exists(join(bundle, "agents", "renamed")), true);
@@ -653,19 +715,21 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
     );
     await writeText(envExample, before);
 
-    await invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]);
-    const configPath = join(bundle, "agents", "alpha", "config.yml");
-    assert.match(await readFile(configPath, "utf8"), /default: acme\/model-v1/);
+    await invoke(setModelCommand, bundle, ["alpha"], { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "acme/model-v1" });
+    const modelPath = join(bundle, "models", "alpha.yml");
+    assert.match(await readFile(modelPath, "utf8"), /model: acme\/model-v1/);
     await writeText(join(bundle, "agents", "alpha", "notes.txt"), "alpha custom state\n");
     const ignoredRuntime = join(bundle, "runtime.env");
     await writeText(ignoredRuntime, "PUMBLE_AGENT_ID=alpha\n");
 
     const renamed = await invoke(agentCommand, bundle, ["rename", "alpha", "renamed"]);
     assert.match(renamed.stdout, /manual reference/);
+    assert.equal(await exists(join(bundle, "models", "alpha.yml")), false);
+    assert.equal(await exists(join(bundle, "models", "renamed.yml")), true);
+    assert.match(await readFile(join(bundle, "models", "renamed.yml"), "utf8"), /model: acme\/model-v1/);
     assert.equal(await exists(join(bundle, "agents", "alpha")), false);
     assert.equal(await exists(join(bundle, "agents", "renamed", "notes.txt")), true);
     assert.equal(await readFile(join(bundle, "agents", "renamed", "notes.txt"), "utf8"), "alpha custom state\n");
-    assert.match(await readFile(join(bundle, "agents", "renamed", "config.yml"), "utf8"), /default: acme\/model-v1/);
     assert.match(await readFile(envExample, "utf8"), /PUMBLE_AGENT_ID=renamed/);
     assert.equal(await readFile(ignoredRuntime, "utf8"), "PUMBLE_AGENT_ID=alpha\n");
     assert.deepEqual(await transactionArtifacts(bundle), []);
@@ -747,6 +811,7 @@ test("check accepts the default HTTP adapter without Pumble fields", async () =>
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(parent, "runtime.env");
     await writeText(
       envPath,
@@ -796,6 +861,7 @@ test("check accepts complete explicit adapters without PUMBLE_AGENT_ID", async (
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(parent, "explicit-complete.env");
     await writeText(envPath, [
       "OMP_BUNDLER_ADAPTER=pumble",
@@ -821,6 +887,7 @@ test("check keeps synthesized Pumble registration validation unchanged", async (
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(parent, "synthesized.env");
     await writeText(envPath, runtimeEnv("alpha"));
 
@@ -839,6 +906,7 @@ test("check and run reject fixed internal listener overrides in the runtime env 
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(parent, "listener-overrides.env");
     await writeText(envPath, [
       ...runtimeEnv().trim().split("\n"),
@@ -877,6 +945,7 @@ test("check scans normalized credential fields without flagging placeholders or 
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["leaky"], { agent: "alpha" });
     const leaky = join(parent, "leaky");
+    await seedModel(leaky, "alpha");
     const leakyOmp = join(leaky, "agents", "alpha");
     const leakedValues = [
       "json-api-token-literal",
@@ -912,6 +981,7 @@ test("check scans normalized credential fields without flagging placeholders or 
 
     await invoke(newCommand, parent, ["safe"], { agent: "alpha" });
     const safe = join(parent, "safe");
+    await seedModel(safe, "alpha");
     const safeOmp = join(safe, "agents", "alpha");
     await writeText(join(safeOmp, "settings.json"), JSON.stringify({
       api_token: "${API_TOKEN}",
@@ -944,6 +1014,7 @@ test("check rejects credential fallback literals without printing values", async
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["fallback"], { agent: "alpha" });
     const fallback = join(parent, "fallback");
+    await seedModel(fallback, "alpha");
     const fallbackOmp = join(fallback, "agents", "alpha");
     const fallbackValues = [
       "fallback-default",
@@ -981,6 +1052,7 @@ export default () => ({ execute: async () => ({}) });
 
     await invoke(newCommand, parent, ["exact"], { agent: "alpha" });
     const exact = join(parent, "exact");
+    await seedModel(exact, "alpha");
     await writeText(join(exact, "agents", "alpha", "settings.json"), JSON.stringify({
       api_token: "${API_TOKEN}",
       token: "$TOKEN",
@@ -1065,6 +1137,7 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
 
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(bundle, "runtime.env");
     await writeText(envPath, runtimeEnv());
     const dryRun = await invoke(
@@ -1086,12 +1159,15 @@ test("run --agents validates bindings against the same alternate collection as b
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const alternate = join(parent, "alternate-agents");
     await writeText(join(alternate, "beta", "AGENTS.md"), "# beta\n");
     await writeText(join(alternate, "beta", "config.yml"), "setupVersion: 1\n");
     for (const surface of ["agents", "commands", "extensions", "skills", "tools"]) {
       await mkdir(join(alternate, "beta", surface), { recursive: true });
     }
+    await rm(join(bundle, "models", "alpha.yml"));
+    await seedModel(bundle, "beta");
 
     const betaEnv = join(bundle, "beta.env");
     await writeText(betaEnv, runtimeEnv("beta"));
@@ -1111,6 +1187,8 @@ test("run --agents validates bindings against the same alternate collection as b
       passed.stdout.trim(),
       `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${betaEnv} bundle:local`,
     );
+    await seedModel(bundle, "alpha");
+    await rm(join(bundle, "models", "beta.yml"));
 
     const alphaEnv = join(bundle, "alpha.env");
     await writeText(alphaEnv, runtimeEnv("alpha"));
@@ -1140,6 +1218,7 @@ test("check requires distinct run host ports and keeps valid defaults and custom
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(bundle, "runtime.env");
     await writeText(envPath, runtimeEnv());
     const configPath = join(bundle, "omp-bundler.yml");
@@ -1203,6 +1282,7 @@ setTimeout(() => process.exit(2), 1000);
 
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const envPath = join(bundle, "runtime.env");
     await writeText(envPath, runtimeEnv());
 
@@ -1272,7 +1352,7 @@ test("source commands reject a direct legacy .omp agent layout", async () => {
       /nested \.omp directory/,
     );
     await assert.rejects(
-      () => invoke(agentCommand, bundle, ["model", "alpha", "acme/model-v1"]),
+      () => invoke(setModelCommand, bundle, ["alpha"], { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "acme/model-v1" }),
       /nested \.omp directory/,
     );
 
@@ -1314,8 +1394,10 @@ test("migrate visible-layout is confirmation-gated, promotes legacy children, an
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     const { agentRoot, omp } = await createLegacyAgent(bundle, "beta");
     await writeText(join(agentRoot, "settings.json"), JSON.stringify({ note: "visible state" }));
+    await seedModel(bundle, "beta");
 
     // Non-interactive runs without --yes refuse before any mutation.
     await assert.rejects(
@@ -1412,14 +1494,16 @@ test("build stages visible agent roots into .omp destination wrappers", async ()
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
     await invoke(generateCommand, bundle, ["tool", "alpha", "lookup-record"]);
+    const bundleBeforeBuild = await snapshotTree(bundle);
 
     const capturePath = join(parent, "docker-capture.json");
     const dockerPath = join(parent, "docker");
     await writeFile(
       dockerPath,
       `#!${process.execPath}
-const { readdirSync, statSync, writeFileSync } = require("node:fs");
+const { readdirSync, statSync, readFileSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const contextPath = process.argv[process.argv.length - 1];
 const files = [];
@@ -1431,7 +1515,13 @@ const walk = (directory) => {
   }
 };
 walk(contextPath);
-writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), files }));
+writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
+  args: process.argv.slice(2),
+  files,
+  models: null,
+  template: readFileSync(join(contextPath, "template", "models.yml.tmpl"), "utf8"),
+  config: readFileSync(join(contextPath, "agents", "alpha", ".omp", "config.yml"), "utf8"),
+}));
 `,
       { mode: 0o755 },
     );
@@ -1455,8 +1545,381 @@ writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.arg
     assert(captured.files.includes(join("agents", "alpha", ".omp", "tools", "lookup-record.ts")));
     assert.equal(captured.files.includes(join("agents", "alpha", "AGENTS.md")), false);
     assert(captured.files.includes("Dockerfile"));
+    assert.equal(parseYaml(captured.config).modelRoles.default, "omp-bundler-alpha/gpt-test");
+    assert.deepEqual(parseYaml(captured.template), {
+      providers: {
+        "omp-bundler-alpha": {
+          baseUrl: "https://api.test.example/v1",
+          api: "openai-responses",
+          models: [{ id: "gpt-test", name: "gpt-test" }],
+          auth: "none",
+        },
+      },
+    });
+    assert.equal((await readFile(join(assetsPath, "template", "models.yml.tmpl"), "utf8")).trim(), "providers: {}");
+    assert.equal(captured.files.some((path) => path.startsWith("models/")), false);
+    assert.equal(captured.files.some((path) => /alias/i.test(path)), false);
+    assert.deepEqual(await snapshotTree(bundle), bundleBeforeBuild);
   });
   } finally {
     if (!assetsPreExisted) await rm(assetsPath, { recursive: true, force: true });
   }
+});
+
+test("set-model help and agent inference cover zero, single, and multiple agents", async () => {
+  const help = await invoke(setModelCommand, process.cwd(), [], { help: true });
+  assert.equal(help.result, 0);
+  assert.match(help.stdout, /set-model \[agent-id\]/);
+  assert.match(help.stdout, /--base-url <value>/);
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["empty"]);
+    await assert.rejects(() => invoke(setModelCommand, join(parent, "empty"), [], {
+      "base-url": "https://api.test/v1", dialect: "openai-responses", model: "test",
+    }), /no agents found/);
+    await invoke(newCommand, parent, ["one"], { agent: "alpha" });
+    const one = join(parent, "one");
+    await invoke(setModelCommand, one, [], {
+      "base-url": "https://api.test/v1", dialect: "openai-responses", model: "test",
+    });
+    assert.equal(await exists(join(one, "models", "alpha.yml")), true);
+    await mkdir(join(one, "agents", "beta"));
+    await assert.rejects(() => invoke(setModelCommand, one, [], {
+      "base-url": "https://api.test/v1", dialect: "openai-responses", model: "test",
+    }), /multiple agents found \(alpha, beta\)/);
+  });
+  for (const field of ["base-url", "dialect", "model", "api-key"]) assert.match(help.stdout, new RegExp(`--${field} <value>`));
+});
+
+test("set-model template, editor, wizard, direct flags, and legacy migration are transactional", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const template = await invoke(setModelCommand, bundle, ["alpha"], { "print-template": true });
+    assert.equal(template.result, 0);
+    assert.equal(await exists(join(bundle, "models", "alpha.yml")), false);
+    const editedYaml = "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: edited\napiKey: \"\"\n# edited\n";
+    const capturedTemplate = join(parent, "editor-template.yml");
+    const editor = await writeEditorScript(parent, "editor", `const fs = require("node:fs"); const target = process.argv[2]; fs.writeFileSync(${JSON.stringify(capturedTemplate)}, fs.readFileSync(target)); fs.writeFileSync(target, ${JSON.stringify(editedYaml)});`);
+    await withEditor(editor, () => invoke(setModelCommand, bundle, ["alpha"]));
+    assert.equal(await readFile(capturedTemplate, "utf8"), template.stdout);
+    assert.equal(await readFile(join(bundle, "models", "alpha.yml"), "utf8"), editedYaml);
+    const direct = join(parent, "direct");
+    const wizard = join(parent, "wizard");
+    await invoke(newCommand, parent, ["direct"], { agent: "alpha" });
+    await invoke(newCommand, parent, ["wizard"], { agent: "alpha" });
+    const flags = { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "same-model", "api-key": "secret" };
+    await invoke(setModelCommand, direct, ["alpha"], flags);
+    const prompted = await invokeWithInput(setModelCommand, wizard, ["alpha"], { wizard: true }, "https://api.test/v1\nopenai-responses\nsame-model\nsecret\n");
+    assert.equal(prompted.result, 0);
+    const directModel = parseYaml(await readFile(join(direct, "models", "alpha.yml"), "utf8"));
+    assert.deepEqual(directModel, {
+      version: 1,
+      baseUrl: "https://api.test/v1",
+      dialect: "openai-responses",
+      model: "same-model",
+      apiKey: "secret",
+    });
+    assert.deepEqual(parseYaml(await readFile(join(wizard, "models", "alpha.yml"), "utf8")), directModel);
+    assert.doesNotMatch(prompted.stdout, /secret/);
+    assert.doesNotMatch(prompted.stderr, /secret/);
+    await writeText(join(direct, "agents", "alpha", "config.yml"), "# keep\nmodelRoles:\n  default: old\n  other: sibling\n");
+    await invoke(setModelCommand, direct, ["alpha"], { model: "changed" });
+    assert.equal(await readFile(join(direct, "agents", "alpha", "config.yml"), "utf8"), "# keep\nmodelRoles:\n  other: sibling\n");
+    await assert.rejects(() => invoke(setModelCommand, direct, ["alpha"], { wizard: true, model: "nope" }), /mutually exclusive/);
+    await assert.rejects(() => invoke(setModelCommand, direct, ["alpha"], { unknown: "nope" }), /unknown option/);
+  });
+});
+
+test("model validation rejects ownership and YAML boundaries without exposing secrets", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await writeText(join(bundle, "models", "beta.yml"), "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: x\napiKey: secret-value\n");
+    let report = await validateBundle({ cwd: bundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.path.endsWith("models/beta.yml")));
+    assert(report.errors.every((entry) => !entry.message.includes("secret-value")));
+    await rm(join(bundle, "models", "beta.yml"));
+    await writeText(join(bundle, "models", "alpha.yml"), "version: nope\napiKey: secret-value\n");
+    report = await validateBundle({ cwd: bundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.every((entry) => !entry.message.includes("secret-value")));
+    await seedModel(bundle, "alpha", { model: "${MODEL_NAME}", apiKey: "${MODEL_KEY}" });
+    report = await validateBundle({ cwd: bundle });
+    assert.equal(report.ok, true);
+  });
+});
+
+test("set-model editor preserves unchanged files and failure or cancellation never mutates", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    const modelPath = join(bundle, "models", "alpha.yml");
+    const before = await readFile(modelPath, "utf8");
+    const unchanged = await writeEditorScript(parent, "unchanged", "");
+    const result = await withEditor(unchanged, () => invoke(setModelCommand, bundle, ["alpha"]));
+    assert.equal(result.result, 0);
+    assert.equal(await readFile(modelPath, "utf8"), before);
+    for (const [name, code] of [["failed", 1], ["cancelled", 130]]) {
+      const editor = await writeEditorScript(parent, name, `process.exit(${code});`);
+      await assert.rejects(() => withEditor(editor, () => invoke(setModelCommand, bundle, ["alpha"])), new RegExp(`exited with code ${code}`));
+      assert.equal(await readFile(modelPath, "utf8"), before);
+    }
+    const configPath = join(bundle, "agents", "alpha", "config.yml");
+    const runtimePath = join(bundle, "runtime.env.example");
+    await writeText(configPath, "setupVersion: 1\n# preserve\nmodelRoles:\n  default: legacy/provider\n  other: sibling/provider\n");
+    const configBefore = await readFile(configPath, "utf8");
+    const runtimeBefore = await readFile(runtimePath, "utf8");
+    const invalid = await writeEditorScript(parent, "invalid", 'require("node:fs").writeFileSync(process.argv[2], "version: 1\\nbaseUrl: https://api.test/v1\\ndialect: unknown\\nmodel: invalid\\napiKey: \\"\\"\\n");');
+    await assert.rejects(() => withEditor(invalid, () => invoke(setModelCommand, bundle, ["alpha"])), /dialect/);
+    assert.equal(await readFile(modelPath, "utf8"), before);
+    assert.equal(await readFile(configPath, "utf8"), configBefore);
+    assert.equal(await readFile(runtimePath, "utf8"), runtimeBefore);
+    assert.deepEqual(await transactionArtifacts(bundle), []);
+  });
+});
+
+test("model catalog ownership, placeholders, and model runtime staging remain isolated", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha", { apiKey: "${MODEL_KEY}" });
+    const source = await snapshotTree(bundle);
+    const env = join(parent, "runtime.env");
+    await writeText(env, "MODEL_KEY=\n");
+    let report = await validateBundle({ cwd: bundle, envFile: env });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.field === "MODEL_KEY"));
+    await writeText(env, "MODEL_KEY=literal-key\n");
+    report = await validateBundle({ cwd: bundle, envFile: env });
+    assert.equal(report.ok, true);
+    assert.deepEqual(await snapshotTree(bundle), source);
+  });
+});
+
+test("runtime example model blocks are exact, idempotent, and preserve Pumble sections", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const runtime = join(bundle, "runtime.env.example");
+    const fresh = "# Bundled adapter. HTTP serves the agent API and omp-tui.\nOMP_BUNDLER_ADAPTER=http\n\n# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.\nOMP_HTTP_API_TOKEN=\n";
+    assert.equal(await readFile(runtime, "utf8"), fresh);
+
+    const alphaOptions = {
+      "base-url": "${ALPHA_URL}",
+      dialect: "openai-responses",
+      model: "alpha",
+      "api-key": "${ALPHA_KEY}",
+    };
+    await invoke(setModelCommand, bundle, ["alpha"], alphaOptions);
+    const alphaHeading = "# Model connection for alpha. Copy this file to runtime.env and fill these values.";
+    const alphaExample = `${fresh}\n${alphaHeading}\nALPHA_KEY=\nALPHA_URL=\n`;
+    assert.equal(await readFile(runtime, "utf8"), alphaExample);
+    await invoke(setModelCommand, bundle, ["alpha"], alphaOptions);
+    assert.equal(await readFile(runtime, "utf8"), alphaExample);
+
+    await writeText(runtime, `${alphaExample}\n# User section\nSENTINEL=keep\n`);
+    await invoke(generateCommand, bundle, ["agent", "beta"]);
+    await invoke(setModelCommand, bundle, ["beta"], {
+      "base-url": "https://api.test/v1",
+      dialect: "openai-completions",
+      model: "beta",
+      "api-key": "${BETA_KEY}",
+    });
+    const betaHeading = "# Model connection for beta. Copy this file to runtime.env and fill these values.";
+    const withBeta = await readFile(runtime, "utf8");
+    const betaBlock = withBeta.slice(withBeta.indexOf(betaHeading));
+    assert.equal(betaBlock, `${betaHeading}\nBETA_KEY=\n`);
+
+    await invoke(setModelCommand, bundle, ["alpha"], {
+      "base-url": "https://api.test/v1",
+      dialect: "openai-responses",
+      model: "alpha",
+      "api-key": "",
+    });
+    const literalAlpha = await readFile(runtime, "utf8");
+    assert.doesNotMatch(literalAlpha, /Model connection for alpha|ALPHA_KEY=|ALPHA_URL=/);
+    assert.match(literalAlpha, /\n# User section\nSENTINEL=keep\n/);
+    assert.equal(literalAlpha.slice(literalAlpha.indexOf(betaHeading)), betaBlock);
+
+    await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
+    const pumbleOnce = await readFile(runtime, "utf8");
+    await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
+    const pumbleTwice = await readFile(runtime, "utf8");
+    assert.equal(pumbleTwice, pumbleOnce);
+    const pumbleHeading = "# Pumble adapter. Fill these values from the Pumble app dashboard, then run the bundle.";
+    assert.equal(pumbleTwice.split(pumbleHeading).length - 1, 1);
+    const pumbleSection = pumbleTwice.slice(pumbleTwice.indexOf(pumbleHeading));
+    await invoke(setModelCommand, bundle, ["alpha"], { model: "alpha-2" });
+    const afterModelUpdate = await readFile(runtime, "utf8");
+    assert.equal(afterModelUpdate.slice(afterModelUpdate.indexOf(pumbleHeading)), pumbleSection);
+  });
+});
+
+test("set-model editor modes, parser boundaries, and ownership failures stay transactional", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const modelPath = join(bundle, "models", "alpha.yml");
+    const runtime = join(bundle, "runtime.env.example");
+    const freshRuntime = await readFile(runtime, "utf8");
+    const untouched = await writeEditorScript(parent, "untouched", "");
+    const fresh = await withEditor(untouched, () => invoke(setModelCommand, bundle, ["alpha"]));
+    assert.match(fresh.stdout, /unchanged models[\\/]alpha\.yml/);
+    assert.equal(await exists(modelPath), false);
+    assert.equal(await readFile(runtime, "utf8"), freshRuntime);
+    await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "agents", "alpha", "config.yml"), "setupVersion: 1\n# before\nmodelRoles:\n  default: legacy\n  sibling: keep\n");
+    await withEditor(untouched, () => invoke(setModelCommand, bundle, ["alpha"]));
+    assert.equal(await readFile(join(bundle, "agents", "alpha", "config.yml"), "utf8"), "setupVersion: 1\n# before\nmodelRoles:\n  sibling: keep\n");
+    await assert.rejects(() => invoke(setModelCommand, bundle, ["alpha"], { "print-template": true, wizard: true }), /mutually exclusive/);
+    await assert.rejects(() => invoke(setModelCommand, bundle, ["alpha"], { "print-template": true, model: "x" }), /mutually exclusive/);
+    await assert.rejects(() => invoke(agentCommand, bundle, ["model", "alpha", "x"]), /unknown/);
+
+    const parserEnv = join(parent, "parser.env");
+    await writeText(parserEnv, "OMP_BUNDLER_ADAPTER=http\nBASE_URL=https://env.test/v1\nMODEL_ID=env-model\nKEY=env-key\n");
+    const accepted = [
+      { baseUrl: "http://localhost:8080/v1", dialect: "openai-responses", model: "literal-model", apiKey: "apiKey: literal-secret" },
+      { baseUrl: "https://api.test/v1", dialect: "openai-completions", model: "${MODEL_ID}", apiKey: 'apiKey: "${KEY}"' },
+      { baseUrl: "${BASE_URL}", dialect: "openai-responses", model: "literal-model", apiKey: undefined },
+      { baseUrl: "https://api.test/v1", dialect: "openai-responses", model: "literal-model", apiKey: "apiKey: null" },
+      { baseUrl: "https://api.test/v1", dialect: "openai-responses", model: "literal-model", apiKey: 'apiKey: ""' },
+    ];
+    for (const model of accepted) {
+      await writeText(modelPath, [
+        "version: 1",
+        `baseUrl: ${JSON.stringify(model.baseUrl)}`,
+        `dialect: ${model.dialect}`,
+        `model: ${JSON.stringify(model.model)}`,
+        ...(model.apiKey === undefined ? [] : [model.apiKey]),
+        "",
+      ].join("\n"));
+      const report = await validateBundle({ cwd: bundle, envFile: parserEnv });
+      assert.equal(report.ok, true, JSON.stringify(report.errors));
+    }
+
+    const rejected = [
+      "version: 1\nbaseUrl: ftp://api.test/v1\ndialect: openai-responses\nmodel: valid\napiKey: \"\"\n",
+      "version: 1\nbaseUrl: https://api.test/v1\ndialect: unknown\nmodel: valid\napiKey: \"\"\n",
+      "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: \"\"\napiKey: \"\"\n",
+      "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: \"${MODEL\"\napiKey: literal-secret\n",
+    ];
+    for (const source of rejected) {
+      await writeText(modelPath, source);
+      const report = await validateBundle({ cwd: bundle, envFile: parserEnv });
+      assert.equal(report.ok, false);
+      assert(report.errors.every((entry) => !entry.message.includes("literal-secret")));
+    }
+
+    await rm(modelPath);
+    let report = await validateBundle({ cwd: bundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.path.endsWith("models/alpha.yml")));
+
+    await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "agents", "alpha", "config.yml"), "setupVersion: 1\nmodelRoles:\n  default: legacy/provider\n");
+    report = await validateBundle({ cwd: bundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => entry.path.endsWith("agents/alpha/config.yml") && entry.field === "modelRoles.default"));
+
+    const linkedDirBundle = join(parent, "linked-dir");
+    await invoke(newCommand, parent, ["linked-dir"], { agent: "alpha" });
+    const outsideModels = join(parent, "outside-models");
+    await mkdir(outsideModels);
+    await writeText(join(outsideModels, "alpha.yml"), "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: linked-dir\napiKey: \"\"\n");
+    await symlink(outsideModels, join(linkedDirBundle, "models"));
+    report = await validateBundle({ cwd: linkedDirBundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => /symlink/.test(entry.message)));
+    const linkedDirRuntime = join(linkedDirBundle, "runtime.env.example");
+    const linkedDirRuntimeBefore = await readFile(linkedDirRuntime, "utf8");
+    const outsideModelsBefore = await snapshotTree(outsideModels);
+    await assert.rejects(() => invoke(setModelCommand, linkedDirBundle, ["alpha"], {
+      "base-url": "https://changed.test/v1", dialect: "openai-responses", model: "changed", "api-key": "",
+    }), /symlink/);
+    assert.deepEqual(await snapshotTree(outsideModels), outsideModelsBefore);
+    assert.equal(await readFile(linkedDirRuntime, "utf8"), linkedDirRuntimeBefore);
+    assert.deepEqual(await transactionArtifacts(linkedDirBundle), []);
+
+    const linkedFileBundle = join(parent, "linked-file");
+    await invoke(newCommand, parent, ["linked-file"], { agent: "alpha" });
+    const outsideModel = join(parent, "outside-alpha.yml");
+    await writeText(outsideModel, "version: 1\nbaseUrl: https://api.test/v1\ndialect: openai-responses\nmodel: linked\napiKey: \"\"\n");
+    await mkdir(join(linkedFileBundle, "models"));
+    await symlink(outsideModel, join(linkedFileBundle, "models", "alpha.yml"));
+    report = await validateBundle({ cwd: linkedFileBundle });
+    assert.equal(report.ok, false);
+    assert(report.errors.some((entry) => /symlink/.test(entry.message)));
+    const linkedFileRuntime = join(linkedFileBundle, "runtime.env.example");
+    const linkedFileRuntimeBefore = await readFile(linkedFileRuntime, "utf8");
+    const outsideModelBefore = await readFile(outsideModel, "utf8");
+    await assert.rejects(() => invoke(setModelCommand, linkedFileBundle, ["alpha"], {
+      "base-url": "https://changed.test/v1", dialect: "openai-responses", model: "changed", "api-key": "",
+    }), /symlink/);
+    assert.equal(await readFile(outsideModel, "utf8"), outsideModelBefore);
+    assert.equal(await readFile(linkedFileRuntime, "utf8"), linkedFileRuntimeBefore);
+    assert.deepEqual(await transactionArtifacts(linkedFileBundle), []);
+  });
+});
+
+test("check and run select runtime env defaults and print exact agent endpoints", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha", { apiKey: "${MODEL_KEY}" });
+
+    const structural = await invoke(checkCommand, bundle, []);
+    assert.equal(structural.result, 0, structural.stderr);
+    const missing = await invoke(runCommand, bundle, []);
+    assert.equal(missing.result, 1);
+    assert.match(missing.stderr, new RegExp(`${join(bundle, "runtime.env").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.match(missing.stderr, /copy runtime\.env\.example/);
+
+    const defaultEnv = join(bundle, "runtime.env");
+    await writeText(defaultEnv, "OMP_BUNDLER_ADAPTER=http\nMODEL_KEY=\n");
+    const invalidDefault = await invoke(checkCommand, bundle, []);
+    assert.equal(invalidDefault.result, 1);
+    assert.match(invalidDefault.stderr, /MODEL_KEY/);
+
+    const explicitEnv = join(parent, "explicit.env");
+    await writeText(explicitEnv, "OMP_BUNDLER_ADAPTER=http\nMODEL_KEY=explicit-key\n");
+    const explicitCheck = await invoke(checkCommand, bundle, [], { "env-file": explicitEnv });
+    assert.equal(explicitCheck.result, 0, explicitCheck.stderr);
+    const explicitRun = await invoke(runCommand, bundle, [], { "env-file": explicitEnv, "dry-run": true });
+    assert.equal(explicitRun.result, 0, explicitRun.stderr);
+    assert.match(explicitRun.stdout, new RegExp(explicitEnv.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+    await writeText(defaultEnv, "OMP_BUNDLER_ADAPTER=http\nMODEL_KEY=default-key\n");
+    const configPath = join(bundle, "omp-bundler.yml");
+    const config = await readFile(configPath, "utf8");
+    assert.match(config, /adapterPort: 8765/);
+    await writeText(configPath, config.replace("adapterPort: 8765", "adapterPort: 9999"));
+
+    const dockerCapture = join(parent, "docker-run.json");
+    await writeFile(
+      join(parent, "docker"),
+      `#!${process.execPath}\nrequire("node:fs").writeFileSync(${JSON.stringify(dockerCapture)}, JSON.stringify(process.argv.slice(2)));\n`,
+      { mode: 0o755 },
+    );
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    let normal;
+    try {
+      normal = await invoke(runCommand, bundle, []);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+    assert.equal(normal.result, 0, normal.stderr);
+    const dockerArgs = JSON.parse(await readFile(dockerCapture, "utf8"));
+    assert.equal(dockerArgs[0], "run");
+    const base = "http://localhost:9999/v1/agents/alpha";
+    const endpoint = `Agent endpoint (available once listening; not a readiness check): ${base}`;
+    const tui = `TUI: omp-tui ${base}`;
+    assert.deepEqual(
+      normal.stdout.split(/\r?\n/).filter((line) => line.startsWith("Agent endpoint") || line.startsWith("TUI:")),
+      [endpoint, tui],
+    );
+  });
 });
