@@ -14,6 +14,8 @@ import {
   newCommand,
   runCommand,
   migrateCommand,
+  setModelCommand,
+  SET_MODEL_HELP,
 } from "./commands/index.ts";
 
 export { type CliIO, type CommandContext, type CommandHandler, type CommandHandlerRegistry } from "./types.ts";
@@ -23,6 +25,7 @@ export const ROOT_COMMANDS = [
   "generate",
   "destroy",
   "agent",
+  "set-model",
   "check",
   "build",
   "run",
@@ -50,10 +53,8 @@ export const COMMAND_HELP: Record<RootCommand, string> = {
     "omp-bundler destroy extension <agent-id> <name> [--dry-run] [--yes]",
     "omp-bundler destroy subagent <agent-id> <name> [--dry-run] [--yes]",
   ].join("\n"),
-  agent: [
-    "omp-bundler agent model <agent-id> <provider/model>",
-    "omp-bundler agent rename <old-agent-id> <new-agent-id>",
-  ].join("\n"),
+  agent: "omp-bundler agent rename <old-agent-id> <new-agent-id>",
+  "set-model": SET_MODEL_HELP,
   check: "omp-bundler check [bundle-path] [--env-file <path>]",
   build: "omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]",
   run: "omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]",
@@ -69,6 +70,7 @@ export const ROOT_HANDLERS: RootCommandHandlerMap = {
   generate: generateCommand,
   destroy: destroyCommand,
   agent: agentCommand,
+  "set-model": setModelCommand,
   check: checkCommand,
   build: buildCommand,
   run: runCommand,

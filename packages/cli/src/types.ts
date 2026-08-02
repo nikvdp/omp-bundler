@@ -36,6 +36,7 @@ export interface CommandHandlerRegistry {
   readonly build?: CommandHandler;
   readonly run?: CommandHandler;
   readonly migrate?: CommandHandler;
+  readonly "set-model"?: CommandHandler;
 }
 
 export type ProjectConfig = Record<string, YamlValue> & {

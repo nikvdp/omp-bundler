@@ -34,6 +34,7 @@ Commands:
   ${COMMAND_HELP.destroy.replaceAll("\n", "\n  ")}
 
   ${COMMAND_HELP.agent.replaceAll("\n", "\n  ")}
+  ${COMMAND_HELP["set-model"].replaceAll("\n", "\n  ")}
 
   ${COMMAND_HELP.check}
   ${COMMAND_HELP.build}

@@ -37,6 +37,7 @@ export {
   generateCommand,
   newCommand,
   runCommand,
+  setModelCommand,
 } from "./commands/index.ts";
 export {
   formatDockerCommand,

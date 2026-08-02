@@ -5,6 +5,7 @@ export { destroyCommand } from "./destroy.ts";
 export { generateCommand } from "./generate.ts";
 export { migrateCommand } from "./migrate.ts";
 export { newCommand } from "./new.ts";
+export { setModelCommand, SET_MODEL_HELP } from "./set-model.ts";
 export {
   CANONICAL_ASSET_PATHS,
   formatDockerCommand,
