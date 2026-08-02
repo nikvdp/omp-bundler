@@ -80,6 +80,7 @@ const URL_ENV_NAMES: Record<string, true> = {
 };
 const CREDENTIAL_ENV_NAMES: Record<string, true> = {
   OMP_AUTH_BROKER_TOKEN: true,
+  OMP_HTTP_API_TOKEN: true,
   OMP_ADAPTERS: true,
   CLIPROXY_API_KEY: true,
   custom-provider_API_KEY: true,
@@ -93,6 +94,8 @@ const CREDENTIAL_ENV_NAMES: Record<string, true> = {
 const FIXED_LISTENER_ENV: Record<string, true> = {
   OMP_HOST: true,
   OMP_PORT: true,
+  OMP_HTTP_HOST: true,
+  OMP_HTTP_PORT: true,
   PUMBLE_BRIDGE_HOST: true,
   PUMBLE_BRIDGE_PORT: true,
 };
@@ -1079,7 +1082,31 @@ function validateRuntimeEnv(
     }
   }
 
+  const adapterMode = value("OMP_BUNDLER_ADAPTER") || "http";
+  if (adapterMode !== "http" && adapterMode !== "pumble") {
+    errors.push(issue(envPath, "OMP_BUNDLER_ADAPTER", "must be 'http' or 'pumble'"));
+    return;
+  }
+  const turnTimeout = value("OMP_HTTP_TURN_TIMEOUT_MS");
+  if (turnTimeout !== undefined) {
+    const parsed = Number(turnTimeout);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      errors.push(issue(envPath, "OMP_HTTP_TURN_TIMEOUT_MS", "must be a positive integer"));
+    }
+  }
+
   const adapters = env.get("OMP_ADAPTERS");
+  if (adapterMode === "http") {
+    if (adapters && adapters.value.trim()) {
+      const adapterLineCount = source.split(/\r?\n/).filter((line) => /^\s*OMP_ADAPTERS\s*=/.test(line)).length;
+      if (adapters.quoted || adapterLineCount !== 1) {
+        errors.push(issue(envPath, "OMP_ADAPTERS", "must be one unquoted JSON array on exactly one env-file line"));
+      }
+      validateAdaptersJson(adapters.value, envPath, agents, errors);
+    }
+    return;
+  }
+
   const pumbleAgent = value("PUMBLE_AGENT_ID");
   for (const required of PUMBLE_REQUIRED) {
     if (!value(required)) errors.push(issue(envPath, required, "is required for bundled Pumble startup; fill runtime.env from the adapter template"));

@@ -147,6 +147,22 @@ function mergePumbleFields(source: string, agentId: string): string {
   const lines = source.split(/\r?\n/);
   let changed = false;
   const additions: string[] = [];
+  const modeMatches: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (envAssignment(lines[index], "OMP_BUNDLER_ADAPTER") !== undefined) {
+      modeMatches.push(index);
+    }
+  }
+  if (modeMatches.length === 0) {
+    additions.push("OMP_BUNDLER_ADAPTER=pumble");
+  } else {
+    for (const index of modeMatches) {
+      if ((envAssignment(lines[index], "OMP_BUNDLER_ADAPTER") ?? "").trim() !== "pumble") {
+        lines[index] = replaceEnvAssignment(lines[index], "pumble");
+        changed = true;
+      }
+    }
+  }
   const fields = [...PUMBLE_RUNTIME_FIELDS, "PUMBLE_AGENT_ID"] as const;
 
   for (const field of fields) {
