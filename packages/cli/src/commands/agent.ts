@@ -1,10 +1,11 @@
-import { lstat } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { optionBoolean } from "../args.ts";
-import { applyFilePlan, createFilePlan, createMovePlan } from "../file-plan.ts";
+import { applyFilePlan, createFilePlan, createMovePlan, createRemovePlan } from "../file-plan.ts";
+import { defaultApiKeyPlaceholder, modelConfigPath } from "../model-config.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import { loadProject, resolveAgentPath } from "../project.ts";
-import type { CommandContext, CommandHandler, FilePlan, ParsedArguments } from "../types.ts";
+import type { CommandContext, CommandHandler, FileOperation, FilePlan, ParsedArguments } from "../types.ts";
 import { assertNoLegacyOmpSource } from "./common.ts";
 import {
   assertNoSymlinkComponents,
@@ -61,9 +62,50 @@ async function agentRename(
   const envChange = envExample
     ? transformPumbleAgentBinding(envExample.content, oldAgentId, newAgentId)
     : null;
+  const modelSource = modelConfigPath(project, oldAgentId);
+  const modelDestination = modelConfigPath(project, newAgentId);
+  await assertNoSymlinkComponents(project.rootDir, modelSource, "model source");
+  await assertNoSymlinkComponents(project.rootDir, modelDestination, "model destination");
+  const modelSourceInfo = await lstat(modelSource).catch(() => null);
+  if (modelSourceInfo?.isSymbolicLink()) throw new Error(`model source must not be a symlink: ${modelSource}`);
+  if (modelSourceInfo && !modelSourceInfo.isFile()) throw new Error(`model source is not a regular file: ${modelSource}`);
+  let modelSourceContent: string | null = null;
+  if (modelSourceInfo) modelSourceContent = await readFile(modelSource, "utf8");
+  const modelDestinationInfo = await lstat(modelDestination).catch(() => null);
+  if (modelDestinationInfo) throw new Error(`model destination already exists: ${modelDestination}`);
+
+  const oldPlaceholder = defaultApiKeyPlaceholder(oldAgentId);
+  const newPlaceholder = defaultApiKeyPlaceholder(newAgentId);
+  const modelOperations: FileOperation[] = [];
+  const modelReferenceCandidate = new Map<string, string>();
+  if (modelSourceInfo) {
+    if (modelSourceContent !== null && modelSourceContent.includes(oldPlaceholder)) {
+      const rewrittenContent = modelSourceContent.split(oldPlaceholder).join(newPlaceholder);
+      const writePlan = await createFilePlan(project.rootDir, [{
+        path: relativePlanPath(project.rootDir, modelDestination),
+        content: rewrittenContent,
+      }]);
+      const removePlan = createRemovePlan(project.rootDir, [
+        relativePlanPath(project.rootDir, modelSource),
+      ]);
+      modelOperations.push(...writePlan.operations, ...removePlan.operations);
+      modelReferenceCandidate.set(modelSource, rewrittenContent);
+    } else {
+      const moveModel = createMovePlan(
+        project.rootDir,
+        relativePlanPath(project.rootDir, modelSource),
+        relativePlanPath(project.rootDir, modelDestination),
+      );
+      modelOperations.push(...moveModel.operations);
+    }
+  }
+
   const references = await findTextReferences(project.rootDir, oldAgentId, {
     filter: (path, content) => {
-      const candidate = path === envExamplePath && envChange?.changed ? envChange.content : content;
+      let candidate = content;
+      if (path === envExamplePath && envChange?.changed) candidate = envChange.content;
+      const overwritten = modelReferenceCandidate.get(path);
+      if (overwritten !== undefined) candidate = overwritten;
       return hasExactTextReference(candidate, oldAgentId);
     },
   });
@@ -73,7 +115,7 @@ async function agentRename(
     relativePlanPath(project.rootDir, source),
     relativePlanPath(project.rootDir, destination),
   );
-  const operations = [...movePlan.operations];
+  const operations = [...movePlan.operations, ...modelOperations];
   if (envExample && envChange?.changed) {
     const envPlan = await createFilePlan(project.rootDir, [{
       path: relativePlanPath(project.rootDir, envExamplePath),
