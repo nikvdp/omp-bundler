@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { executeChild } from "../process.ts";
-import { validateBundle, formatIssue } from "./check.ts";
+import { validateBundleForBuild, formatIssue } from "./check.ts";
 import {
   assertAllowedOptions,
   requiredOptionString,
@@ -56,11 +56,12 @@ export const buildCommand: CommandHandler = async (
     return usageError(context, "--tag must be a safe Docker image tag");
   }
 
-  const result = await validateBundle({
+  const validation = await validateBundleForBuild({
     cwd: context.cwd,
     ...(args.positionals[0] === undefined ? {} : { bundlePath: args.positionals[0] }),
     ...(agentsOverride === undefined ? {} : { agentsDirOverride: agentsOverride }),
   });
+  const { result } = validation;
   if (!result.ok) {
     writeValidationErrors(context, "build", result);
     return 1;
@@ -73,7 +74,7 @@ export const buildCommand: CommandHandler = async (
 
   let contextPath: string | undefined;
   try {
-    contextPath = await stageDockerContext(result.agents);
+    contextPath = await stageDockerContext(result.agents, validation.modelBundle, undefined);
     const docker = await executeChild("docker", buildDockerArgs(tag, contextPath), {
       stdio: "inherit",
       forwardSignals: true,

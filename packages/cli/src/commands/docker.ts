@@ -1,10 +1,18 @@
-import { copyFile, lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { resolvePackagedAsset } from "../assets.ts";
-import { CANONICAL_ASSET_PATHS, isExcludedAssetName } from "../package-assets.ts";
+import {
+  CANONICAL_ASSET_PATHS,
+  isExcludedAssetName,
+} from "../package-assets.ts";
 export { CANONICAL_ASSET_PATHS } from "../package-assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
+import {
+  renderModelCatalog,
+  stageAgentModelBinding,
+  type LoadedModelBundle,
+} from "../model-config.ts";
 import type { AgentDirectory } from "../types.ts";
 
 
@@ -62,21 +70,28 @@ export function formatDockerCommand(
 /**
  * Stage a fresh context from packaged assets and validated agent source
  * trees. Each agent's visible root is wrapped under agents/<id>/.omp in the
- * context. Every source entry is lstat-checked, so no symlink is ever copied.
+ * context; the root template catalog and staged agent configs bind models.
+ * Every source entry is lstat-checked, so no symlink is ever copied.
  */
 export async function stageDockerContext(
   agents: readonly AgentDirectory[],
+  modelsOrAssetsRoot?: LoadedModelBundle | string,
   assetsRoot?: string,
 ): Promise<string> {
+  const models = typeof modelsOrAssetsRoot === "object" ? modelsOrAssetsRoot : undefined;
+  const sourceAssetsRoot = typeof modelsOrAssetsRoot === "string" ? modelsOrAssetsRoot : assetsRoot;
   const contextPath = await mkdtemp(join(tmpdir(), "omp-bundler-build-"));
   try {
-    const sourceRoot = resolve(assetsRoot ?? await packagedAssetsRoot());
+    const sourceRoot = resolve(sourceAssetsRoot ?? await packagedAssetsRoot());
     for (const assetPath of CANONICAL_ASSET_PATHS) {
       await copyTreeNoSymlinks(
         join(sourceRoot, assetPath),
         join(contextPath, assetPath),
         true,
       );
+    }
+    if (models !== undefined) {
+      await writeFile(join(contextPath, "template", "models.yml.tmpl"), renderModelCatalog(models.connections), "utf8");
     }
 
     const stagedAgents = join(contextPath, "agents");
@@ -91,6 +106,18 @@ export async function stageDockerContext(
         join(stagedAgents, agent.id, ".omp"),
         false,
       );
+      if (models === undefined) continue;
+      const connection = models.connections.find((entry) => entry.agentId === agent.id);
+      if (!connection) throw new Error(`missing validated model connection for agent '${agent.id}'`);
+      const configPath = join(agent.path, "config.yml");
+      const source = await readFile(configPath, "utf8");
+      const stagedConfig = stageAgentModelBinding(
+        source,
+        connection.providerId,
+        connection.config.model,
+        configPath,
+      );
+      await writeFile(join(stagedAgents, agent.id, ".omp", "config.yml"), stagedConfig, "utf8");
     }
     return contextPath;
   } catch (error) {
@@ -115,13 +142,9 @@ async function copyTreeNoSymlinks(
   if (info.isDirectory()) {
     await mkdir(destinationPath, { recursive: true });
     const entries = await readdir(sourcePath, { withFileTypes: true });
-    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    for (const entry of entries.sort((left: { readonly name: string }, right: { readonly name: string }) => left.name.localeCompare(right.name))) {
       if (skipPackagedState && isExcludedAssetName(entry.name)) continue;
-      await copyTreeNoSymlinks(
-        join(sourcePath, entry.name),
-        join(destinationPath, entry.name),
-        skipPackagedState,
-      );
+      await copyTreeNoSymlinks(join(sourcePath, entry.name), join(destinationPath, entry.name), skipPackagedState);
     }
     return;
   }

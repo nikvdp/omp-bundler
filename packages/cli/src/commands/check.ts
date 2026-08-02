@@ -3,6 +3,13 @@ import { isAbsolute, join } from "node:path";
 import { optionString } from "../args.ts";
 import { parseYaml } from "../config.ts";
 import {
+  expandModelPlaceholders,
+  loadBundleModels,
+  validateExpandedBaseUrl,
+  type LoadedModelBundle,
+  type ModelMetadata,
+} from "../model-config.ts";
+import {
   assertSafeRelativePath,
   isSafeIdentifier,
   resolveInside,
@@ -40,11 +47,18 @@ export interface CheckResult {
   readonly project: ProjectContext;
   readonly agentsDir: string;
   readonly agents: readonly AgentDirectory[];
+  readonly models: readonly ModelMetadata[];
   readonly errors: readonly ValidationIssue[];
   readonly warnings: readonly ValidationIssue[];
   readonly credentialNames: readonly string[];
   readonly envFile?: string;
 }
+
+export interface BuildValidation {
+  readonly result: CheckResult;
+  readonly modelBundle: LoadedModelBundle;
+}
+
 
 const PROJECT_KEYS: Record<string, true> = { version: true, agentsDir: true, image: true, run: true };
 const IMAGE_KEYS: Record<string, true> = { tag: true };
@@ -122,6 +136,11 @@ type RecordValue = { [key: string]: YamlValue };
  * process.env. The returned report is deliberately safe to pass to build/run.
  */
 export async function validateBundle(options: CheckOptions): Promise<CheckResult> {
+  const { result } = await validateBundleForBuild(options);
+  return result;
+}
+
+export async function validateBundleForBuild(options: CheckOptions): Promise<BuildValidation> {
   const errors: ValidationIssue[] = [];
   const warnings: ValidationIssue[] = [];
   const credentialNames = new Set<string>();
@@ -147,8 +166,33 @@ export async function validateBundle(options: CheckOptions): Promise<CheckResult
   const projectInfo = buildProjectContext(rootDir, configPath, parsedConfig, errors);
   const effectiveAgentsDir = resolveEffectiveAgentsDir(options, projectInfo.project, rootDir, errors);
   const agents = await validateAgentCollection(effectiveAgentsDir, errors);
+  for (const agent of agents) await validateAgent(agent, errors);
+
+  let modelBundle: LoadedModelBundle = { connections: [], metadata: [], envNames: [] };
+  try {
+    modelBundle = await loadBundleModels(rootDir, agents);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const separator = message.indexOf(": ");
+    errors.push(issue(
+      separator >= 0 ? message.slice(0, separator) : rootDir,
+      undefined,
+      separator >= 0 ? message.slice(separator + 2) : message,
+    ));
+  }
+
   for (const agent of agents) {
-    await validateAgent(agent, errors);
+    const agentConfigPath = join(agent.path, "config.yml");
+    const source = await readFile(agentConfigPath, "utf8").catch(() => null);
+    if (source === null) continue;
+    try {
+      const parsed = parseYaml(source);
+      if (isRecord(parsed) && isRecord(parsed.modelRoles) && parsed.modelRoles.default !== undefined) {
+        errors.push(issue(agentConfigPath, "modelRoles.default", "is legacy model ownership; remove it and use models/<agent-id>.yml"));
+      }
+    } catch {
+      // validateAgent already reports malformed config.yml.
+    }
   }
 
   let resolvedEnvFile: string | undefined;
@@ -173,22 +217,46 @@ export async function validateBundle(options: CheckOptions): Promise<CheckResult
         for (const [name, value] of parsedEnv.entries()) {
           if (isCredentialName(name) && value.value.trim()) credentialNames.add(name);
         }
+        for (const name of modelBundle.envNames) {
+          if (!parsedEnv.get(name)?.value.trim()) {
+            errors.push(issue(resolvedEnvFile, name, "is required by model configuration and must be non-empty"));
+          }
+        }
+        const modelEnv = new Map<string, string>();
+        for (const name of modelBundle.envNames) {
+          const value = parsedEnv.get(name)?.value.trim();
+          if (value) modelEnv.set(name, value);
+        }
+        for (const connection of modelBundle.connections) {
+          const baseUrl = expandModelPlaceholders(connection.config.baseUrl, modelEnv, `${resolvedEnvFile} [${connection.agentId}]`);
+          if (baseUrl.includes("${")) continue;
+          try {
+            validateExpandedBaseUrl(baseUrl, `${resolvedEnvFile} [${connection.agentId}]`);
+          } catch {
+            errors.push(issue(resolvedEnvFile, connection.agentId, "model baseUrl must resolve to an absolute HTTP(S) URL"));
+          }
+        }
         validateRuntimeEnv(parsedEnv, envSource, resolvedEnvFile, agents, errors);
       }
-      }
     }
+  }
 
   return {
-    ok: errors.length === 0,
-    project: projectInfo.project,
-    agentsDir: effectiveAgentsDir,
-    agents,
-    errors,
-    warnings,
-    credentialNames: [...credentialNames].sort(),
-    ...(resolvedEnvFile === undefined ? {} : { envFile: resolvedEnvFile }),
+    result: {
+      ok: errors.length === 0,
+      project: projectInfo.project,
+      agentsDir: effectiveAgentsDir,
+      agents,
+      models: modelBundle.metadata,
+      errors,
+      warnings,
+      credentialNames: [...credentialNames].sort(),
+      ...(resolvedEnvFile === undefined ? {} : { envFile: resolvedEnvFile }),
+    },
+    modelBundle,
   };
 }
+
 
 /** Format an issue without exposing source or environment values. */
 export function formatIssue(entry: ValidationIssue): string {
