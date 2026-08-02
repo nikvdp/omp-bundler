@@ -8,10 +8,12 @@ Build and run filesystem-configured OMP agents as a durable service.
 
 An agent is a directory holding its OMP project files directly at the root:
 `AGENTS.md`, `config.yml`, and the `agents`, `commands`, `extensions`,
-`skills`, and `tools` component directories. The filesystem is the source of
-truth: add an agent directory to add an agent, rename the directory to rename
-it, and remove the directory to remove it. There is no agent registry and no
-agent-list environment variable.
+`skills`, and `tools` component directories. Direct child directories define
+agent IDs. After `new` or `generate agent`, run `set-model <agent-id>` to
+create the required model connection and any required runtime placeholders. Use
+`agent rename` and `destroy agent` to keep existing bundle-owned model and
+managed runtime-example state synchronized. There is no separate agent
+registry or agent-list environment variable.
 
 `omp-bundler` provides a Rails-style CLI for creating a bundle, generating
 agents and their components, validating the result, building a container
@@ -31,8 +33,8 @@ Confirm that it is available:
 omp-bundler --version
 ```
 
-Docker is required to build and run images. Model credentials are runtime
-inputs; the default HTTP adapter needs no platform credentials.
+Docker is required to build and run images. Configure each agent's model
+connection in the bundle; supply referenced environment values only at runtime.
 
 ## Quick start
 
@@ -43,25 +45,27 @@ omp-bundler new my-bundle --agent my-agent
 cd my-bundle
 ```
 
-Edit the generated instructions:
+Edit the generated instructions, then configure the agent's model:
 
 ```bash
 $EDITOR agents/my-agent/AGENTS.md
+omp-bundler set-model my-agent
 ```
 
-Check and build the bundle:
+`set-model` opens temporary model YAML in `VISUAL`, `EDITOR`, or `vi`. After
+you save and exit with valid YAML, it atomically commits
+`models/my-agent.yml`. Use `omp-bundler set-model my-agent --wizard` for
+guided prompts instead.
 
-```bash
-omp-bundler check
-omp-bundler build
-```
-
-Create the local runtime file, fill the model authentication values, and run:
+Create the local runtime file, fill any generated model placeholders, check,
+build, and run:
 
 ```bash
 cp runtime.env.example runtime.env
 $EDITOR runtime.env
-omp-bundler run --env-file runtime.env
+omp-bundler check
+omp-bundler build
+omp-bundler run
 ```
 
 Send a turn through the default HTTP adapter:
@@ -80,7 +84,7 @@ when this bundle will receive Pumble events.
 The complete development loop is:
 
 ```text
-new or generate -> edit -> check -> build -> run
+new or generate -> edit -> set-model -> check -> build -> run
 ```
 
 ## What `new` creates
@@ -117,6 +121,9 @@ my-bundle/
 The agent scaffold creates every supported OMP project surface. A first-time
 user can inspect the complete shape without knowing OMP's discovery paths in
 advance.
+
+`new` does not guess a provider or model. `set-model` creates the bundle-owned
+`models/<agent-id>.yml` file when the connection is configured.
 
 The `.example` files are complete, valid templates. OMP ignores the `.example`
 suffix, so they have no runtime effect. The `check` command still validates
@@ -218,15 +225,16 @@ You are the my-agent agent.
 Treat this as a starting point. Replace the generic role and instructions with
 the agent's actual job, constraints, and behavior.
 
-The generated `config.yml` is also valid and inherits the bundle's shared OMP
-model selection:
+The generated `config.yml` is immediately valid and contains only OMP
+agent-local settings:
 
 ```yaml
 setupVersion: 1
 ```
 
-It contains comments showing where model roles and other agent-local OMP
-settings belong, but it does not select a machine-specific provider.
+Model connections belong at `models/<agent-id>.yml`, not in
+`modelRoles.default`. During build, omp-bundler generates the internal OMP
+provider binding in the staged image without changing this source file.
 
 ## Generate agent components
 
@@ -357,30 +365,81 @@ omp-bundler generate tool my-agent lookup-record --dry-run
 Agent and agent-component generators refuse to overwrite existing component
 files. The adapter generator follows the documented merge rule above.
 
-## Select an agent model
+## Configure an agent model
 
-Agents inherit the shared OMP model selection unless explicitly configured.
-Set an agent's default model with:
-
-```bash
-omp-bundler agent model my-agent anthropic/claude-sonnet-4-5
-```
-
-This updates only:
+Each effective agent must have one bundle-owned model connection:
 
 ```text
-agents/my-agent/config.yml
+models/<agent-id>.yml
 ```
 
-Result:
+Configure it with the default editor flow:
+
+```bash
+omp-bundler set-model my-agent
+```
+
+When a bundle has exactly one agent, the ID is optional. A new connection
+starts from the same commented template printed by:
+
+```bash
+omp-bundler set-model my-agent --print-template
+```
+
+The stored YAML has one small schema:
 
 ```yaml
-setupVersion: 1
-modelRoles:
-  default: anthropic/claude-sonnet-4-5
+version: 1
+baseUrl: https://api.openai.com/v1
+dialect: openai-responses
+model: gpt-5.4
+apiKey: "${OPENAI_API_KEY}"
 ```
 
-The model name belongs in agent configuration. Provider credentials do not.
+- `baseUrl` is an HTTP(S) URL or `${ENV_VAR}` template.
+- `dialect` is exactly `openai-responses`, `openai-completions`, or
+  `anthropic-messages`.
+- `model` is a non-empty provider model ID or environment template.
+- `apiKey` accepts a literal, `${ENV_VAR}`, `null`, or an empty string for a
+  no-auth endpoint.
+
+Use the wizard when guided prompts are preferable:
+
+```bash
+omp-bundler set-model my-agent --wizard
+```
+
+Automation can supply the same fields directly:
+
+```bash
+omp-bundler set-model my-agent \
+  --base-url https://api.openai.com/v1 \
+  --dialect openai-responses \
+  --model gpt-5.4 \
+  --api-key '${OPENAI_API_KEY}'
+```
+
+Direct flags may also update only selected fields of an existing connection.
+Editor, wizard, direct flags, printed templates, and handwritten YAML all use
+the same parser and field definitions. Invalid input, a failed editor, or
+editor cancellation changes nothing. Diagnostic output names fields and paths
+but never prints an API key value.
+
+Every `${ENV_VAR}` referenced by the model connection is added to the
+agent's generated block in `runtime.env.example`. Re-running `set-model`
+updates that block exactly: new names appear, stale names disappear, and
+unrelated or Pumble sections remain. Literal and no-auth values need no runtime
+placeholder. A literal API key is supported but is stored in the committed
+model file and built image. Never put production credentials there; use an
+environment template.
+
+`set-model` never edits an existing ignored `runtime.env`. If that file already
+exists, copy or merge changed model variables from `runtime.env.example` before
+the next `check` or `run`.
+
+At build time, omp-bundler renders an internal provider catalog and per-agent
+default binding into the Docker context. Internal provider IDs are generated
+implementation details, not values users configure or copy.
 
 ## Rename an agent
 
@@ -400,29 +459,37 @@ to:
 agents/renamed-agent/
 ```
 
-The command performs only these source-tree changes:
+The command performs these source-tree changes atomically:
 
 1. Moves `agents/my-agent/` to `agents/renamed-agent/`.
-2. Updates `PUMBLE_AGENT_ID` in the committed `runtime.env.example` when that
+2. Moves `models/my-agent.yml` to `models/renamed-agent.yml` when present.
+   The default generated API-key placeholder and managed
+   `runtime.env.example` model block follow the new ID; custom placeholders,
+   comments, and unrelated fields remain unchanged.
+3. Updates `PUMBLE_AGENT_ID` in the committed `runtime.env.example` when that
    generated field names the old agent.
-3. Reports any other project-owned text reference it cannot update safely.
+4. Reports any other project-owned text reference it cannot update safely.
 
 It does not edit ignored `runtime.env` files, rewrite JSON inside
 `OMP_ADAPTERS`, rebuild an existing image, rename durable
 `/data/agents/my-agent` state, or change a running container.
 
-Before the next run:
+After the rebuilt image starts, the old durable agent directory remains but
+its stale `/data/agents/my-agent/.omp/` subtree is removed. Sibling workspace
+files remain. Copy anything needed from the old `.omp` subtree before starting
+the rebuilt image.
+
+Before the next run, update any local runtime variable or explicit adapter
+binding that still uses the old ID, then rebuild:
 
 ```bash
 $EDITOR runtime.env
-omp-bundler check --env-file runtime.env
+omp-bundler check
 omp-bundler build
-omp-bundler run --env-file runtime.env
+omp-bundler run
 ```
 
-Change every runtime `PUMBLE_AGENT_ID` or `OMP_ADAPTERS` `agentId` reference
-from `my-agent` to `renamed-agent`. Rebuilding is required because existing
-images retain the old baked directory.
+Rebuilding is required because existing images retain the old baked directory.
 
 ## Remove generated components
 
@@ -450,18 +517,21 @@ omp-bundler destroy agent second-agent
 
 Destructive commands print the paths they will delete and ask for confirmation.
 Use `--dry-run` to preview them. Automation may use `--yes` to skip the prompt.
-Removing source files does not delete Docker volumes, sessions, or remote
-resources.
+Destroying an agent also removes its matching `models/<agent-id>.yml` and
+generated model block from `runtime.env.example`. If the agent owns the
+generated Pumble block, that block is removed and the committed example
+returns to HTTP mode. Unrelated lines remain unchanged.
 
-An already-built image is immutable and still contains any agent or component
-that was present when it was built. Rebuild after a destroy operation to
-remove the source from future containers. Destroy does not edit ignored
-runtime bindings; update or remove bindings to a destroyed agent before the
-next run.
+Removing source files does not delete Docker volumes, sessions, remote
+resources, or ignored `runtime.env` bindings. Update local runtime bindings
+before the next run. An already-built image is immutable, so rebuild to remove
+the source from future containers.
 
-Durable `/data/agents/<agent-id>` files are also preserved. A destroyed agent
-no longer receives traffic after its bindings are removed and the image is
-rebuilt, but deleting its durable data is a separate operator action.
+The old durable agent directory and its sibling workspace files remain. After
+a rebuilt image starts, the stale `/data/agents/<agent-id>/.omp/` subtree is
+removed because it is no longer baked into the image. Copy anything needed
+from that subtree before starting the rebuilt image; deleting the remaining
+durable workspace is a separate operator action.
 
 ## Migrate a legacy agent layout
 
@@ -520,18 +590,24 @@ omp-bundler check ../another-bundle
 - OMP YAML and Markdown frontmatter
 - TypeScript extension and tool entrypoints
 - Duplicate component names
+- Exactly one valid `models/<agent-id>.yml` for every effective agent, with no
+  unknown model files, legacy `modelRoles.default`, or symlinked ownership
+- Model field syntax and required runtime placeholder names without exposing
+  credential values
 - Accidental credentials or generated runtime state in agent source
-- Adapter-to-agent bindings when a runtime env file is supplied
+- Adapter-to-agent bindings when runtime configuration is selected
 
-Supply runtime configuration for binding validation:
+If `runtime.env` exists, `check` selects it automatically. An explicit file
+takes precedence:
 
 ```bash
-omp-bundler check --env-file runtime.env
+omp-bundler check --env-file another-runtime.env
 ```
 
-With `--env-file`, `check` parses `PUMBLE_AGENT_ID` and every
-`OMP_ADAPTERS[].agentId`, then verifies that each referenced ID is a direct
-child of the effective agent collection.
+Without either file, `check` performs structural and source validation only.
+With runtime configuration, it also validates model placeholders,
+`PUMBLE_AGENT_ID`, and every `OMP_ADAPTERS[].agentId` against the effective
+agent collection.
 
 A failed check names the exact file, field, and expected correction.
 
@@ -569,45 +645,37 @@ directory, or an invalid child fails before Docker runs.
 
 The build command:
 
-1. Runs the structural, source, and credential-leak checks performed by
-   `check` without `--env-file`. Build never reads runtime configuration.
+1. Runs the structural, source, model-ownership, and credential-leak checks
+   performed by `check` without runtime configuration.
 2. Resolves the effective collection from `--agents`, when supplied, or
    `agentsDir` otherwise.
 3. Discovers every direct child of that effective collection.
 4. Stages the shared omp-bundler runtime.
 5. Bakes each agent's visible source root into the internal
    `/agents/<agent-id>/.omp/` path of the staged context.
-6. Builds the Docker image.
-7. Reports the image tag and included agent IDs.
+6. Generates the internal model catalog and per-agent OMP default binding from
+   the matching bundle-root model files.
+7. Builds the Docker image and reports its tag and included agent IDs.
 
-Building requires Docker. It does not contact model providers or adapters.
+Building requires Docker. It does not contact model providers or adapters and
+does not read `runtime.env` or `runtime.env.example`. Environment templates
+remain unresolved until the container starts.
 
-The build does not require or read:
-
-- Model-provider API keys
-- Private provider base URLs
-- OMP auth broker credentials
-- Pumble credentials
-- Adapter shared secrets
-- `OMP_ARGS`
-- `OMP_ADAPTERS`
-- `OMP_AGENTS`
-
-Provider-specific variables such as `CLIPROXY_BASE_URL`, `custom-provider_BASE_URL`,
-or their API keys are not part of the standard build interface. A deployment
-that deliberately uses a private provider supplies its configuration at
-runtime, not while building the image.
+A model connection may contain a literal base URL or API key, in which case
+that value is intentionally part of the committed bundle and built image.
+Use `${ENV_VAR}` templates to keep deployment-specific URLs and credentials in
+the runtime environment instead.
 
 ## Runtime configuration
 
-`new` creates `runtime.env.example` with HTTP mode and standard authentication
-fields:
+`new` creates a compact HTTP-first `runtime.env.example`:
 
 ```env
+# Bundled adapter. HTTP serves the agent API and omp-tui.
 OMP_BUNDLER_ADAPTER=http
+
+# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.
 OMP_HTTP_API_TOKEN=
-OMP_AUTH_BROKER_URL=
-OMP_AUTH_BROKER_TOKEN=
 ```
 
 HTTP is the default bundled adapter. `OMP_HTTP_API_TOKEN` is optional; when
@@ -615,56 +683,65 @@ set, message requests must send `Authorization: Bearer <token>`. Set it, or
 place the adapter behind an authenticated local reverse proxy, before exposing
 port 8765 outside a trusted development machine.
 
-The documented model-authentication path uses the OMP auth broker. Supply both
-broker values together, or omit both and use the selected provider's direct
-runtime credentials. Agent files select models but never contain credentials.
+`set-model` adds only the environment names referenced by each model:
 
-For a Pumble deployment, generate its fields before making the local file:
+```env
+# Model connection for my-agent. Copy this file to runtime.env and fill these values.
+OPENAI_API_KEY=
+```
+
+For a Pumble deployment, generate its committed section before creating the
+local file:
 
 ```bash
 omp-bundler generate adapter pumble --agent my-agent
 cp runtime.env.example runtime.env
 ```
 
-The generator changes `OMP_BUNDLER_ADAPTER` to `pumble` and merges the
-required Pumble fields. Fill `runtime.env` with deployment values; it is
-ignored by Git.
-
-Direct provider credential names depend on the selected OMP provider, so
-there is no universal list. They remain runtime inputs and are never build
-inputs.
+The generator switches `OMP_BUNDLER_ADAPTER` to `pumble`, adds the required
+Pumble fields, and binds them to the selected agent. Fill `runtime.env` with
+deployment values; it is ignored by Git. Generators and lifecycle commands
+never edit that ignored local file.
 
 ## Run
 
-Run the current bundle with an explicit runtime env file:
+Run the current bundle using its default `runtime.env`:
 
 ```bash
-omp-bundler run --env-file runtime.env
+omp-bundler run
+```
+
+If the default file is absent, `run` stops with an actionable error. Select a
+different file explicitly when needed:
+
+```bash
+omp-bundler run --env-file another-runtime.env
 ```
 
 The command uses the image tag, ports, and data volume from
-`omp-bundler.yml`. It validates runtime adapter bindings against the
-effective agent collection before starting the container, streams logs, and
-forwards termination signals.
+`omp-bundler.yml`. It validates runtime model values and adapter bindings
+against the effective agent collection before starting the container, streams
+logs, forwards termination signals, and prints copyable per-agent HTTP and
+`omp-tui` URLs.
 
 Run a bundle from another directory:
 
 ```bash
-omp-bundler run ../another-bundle --env-file ../another-bundle/runtime.env
+omp-bundler run ../another-bundle \
+  --env-file ../another-bundle/runtime.env
 ```
 
 Override the image:
 
 ```bash
-omp-bundler run --image registry.example.com/my-bundle:2026-08-01 \
-  --env-file runtime.env
+omp-bundler run --image registry.example.com/my-bundle:2026-08-01
 ```
 
 Override the agent collection used for binding validation without changing
 the image or project configuration:
 
 ```bash
-omp-bundler run --agents ./alternate-agents --env-file runtime.env
+omp-bundler run --agents ./alternate-agents
 ```
 
 `--agents` takes precedence over `agentsDir` for validation only. It follows
@@ -676,7 +753,7 @@ fails before Docker runs.
 Preview the Docker invocation:
 
 ```bash
-omp-bundler run --env-file runtime.env --dry-run
+omp-bundler run --dry-run
 ```
 
 The equivalent direct Docker shape is:
@@ -810,7 +887,7 @@ Additional external adapters have their own deployment and credentials.
 ## CLI reference
 
 ```text
-omp-bundler new <path> [--agent <agent-id>]
+omp-bundler new <path> [--agent <agent-id>] [--dry-run]
 
 omp-bundler generate agent <agent-id> [--dry-run]
 omp-bundler generate skill <agent-id> <name> [--dry-run]
@@ -828,12 +905,14 @@ omp-bundler destroy extension <agent-id> <name> [--dry-run] [--yes]
 omp-bundler destroy subagent <agent-id> <name> [--dry-run] [--yes]
 
 omp-bundler migrate visible-layout [bundle-path] [--dry-run] [--yes]
-omp-bundler agent model <agent-id> <provider/model>
-omp-bundler agent rename <old-agent-id> <new-agent-id>
+omp-bundler set-model [agent-id] [--wizard]
+omp-bundler set-model [agent-id] [--base-url <value>] [--dialect <value>] [--model <value>] [--api-key <value>]
+omp-bundler set-model [agent-id] --print-template
+omp-bundler agent rename <old-agent-id> <new-agent-id> [--dry-run]
 
 omp-bundler check [bundle-path] [--env-file <path>]
 omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]
-omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]
+omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]
 ```
 
 Every command supports `--help`. Generators support `--dry-run` and refuse to
