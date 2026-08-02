@@ -694,7 +694,7 @@ test("rename and destroy rollback late env failures without source or temp chang
   });
 });
 
-test("Pumble generation is idempotent, rejects conflicting agents, and rename preserves model and files", async () => {
+test("Pumble generation is idempotent and agent rename or destroy keeps model state consistent", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
@@ -718,6 +718,7 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
     await invoke(setModelCommand, bundle, ["alpha"], { "base-url": "https://api.test/v1", dialect: "openai-responses", model: "acme/model-v1" });
     const modelPath = join(bundle, "models", "alpha.yml");
     assert.match(await readFile(modelPath, "utf8"), /model: acme\/model-v1/);
+    await writeText(modelPath, `${await readFile(modelPath, "utf8")}# preserve \${OMP_MODEL_ALPHA_API_KEY}\n`);
     await writeText(join(bundle, "agents", "alpha", "notes.txt"), "alpha custom state\n");
     const ignoredRuntime = join(bundle, "runtime.env");
     await writeText(ignoredRuntime, "PUMBLE_AGENT_ID=alpha\n");
@@ -726,11 +727,30 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
     assert.match(renamed.stdout, /manual reference/);
     assert.equal(await exists(join(bundle, "models", "alpha.yml")), false);
     assert.equal(await exists(join(bundle, "models", "renamed.yml")), true);
-    assert.match(await readFile(join(bundle, "models", "renamed.yml"), "utf8"), /model: acme\/model-v1/);
+    const renamedModel = await readFile(join(bundle, "models", "renamed.yml"), "utf8");
+    assert.match(renamedModel, /model: acme\/model-v1/);
+    assert.match(renamedModel, /apiKey: "\$\{OMP_MODEL_RENAMED_API_KEY\}"/);
+    assert.match(renamedModel, /# preserve \$\{OMP_MODEL_ALPHA_API_KEY\}/);
     assert.equal(await exists(join(bundle, "agents", "alpha")), false);
     assert.equal(await exists(join(bundle, "agents", "renamed", "notes.txt")), true);
     assert.equal(await readFile(join(bundle, "agents", "renamed", "notes.txt"), "utf8"), "alpha custom state\n");
     assert.match(await readFile(envExample, "utf8"), /PUMBLE_AGENT_ID=renamed/);
+    assert.equal(await readFile(ignoredRuntime, "utf8"), "PUMBLE_AGENT_ID=alpha\n");
+    const renamedEnv = await readFile(envExample, "utf8");
+    assert.doesNotMatch(renamedEnv, /Model connection for alpha|OMP_MODEL_ALPHA_API_KEY/);
+    assert.match(renamedEnv, /Model connection for renamed/);
+    await writeText(
+      envExample,
+      `${renamedEnv.replace("PUMBLE_AGENT_ID=renamed", "PUMBLE_AGENT_ID=renamed # primary")}\n# User section\nSENTINEL=keep\n`,
+    );
+    await invoke(destroyCommand, bundle, ["agent", "renamed"], { yes: true });
+    assert.equal(await exists(join(bundle, "agents", "renamed")), false);
+    assert.equal(await exists(join(bundle, "models", "renamed.yml")), false);
+    const destroyedEnv = await readFile(envExample, "utf8");
+    assert.doesNotMatch(destroyedEnv, /PUMBLE_|Model connection for renamed|OMP_MODEL_RENAMED_API_KEY/);
+    assert.match(destroyedEnv, /^OMP_BUNDLER_ADAPTER=http$/m);
+    assert.match(destroyedEnv, /SENTINEL=keep/);
+    assert.equal((await validateBundle({ cwd: bundle, envFile: envExample })).ok, true);
     assert.equal(await readFile(ignoredRuntime, "utf8"), "PUMBLE_AGENT_ID=alpha\n");
     assert.deepEqual(await transactionArtifacts(bundle), []);
   });
