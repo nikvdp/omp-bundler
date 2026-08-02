@@ -839,3 +839,30 @@ omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>
 Every command supports `--help`. Generators support `--dry-run` and refuse to
 overwrite existing files. Destructive commands require confirmation unless
 `--yes` is supplied.
+
+## Terminal chat client (`omp-tui`)
+
+A small terminal chat client is available under `tools/omp-tui`. It talks to
+one already-running omp-bundler HTTP agent using only that agent's URL.
+
+```bash
+cd tools/omp-tui
+go build -o omp-tui .
+./omp-tui http://localhost:8765/v1/agents/my-agent
+```
+
+The URL identifies exactly one agent. Each program launch starts a fresh
+server-side conversation; there is no resume or local history. Requests are
+synchronous with a spinner until the agent turn completes, and streaming is
+not currently supported.
+
+Optional Bearer authentication can be supplied through the environment without
+putting the token in the command arguments:
+
+```bash
+OMP_HTTP_API_TOKEN=... ./omp-tui http://localhost:8765/v1/agents/my-agent
+```
+
+Keys: Enter sends a message, Ctrl+J inserts a newline, PgUp/PgDn scroll the
+transcript, and Ctrl+C quits. See `tools/omp-tui/DESIGN.md` for the full
+design contract.
