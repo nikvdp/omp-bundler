@@ -2,7 +2,12 @@ import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { optionBoolean } from "../args.ts";
 import { applyFilePlan, createFilePlan, createMovePlan, createRemovePlan } from "../file-plan.ts";
-import { defaultApiKeyPlaceholder, modelConfigPath } from "../model-config.ts";
+import {
+  defaultApiKeyPlaceholder,
+  modelConfigEnvNames,
+  modelConfigPath,
+  parseModelConfig,
+} from "../model-config.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import { loadProject, resolveAgentPath } from "../project.ts";
 import type { CommandContext, CommandHandler, FileOperation, FilePlan, ParsedArguments } from "../types.ts";
@@ -17,6 +22,7 @@ import {
   relativePlanPath,
   transformPumbleAgentBinding,
 } from "./support.ts";
+import { updateAgentModelEnvBlock } from "./templates.ts";
 
 const AGENT_HELP = "omp-bundler agent rename <old-agent-id> <new-agent-id>";
 
@@ -59,9 +65,6 @@ async function agentRename(
 
   const envExamplePath = join(project.rootDir, "runtime.env.example");
   const envExample = await readOptionalTextFile(envExamplePath, "runtime.env.example");
-  const envChange = envExample
-    ? transformPumbleAgentBinding(envExample.content, oldAgentId, newAgentId)
-    : null;
   const modelSource = modelConfigPath(project, oldAgentId);
   const modelDestination = modelConfigPath(project, newAgentId);
   await assertNoSymlinkComponents(project.rootDir, modelSource, "model source");
@@ -78,13 +81,21 @@ async function agentRename(
   const newPlaceholder = defaultApiKeyPlaceholder(newAgentId);
   const modelOperations: FileOperation[] = [];
   const modelReferenceCandidate = new Map<string, string>();
+  let stagedModelSource = modelSourceContent;
   if (modelSourceInfo) {
-    if (modelSourceContent !== null && modelSourceContent.includes(oldPlaceholder)) {
-      const rewrittenContent = modelSourceContent.split(oldPlaceholder).join(newPlaceholder);
+    if (
+      modelSourceContent !== null
+      && parseModelConfig(modelSourceContent, modelSource).apiKey === oldPlaceholder
+    ) {
+      const rewrittenContent = modelSourceContent.replace(
+        /^(\s*apiKey\s*:.*)$/m,
+        (line) => line.replace(oldPlaceholder, newPlaceholder),
+      );
       const writePlan = await createFilePlan(project.rootDir, [{
         path: relativePlanPath(project.rootDir, modelDestination),
         content: rewrittenContent,
       }]);
+      stagedModelSource = rewrittenContent;
       const removePlan = createRemovePlan(project.rootDir, [
         relativePlanPath(project.rootDir, modelSource),
       ]);
@@ -99,6 +110,24 @@ async function agentRename(
       modelOperations.push(...moveModel.operations);
     }
   }
+
+  let envContent = envExample?.content ?? null;
+  if (envContent !== null) {
+    const pumbleChange = transformPumbleAgentBinding(envContent, oldAgentId, newAgentId);
+    if (pumbleChange.changed) envContent = pumbleChange.content;
+    envContent = updateAgentModelEnvBlock(envContent, oldAgentId, []);
+    if (stagedModelSource !== null) {
+      const modelConfig = parseModelConfig(stagedModelSource, modelDestination);
+      envContent = updateAgentModelEnvBlock(
+        envContent,
+        newAgentId,
+        modelConfigEnvNames(modelConfig, modelDestination),
+      );
+    }
+  }
+  const envChange = envExample && envContent !== null
+    ? { changed: envContent !== envExample.content, content: envContent }
+    : null;
 
   const references = await findTextReferences(project.rootDir, oldAgentId, {
     filter: (path, content) => {

@@ -3,6 +3,7 @@ import { basename, join } from "node:path";
 import { optionBoolean } from "../args.ts";
 import { applyFilePlan, createFilePlan, createRemovePlan } from "../file-plan.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
+import { modelConfigPath } from "../model-config.ts";
 import { loadProject, resolveAgentPath } from "../project.ts";
 import type { CommandContext, CommandHandler, FilePlan, ParsedArguments } from "../types.ts";
 import { assertNoLegacyOmpSource } from "./common.ts";
@@ -17,6 +18,12 @@ import {
   relativePlanPath,
   transformPumbleAgentBinding,
 } from "./support.ts";
+import {
+  PUMBLE_ENV_HEADING,
+  removePumbleBlock,
+  setBundledAdapter,
+  updateAgentModelEnvBlock,
+} from "./templates.ts";
 
 const DESTROY_HELP = [
   "omp-bundler destroy agent <agent-id> [--dry-run] [--yes]",
@@ -116,18 +123,37 @@ async function destroyAgent(
 
   const envExamplePath = join(project.rootDir, "runtime.env.example");
   const envExample = await readOptionalTextFile(envExamplePath, "runtime.env.example");
-  const envChange = envExample
-    ? transformPumbleAgentBinding(envExample.content, agentId, null)
+  let envContent = envExample?.content ?? null;
+  if (envContent !== null) {
+    const hadManagedPumbleBlock = envContent.includes(PUMBLE_ENV_HEADING);
+    const withoutManagedPumble = removePumbleBlock(envContent, agentId);
+    const removedManagedPumble = withoutManagedPumble !== envContent;
+    const pumbleChange = transformPumbleAgentBinding(withoutManagedPumble, agentId, null);
+    envContent = pumbleChange.changed ? pumbleChange.content : withoutManagedPumble;
+    if (removedManagedPumble || (pumbleChange.changed && !hadManagedPumbleBlock)) {
+      envContent = setBundledAdapter(envContent, "http");
+    }
+    envContent = updateAgentModelEnvBlock(envContent, agentId, []);
+  }
+  const envChange = envExample && envContent !== null
+    ? { changed: envContent !== envExample.content, content: envContent }
     : null;
+  const modelPath = modelConfigPath(project, agentId);
+  await assertNoSymlinkComponents(project.rootDir, modelPath, "model source");
+  const modelInfo = await lstat(modelPath).catch(() => null);
+  if (modelInfo?.isSymbolicLink()) throw new Error(`model source must not be a symlink: ${modelPath}`);
+  if (modelInfo && !modelInfo.isFile()) throw new Error(`model source is not a regular file: ${modelPath}`);
   const references = await findTextReferences(project.rootDir, agentId, {
-    skip: [agentPath],
+    skip: [agentPath, modelPath],
     filter: (path, content) => {
       const candidate = path === envExamplePath && envChange?.changed ? envChange.content : content;
       return hasExactTextReference(candidate, agentId);
     },
   });
 
-  const removePlan = createRemovePlan(project.rootDir, [relativePlanPath(project.rootDir, agentPath)]);
+  const removePaths = [relativePlanPath(project.rootDir, agentPath)];
+  if (modelInfo) removePaths.push(relativePlanPath(project.rootDir, modelPath));
+  const removePlan = createRemovePlan(project.rootDir, removePaths);
   const operations = [...removePlan.operations];
   if (envExample && envChange?.changed) {
     const envPlan = await createFilePlan(project.rootDir, [{

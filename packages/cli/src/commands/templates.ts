@@ -368,3 +368,46 @@ export function updatePumbleBlock(source: string, agentId: string): string {
   const result = filtered.length > 0 ? `${filtered.join(eol)}${eol}` : "";
   return result === source ? source : result;
 }
+
+/**
+ * Remove the generated Pumble block only when it is bound to `agentId`.
+ * Handwritten or differently bound Pumble sections remain untouched.
+ */
+export function removePumbleBlock(source: string, agentId: string): string {
+  const lines = source.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const blockStart = lines.indexOf(PUMBLE_ENV_HEADING);
+  if (blockStart < 0) return source;
+  let blockEnd = blockStart + 1;
+  while (blockEnd < lines.length) {
+    const body = lines[blockEnd];
+    if (body.trim() === "" || body.trimStart().startsWith("#")) break;
+    if (!/^\s*(?:OMP_BUNDLER_ADAPTER|PUMBLE_[A-Z0-9_]*)\s*=/.test(body)) break;
+    blockEnd += 1;
+  }
+  const binding = lines
+    .slice(blockStart + 1, blockEnd)
+    .find((line) => /^\s*PUMBLE_AGENT_ID\s*=/.test(line));
+  const bindingValue = binding?.slice(binding.indexOf("=") + 1) ?? "";
+  const commentStart = bindingValue.search(/(?:^|\s)#/);
+  const boundAgent = (commentStart < 0 ? bindingValue : bindingValue.slice(0, commentStart)).trim();
+  if (boundAgent !== agentId) return source;
+  return updateManagedEnvBlock(source, PUMBLE_ENV_HEADING, []);
+}
+
+/** Set the generated bundled-adapter selection without touching model blocks. */
+export function setBundledAdapter(source: string, adapter: "http" | "pumble"): string {
+  const eol = detectEol(source);
+  const lines = source.split(/\r?\n/);
+  const hadFinalEol = lines.length > 0 && lines[lines.length - 1] === "";
+  if (hadFinalEol) lines.pop();
+  const protectedModelLines = managedModelBlockLines(lines);
+  let found = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (protectedModelLines.has(index) || !/^\s*OMP_BUNDLER_ADAPTER\s*=/.test(lines[index])) continue;
+    found = true;
+    lines[index] = `${lines[index].slice(0, lines[index].indexOf("=") + 1)}${adapter}`;
+  }
+  if (!found) lines.unshift(`OMP_BUNDLER_ADAPTER=${adapter}`);
+  return `${lines.join(eol)}${hadFinalEol || lines.length > 0 ? eol : ""}`;
+}
