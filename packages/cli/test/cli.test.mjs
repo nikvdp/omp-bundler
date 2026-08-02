@@ -245,6 +245,7 @@ async function createCanonicalAssetSource(root) {
 
 function runtimeEnv(agentId = "alpha") {
   return [
+    "OMP_BUNDLER_ADAPTER=pumble",
     "PUMBLE_APP_ID=app",
     "PUMBLE_APP_CLIENT_SECRET=client-secret",
     "PUMBLE_APP_KEY=app-key",
@@ -325,6 +326,10 @@ test("new creates empty and full trees, generators cover every surface, and coll
     );
     assert.equal(await exists(join(parent, "empty", "agents", ".gitkeep")), true);
     assert.equal(await exists(join(parent, "full", "agents", "alpha", "AGENTS.md")), true);
+    assert.match(
+      await readFile(join(parent, "full", "runtime.env.example"), "utf8"),
+      /^OMP_BUNDLER_ADAPTER=http$/m,
+    );
     assert.equal(await exists(join(parent, "full", "agents", "alpha", "config.yml")), true);
     for (const surface of ["agents", "commands", "extensions", "skills", "tools"]) {
       assert.equal(await exists(join(parent, "full", "agents", "alpha", surface)), true);
@@ -635,6 +640,7 @@ test("Pumble generation is idempotent, rejects conflicting agents, and rename pr
 
     await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
     const before = await readFile(envExample, "utf8");
+    assert.match(before, /^OMP_BUNDLER_ADAPTER=pumble$/m);
     assert.match(before, /PUMBLE_AGENT_ID=alpha/);
     const repeated = await invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" });
     assert.match(repeated.stdout, /no changes/);
@@ -708,6 +714,7 @@ test("check reports structural and runtime errors without exposing credential va
     const leaked = "super-secret-value-42";
     const envPath = join(parent, "runtime.env");
     await writeText(envPath, [
+      "OMP_BUNDLER_ADAPTER=pumble",
       "PUMBLE_APP_ID=app",
       `PUMBLE_APP_CLIENT_SECRET=${leaked}`,
       "PUMBLE_APP_KEY=app-key",
@@ -736,6 +743,22 @@ test("check reports structural and runtime errors without exposing credential va
   });
 });
 
+test("check accepts the default HTTP adapter without Pumble fields", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const envPath = join(parent, "runtime.env");
+    await writeText(
+      envPath,
+      await readFile(join(bundle, "runtime.env.example"), "utf8"),
+    );
+
+    const report = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.errors, []);
+  });
+});
+
 test("check rejects incomplete explicit adapters without exposing adapter secrets", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
@@ -743,6 +766,7 @@ test("check rejects incomplete explicit adapters without exposing adapter secret
     const envPath = join(parent, "explicit-incomplete.env");
     const adapterSecret = "explicit-adapter-secret";
     await writeText(envPath, [
+      "OMP_BUNDLER_ADAPTER=pumble",
       `OMP_ADAPTERS=[{"adapterId":"external","callbackUrl":"http://127.0.0.1:8765/core/events","sharedSecret":"${adapterSecret}","agentId":"alpha"}]`,
       "",
     ].join("\n"));
@@ -774,6 +798,7 @@ test("check accepts complete explicit adapters without PUMBLE_AGENT_ID", async (
     const bundle = join(parent, "bundle");
     const envPath = join(parent, "explicit-complete.env");
     await writeText(envPath, [
+      "OMP_BUNDLER_ADAPTER=pumble",
       "PUMBLE_APP_ID=app",
       "PUMBLE_APP_CLIENT_SECRET=client-secret",
       "PUMBLE_APP_KEY=app-key",
