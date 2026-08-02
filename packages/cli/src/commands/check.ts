@@ -18,6 +18,7 @@ import {
   PROJECT_CONFIG_FILE,
   resolveBundleRoot,
   resolveCommandPath,
+  resolveDefaultEnvFile,
 } from "../project.ts";
 import type {
   AgentDirectory,
@@ -281,11 +282,21 @@ export const checkCommand: CommandHandler = async (
     context.io.stderr.write("omp-bundler check: --env-file requires a path\n");
     return 1;
   }
+  // Explicit --env-file always wins; otherwise use the bundle's runtime.env
+  // if it exists, and fall back to structural-only validation when absent.
+  let effectiveEnvFile = envFile;
+  if (effectiveEnvFile === undefined) {
+    const bundleRoot = await resolveBundleRoot(
+      args.positionals[0] === undefined ? undefined : args.positionals[0],
+      context.cwd,
+    );
+    effectiveEnvFile = await resolveDefaultEnvFile(bundleRoot);
+  }
 
   const result = await validateBundle({
     cwd: context.cwd,
     ...(args.positionals[0] === undefined ? {} : { bundlePath: args.positionals[0] }),
-    ...(envFile === undefined ? {} : { envFile }),
+    ...(effectiveEnvFile === undefined ? {} : { envFile: effectiveEnvFile }),
   });
   const output = context.io.stdout;
   output.write(`Bundle: ${result.project.rootDir}\n`);

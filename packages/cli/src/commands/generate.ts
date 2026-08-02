@@ -19,7 +19,7 @@ import {
 import {
   agentScaffoldFiles,
   componentFile,
-  PUMBLE_RUNTIME_FIELDS,
+  updatePumbleBlock,
 } from "./templates.ts";
 import type { ComponentKind } from "./templates.ts";
 
@@ -105,7 +105,6 @@ async function generateComponent(
   const plan = await createFilePlan(agent.path, [componentFile(kind, name)]);
   await applyAndReport(plan, context, dryRun);
 }
-
 async function generateAdapter(
   args: ParsedArguments,
   context: CommandContext,
@@ -123,15 +122,12 @@ async function generateAdapter(
   await requireAgent(project, agentId);
 
   const runtimePath = join(project.rootDir, "runtime.env.example");
-  let source: string;
-  try {
-    source = await readFile(runtimePath, "utf8");
-  } catch (error) {
+  const source = await readFile(runtimePath, "utf8").catch((error: unknown) => {
     throw new Error(
       `cannot read runtime.env.example '${runtimePath}': ${error instanceof Error ? error.message : String(error)}`,
     );
-  }
-  const merged = mergePumbleFields(source, agentId);
+  });
+  const merged = updatePumbleBlock(source, agentId);
   if (merged === source) {
     context.io.stdout.write(`no changes ${runtimePath}\n`);
     return;
@@ -140,76 +136,4 @@ async function generateAdapter(
     { path: "runtime.env.example", content: merged, overwrite: true },
   ]);
   await applyAndReport(plan, context, dryRun);
-}
-
-function mergePumbleFields(source: string, agentId: string): string {
-  const eol = source.includes("\r\n") ? "\r\n" : "\n";
-  const lines = source.split(/\r?\n/);
-  let changed = false;
-  const additions: string[] = [];
-  const modeMatches: number[] = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    if (envAssignment(lines[index], "OMP_BUNDLER_ADAPTER") !== undefined) {
-      modeMatches.push(index);
-    }
-  }
-  if (modeMatches.length === 0) {
-    additions.push("OMP_BUNDLER_ADAPTER=pumble");
-  } else {
-    for (const index of modeMatches) {
-      if ((envAssignment(lines[index], "OMP_BUNDLER_ADAPTER") ?? "").trim() !== "pumble") {
-        lines[index] = replaceEnvAssignment(lines[index], "pumble");
-        changed = true;
-      }
-    }
-  }
-  const fields = [...PUMBLE_RUNTIME_FIELDS, "PUMBLE_AGENT_ID"] as const;
-
-  for (const field of fields) {
-    const matches: number[] = [];
-    for (let index = 0; index < lines.length; index += 1) {
-      if (envAssignment(lines[index], field) !== undefined) matches.push(index);
-    }
-    if (field === "PUMBLE_AGENT_ID") {
-      const bindings = matches
-        .map((index) => envAssignment(lines[index], field)?.trim() ?? "")
-        .filter((value) => value.length > 0);
-      const conflict = bindings.find((value) => value !== agentId);
-      if (conflict !== undefined) {
-        throw new Error(
-          `runtime.env.example already binds PUMBLE_AGENT_ID to '${conflict}'; change or remove that binding explicitly`,
-        );
-      }
-      if (matches.length === 0) {
-        additions.push(`${field}=${agentId}`);
-      } else {
-        for (const index of matches) {
-          if ((envAssignment(lines[index], field) ?? "").trim() === "") {
-            lines[index] = replaceEnvAssignment(lines[index], agentId);
-            changed = true;
-          }
-        }
-      }
-    } else if (matches.length === 0) {
-      additions.push(`${field}=`);
-    }
-  }
-
-  if (additions.length > 0) {
-    let updated = lines.join(eol);
-    if (updated.length > 0 && !updated.endsWith(eol)) updated += eol;
-    updated += additions.join(eol) + eol;
-    return updated;
-  }
-  return changed ? lines.join(eol) : source;
-}
-
-function envAssignment(line: string, field: string): string | undefined {
-  const prefix = new RegExp(`^\\s*${field}\\s*=`);
-  if (!prefix.test(line)) return undefined;
-  return line.slice(line.indexOf("=") + 1);
-}
-
-function replaceEnvAssignment(line: string, value: string): string {
-  return `${line.slice(0, line.indexOf("=") + 1)}${value}`;
 }

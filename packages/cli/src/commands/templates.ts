@@ -17,8 +17,34 @@ export const PUMBLE_RUNTIME_FIELDS = [
   "PUMBLE_CORE_SHARED_SECRET",
 ] as const;
 
-export const RUNTIME_ENV_EXAMPLE =
-  "OMP_BUNDLER_ADAPTER=http\nOMP_HTTP_API_TOKEN=\nOMP_AUTH_BROKER_URL=\nOMP_AUTH_BROKER_TOKEN=\n";
+/**
+ * Fresh runtime.env.example for a default HTTP bundle. Compact and
+ * self-explaining: one comment, the adapter mode, a blank line, and the
+ * optional HTTP Bearer token. No auth-broker or Pumble fields — those are
+ * opt-in sections generated on request.
+ */
+export const RUNTIME_ENV_EXAMPLE = runtimeEnvExample();
+
+/** Compact, commented fresh runtime.env.example for the default HTTP path. */
+export function runtimeEnvExample(): string {
+  const lines = [
+    "# Bundled adapter. HTTP serves the agent API and omp-tui.",
+    "OMP_BUNDLER_ADAPTER=http",
+    "",
+    "# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.",
+    "OMP_HTTP_API_TOKEN=",
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
+/** Comment heading that marks a generated per-agent model-connection block. */
+export function agentModelEnvHeading(agentId: string): string {
+  return `# Model connection for ${agentId}. Copy this file to runtime.env and fill these values.`;
+}
+
+/** Comment heading that marks the generated Pumble adapter block. */
+export const PUMBLE_ENV_HEADING =
+  "# Pumble adapter. Fill these values from the Pumble app dashboard, then run the bundle.";
 
 export function bundleFiles(bundleName: string): readonly PlannedWrite[] {
   return [
@@ -145,4 +171,200 @@ function extensionTemplate(name: string): string {
 
 function subagentTemplate(name: string): string {
   return `---\nname: ${name}\ndescription: Starter subagent for ${name}. Customize before use.\ntools: read, grep, glob\nspawns: \"\"\n---\n\nYou are ${name}. Read the requested context and return a concise answer.\nCustomize this task-agent definition before relying on it.\n`;
+}
+
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+/** Detected line ending: CRLF if any present, else LF. */
+function detectEol(source: string): string {
+  return source.includes("\r\n") ? "\r\n" : "\n";
+}
+
+/**
+ * Replace or append one managed env block identified by an exact comment
+ * `heading`. The block is the heading line plus consecutive `NAME[=value]`
+ * assignment rows. When `assignments` is empty the block is removed. Lines
+ * outside the block — including unrelated comments, model blocks, and the
+ * adapter mode line — are preserved verbatim. Idempotent.
+ */
+export function updateManagedEnvBlock(
+  source: string,
+  heading: string,
+  assignments: readonly string[],
+): string {
+  for (const assignment of assignments) {
+    const name = assignment.slice(0, assignment.indexOf("="));
+    if (!ENV_NAME_RE.test(name)) throw new Error(`invalid generated env name: ${name}`);
+  }
+  const eol = detectEol(source);
+  const lines = source.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const sorted = [...assignments].sort((left, right) => left.localeCompare(right));
+
+  const start = lines.indexOf(heading);
+  if (start >= 0) {
+    let end = start + 1;
+    while (end < lines.length) {
+      const body = lines[end];
+      if (body.trim() === "" || body.trimStart().startsWith("#")) break;
+      if (!/^\s*[A-Z_][A-Z0-9_]*\s*=/.test(body)) break;
+      end += 1;
+    }
+    if (sorted.length === 0) {
+      let removeEnd = end;
+      if (removeEnd < lines.length && lines[removeEnd].trim() === "") removeEnd += 1;
+      lines.splice(start, removeEnd - start);
+    } else {
+      lines.splice(start, end - start, heading, ...sorted);
+    }
+    return lines.length > 0 ? `${lines.join(eol)}${eol}` : "";
+  }
+
+  if (sorted.length === 0) return source;
+  if (lines.length > 0 && lines[lines.length - 1].trim() !== "") lines.push("");
+  lines.push(heading, ...sorted);
+  return `${lines.join(eol)}${eol}`;
+}
+
+/**
+ * Update one agent's generated model-connection block. Replaces the block
+ * with one `NAME=` row per env name (sorted, de-duped), removes it when empty,
+ * or appends a new block when absent and non-empty. Idempotent.
+ */
+export function updateAgentModelEnvBlock(
+  source: string,
+  agentId: string,
+  envNames: readonly string[],
+): string {
+  const unique = [...new Set(envNames)];
+  const assignments = unique.map((name) => `${name}=`);
+  return updateManagedEnvBlock(source, agentModelEnvHeading(agentId), assignments);
+}
+
+/** The seven canonical Pumble adapter assignments, in declaration order. */
+const PUMBLE_BLOCK_FIELDS = [...PUMBLE_RUNTIME_FIELDS, "PUMBLE_AGENT_ID"] as const;
+const MODEL_ENV_HEADING_RE =
+  /^# Model connection for [a-z0-9][a-z0-9_-]{0,63}\. Copy this file to runtime\.env and fill these values\.$/;
+const ENV_ASSIGNMENT_RE = /^\s*[A-Z_][A-Z0-9_]*\s*=/;
+
+function managedModelBlockLines(lines: readonly string[]): ReadonlySet<number> {
+  const protectedLines = new Set<number>();
+  for (let start = 0; start < lines.length; start += 1) {
+    if (!MODEL_ENV_HEADING_RE.test(lines[start])) continue;
+    protectedLines.add(start);
+    for (let index = start + 1; index < lines.length && ENV_ASSIGNMENT_RE.test(lines[index]); index += 1) {
+      protectedLines.add(index);
+    }
+  }
+  return protectedLines;
+}
+
+
+/**
+ * Switch the runtime to the Pumble adapter and ensure one managed Pumble
+ * block bound to `agentId`. Migrates any prior unheaded canonical PUMBLE_*
+ * assignments (only the seven known names) into the block, preserving their
+ * non-empty values. Rejects a conflicting PUMBLE_AGENT_ID binding. Idempotent.
+ */
+export function updatePumbleBlock(source: string, agentId: string): string {
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(agentId)) throw new Error(`invalid agent id: ${agentId}`);
+  const eol = detectEol(source);
+  const lines = source.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  const protectedModelLines = managedModelBlockLines(lines);
+
+  // Conflict-check every PUMBLE_AGENT_ID assignment before mutating.
+  for (let index = 0; index < lines.length; index += 1) {
+    if (protectedModelLines.has(index)) continue;
+    const line = lines[index];
+    if (!/^\s*PUMBLE_AGENT_ID\s*=/.test(line)) continue;
+    const value = line.slice(line.indexOf("=") + 1).trim();
+    if (value !== "" && value !== agentId) {
+      throw new Error(
+        `runtime.env.example already binds PUMBLE_AGENT_ID to '${value}'; change or remove that binding explicitly`,
+      );
+    }
+  }
+
+  // Migrate the prior generator's unheaded canonical assignments, first non-empty wins.
+  const knownValues = new Map<string, string>();
+  for (const field of PUMBLE_BLOCK_FIELDS) {
+    for (let index = 0; index < lines.length; index += 1) {
+      if (protectedModelLines.has(index)) continue;
+      const line = lines[index];
+      if (new RegExp(`^\\s*${field}\\s*=`).test(line)) {
+        const value = line.slice(line.indexOf("=") + 1);
+        if (value.trim() !== "" && !knownValues.has(field)) knownValues.set(field, value);
+      }
+    }
+  }
+
+  // Remove unheaded canonical PUMBLE_* assignments outside a managed block.
+  const blockStart = lines.indexOf(PUMBLE_ENV_HEADING);
+  let blockEnd = blockStart;
+  if (blockStart >= 0) {
+    blockEnd = blockStart + 1;
+    while (blockEnd < lines.length) {
+      const body = lines[blockEnd];
+      if (body.trim() === "" || body.trimStart().startsWith("#")) break;
+      if (!/^\s*(?:OMP_BUNDLER_ADAPTER|PUMBLE_[A-Z0-9_]*)\s*=/.test(body)) break;
+      blockEnd += 1;
+    }
+  }
+  const filtered: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (protectedModelLines.has(index)) {
+      filtered.push(lines[index]);
+      continue;
+    }
+    if (index >= blockStart && index < blockEnd) {
+      filtered.push(lines[index]);
+      continue;
+    }
+    const line = lines[index];
+    if (/^\s*PUMBLE_AGENT_ID\s*=/.test(line)) continue;
+    const match = line.match(/^\s*(PUMBLE_[A-Z0-9_]*)\s*=/);
+    if (match && (PUMBLE_RUNTIME_FIELDS as readonly string[]).includes(match[1])) continue;
+    filtered.push(line);
+  }
+
+  const filteredModelLines = managedModelBlockLines(filtered);
+  // Set every unprotected OMP_BUNDLER_ADAPTER assignment to pumble (add one if absent).
+  let adapterFound = false;
+  for (let index = 0; index < filtered.length; index += 1) {
+    if (filteredModelLines.has(index) || !/^\s*OMP_BUNDLER_ADAPTER\s*=/.test(filtered[index])) continue;
+    adapterFound = true;
+    if (filtered[index].slice(filtered[index].indexOf("=") + 1).trim() !== "pumble") {
+      filtered[index] = `${filtered[index].slice(0, filtered[index].indexOf("=") + 1)}pumble`;
+    }
+  }
+  if (!adapterFound) {
+    filtered.unshift("OMP_BUNDLER_ADAPTER=pumble");
+  }
+
+  // Build the managed Pumble block body.
+  const block = [
+    PUMBLE_ENV_HEADING,
+    ...PUMBLE_RUNTIME_FIELDS.map((field) => `${field}=${knownValues.get(field) ?? ""}`),
+    `PUMBLE_AGENT_ID=${agentId}`,
+  ];
+
+  // Replace the existing managed block, or append a new one.
+  const headingIndex = filtered.indexOf(PUMBLE_ENV_HEADING);
+  if (headingIndex >= 0) {
+    let existingEnd = headingIndex + 1;
+    while (existingEnd < filtered.length) {
+      const body = filtered[existingEnd];
+      if (body.trim() === "" || body.trimStart().startsWith("#")) break;
+      if (!/^\s*(?:OMP_BUNDLER_ADAPTER|PUMBLE_[A-Z0-9_]*)\s*=/.test(body)) break;
+      existingEnd += 1;
+    }
+    filtered.splice(headingIndex, existingEnd - headingIndex, ...block);
+  } else {
+    if (filtered.length > 0 && filtered[filtered.length - 1].trim() !== "") filtered.push("");
+    filtered.push(...block);
+  }
+
+  const result = filtered.length > 0 ? `${filtered.join(eol)}${eol}` : "";
+  return result === source ? source : result;
 }

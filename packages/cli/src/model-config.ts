@@ -264,6 +264,19 @@ function placeholderNames(value: string, contextLabel: string): readonly string[
   return [...new Set(names)].sort((left, right) => left.localeCompare(right));
 }
 
+/**
+ * Derive the model-connection environment variable names referenced by a
+ * single agent's parsed config (baseUrl, model, apiKey), sorted and de-duped.
+ * Shares the placeholder grammar used by {@link loadBundleModels}.
+ */
+export function modelConfigEnvNames(config: ModelConfig, contextLabel: string): readonly string[] {
+  return [...new Set([
+    ...placeholderNames(config.baseUrl, `${contextLabel} [baseUrl]`),
+    ...placeholderNames(config.model, `${contextLabel} [model]`),
+    ...placeholderNames(config.apiKey, `${contextLabel} [apiKey]`),
+  ])].sort((left, right) => left.localeCompare(right));
+}
+
 export async function loadBundleModels(rootDir: string, agents: readonly AgentDirectory[]): Promise<LoadedModelBundle> {
   const modelsDir = resolveInside(rootDir, "models");
   const directory = await lstat(modelsDir).catch(() => null);
@@ -283,11 +296,6 @@ export async function loadBundleModels(rootDir: string, agents: readonly AgentDi
     if (info.isSymbolicLink()) throw new Error(`${path}: model file must not be a symlink`);
     if (!info.isFile()) throw new Error(`${path}: model file must be a regular file`);
   }
-  for (const agent of agents) {
-    const path = join(modelsDir, `${agent.id}.yml`);
-    if (!await lstat(path).catch(() => null)) throw new Error(`${path}: model file is required for effective agent '${agent.id}'`);
-  }
-
   const connections: ValidatedModelConnection[] = [];
   const metadata: ModelMetadata[] = [];
   const envNames = new Set<string>();
@@ -297,11 +305,7 @@ export async function loadBundleModels(rootDir: string, agents: readonly AgentDi
       throw new Error(`${path}: cannot read model file: ${error instanceof Error ? error.message : String(error)}`);
     });
     const config = parseModelConfig(source, path);
-    const names = [...new Set([
-      ...placeholderNames(config.baseUrl, `${path} [baseUrl]`),
-      ...placeholderNames(config.model, `${path} [model]`),
-      ...placeholderNames(config.apiKey, `${path} [apiKey]`),
-    ])].sort((left, right) => left.localeCompare(right));
+    const names = modelConfigEnvNames(config, path);
     for (const name of names) envNames.add(name);
     const providerId = providerIdForAgent(agent.id);
     connections.push({ agentId: agent.id, providerId, config });

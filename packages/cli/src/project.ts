@@ -99,6 +99,23 @@ export function resolveCommandPath(path: string, cwd: string): string {
   return resolve(cwd, path);
 }
 
+/**
+ * Resolve the bundle's default runtime.env path. Returns the path if a
+ * `runtime.env` entry exists at the bundle root (any type — symlink or
+ * otherwise), or `undefined` when absent. {@link validateBundle} remains
+ * the authority that rejects symlinks and non-file entries.
+ */
+export async function resolveDefaultEnvFile(bundleRoot: string): Promise<string | undefined> {
+  const path = join(bundleRoot, "runtime.env");
+  try {
+    await lstat(path);
+    return path;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
 function isRecord(value: YamlValue): value is { [key: string]: YamlValue } {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }

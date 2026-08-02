@@ -14,6 +14,7 @@ import { assertNoLegacyOmpSource } from "./common.ts";
 import { assertNoSymlinkComponents, readOptionalTextFile, relativePlanPath } from "./support.ts";
 import {
   MODEL_FIELDS,
+  modelConfigEnvNames,
   modelConfigPath,
   parseModelConfig,
   renderModelTemplate,
@@ -21,6 +22,7 @@ import {
   type CliModelField,
   type ModelConfig,
 } from "../model-config.ts";
+import { runtimeEnvExample, updateAgentModelEnvBlock } from "./templates.ts";
 
 /** Fields that have a CLI flag, derived from MODEL_FIELDS. */
 const CLI_FIELDS: readonly CliModelField[] = MODEL_FIELDS.filter((field): field is CliModelField => field.flag !== undefined);
@@ -308,6 +310,11 @@ async function commitConfig(
   const yaml = typeof content === "string" ? content : renderModelYaml(content);
   const modelChanged = existingContent !== yaml;
 
+  // Derive the generated env names for this agent's committed model config so
+  // runtime.env.example stays in sync in the same transaction.
+  const committedConfig = typeof content === "string" ? parseModelConfig(yaml, configPath) : content;
+  const envNames = modelConfigEnvNames(committedConfig, configPath);
+
   const writes: PlannedWrite[] = [];
   if (modelChanged) {
     writes.push({ path: relativePlanPath(project.rootDir, configPath), content: yaml, overwrite: true });
@@ -325,6 +332,17 @@ async function commitConfig(
     }
   }
 
+  // Update (or seed) runtime.env.example's generated block for this agent.
+  const envExamplePath = join(project.rootDir, "runtime.env.example");
+  const envExampleFile = await readOptionalTextFile(envExamplePath, "runtime env example");
+  const envExampleSource = envExampleFile?.content ?? runtimeEnvExample();
+  const updatedEnvExample = updateAgentModelEnvBlock(envExampleSource, agentId, envNames);
+  let envExampleUpdated = false;
+  if (updatedEnvExample !== envExampleSource) {
+    writes.push({ path: "runtime.env.example", content: updatedEnvExample, overwrite: true });
+    envExampleUpdated = true;
+  }
+
   if (writes.length === 0) {
     context.io.stdout.write(`unchanged ${relativePlanPath(project.rootDir, configPath)}\n`);
     return 0;
@@ -339,6 +357,9 @@ async function commitConfig(
   }
   if (legacyRemoved) {
     context.io.stdout.write(`removed legacy modelRoles.default from ${relativePlanPath(project.rootDir, configYmlPath)}\n`);
+  }
+  if (envExampleUpdated) {
+    context.io.stdout.write(`updated runtime.env.example for ${agentId}\n`);
   }
   return 0;
 }

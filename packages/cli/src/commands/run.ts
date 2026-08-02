@@ -1,6 +1,7 @@
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 import { optionBoolean } from "../args.ts";
 import { executeChild } from "../process.ts";
+import { resolveBundleRoot, resolveDefaultEnvFile } from "../project.ts";
 import { validateBundle, formatIssue } from "./check.ts";
 import { assertAllowedOptions, requiredOptionString } from "./common.ts";
 import {
@@ -10,12 +11,13 @@ import {
 import type { CheckResult } from "./check.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 
-export const RUN_HELP = `omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]
+export const RUN_HELP = `omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]
 
 Validate runtime bindings, then run the configured image with its ports and
-named data volume. --agents selects the agent collection used to validate
-adapter bindings without changing the image. --dry-run prints the Docker
-command without executing it.`;
+named data volume. --env-file defaults to the bundle's runtime.env; copy
+runtime.env.example to runtime.env to fill deployment values. --agents
+selects the agent collection used to validate adapter bindings without
+changing the image. --dry-run prints the Docker command without executing it.`;
 
 const SAFE_IMAGE_TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
 const SAFE_VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -51,11 +53,22 @@ export const runCommand: CommandHandler = async (
     return usageError(context, "--dry-run does not accept a value");
   }
 
-  let envFile: string;
-  try {
-    envFile = requiredOptionString(args, "env-file");
-  } catch (error) {
-    return usageError(context, error instanceof Error ? error.message : String(error));
+  let envFile: string | undefined;
+  if (args.options["env-file"] !== undefined) {
+    try {
+      envFile = requiredOptionString(args, "env-file");
+    } catch (error) {
+      return usageError(context, error instanceof Error ? error.message : String(error));
+    }
+  } else {
+    const bundleRoot = await resolveBundleRoot(
+      args.positionals[0] === undefined ? undefined : args.positionals[0],
+      context.cwd,
+    );
+    envFile = await resolveDefaultEnvFile(bundleRoot);
+    if (envFile === undefined) {
+      return usageError(context, `runtime env-file is missing: ${join(bundleRoot, "runtime.env")}; copy runtime.env.example to runtime.env`);
+    }
   }
 
   let imageOverride: string | undefined;
@@ -98,6 +111,11 @@ export const runCommand: CommandHandler = async (
   if (optionBoolean(args, "dry-run")) {
     context.io.stdout.write(`${formatDockerCommand("docker", dockerArgs)}\n`);
     return 0;
+  }
+  for (const agent of result.agents) {
+    const base = `http://localhost:${settings.adapterPort}/v1/agents/${agent.id}`;
+    context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
+    context.io.stdout.write(`TUI: omp-tui ${base}\n`);
   }
 
   const docker = await executeChild("docker", dockerArgs, {

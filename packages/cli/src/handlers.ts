@@ -57,7 +57,7 @@ export const COMMAND_HELP: Record<RootCommand, string> = {
   "set-model": SET_MODEL_HELP,
   check: "omp-bundler check [bundle-path] [--env-file <path>]",
   build: "omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]",
-  run: "omp-bundler run [bundle-path] --env-file <path> [--image <tag>] [--agents <path>] [--dry-run]",
+  run: "omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]",
   migrate: "omp-bundler migrate visible-layout [bundle-path] [--dry-run] [--yes]",
 };
 
