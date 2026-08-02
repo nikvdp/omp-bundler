@@ -10,18 +10,21 @@ export const CANONICAL_ASSET_PATHS = [
   "template",
   "packages/contracts",
   "packages/core",
+  "packages/http-adapter",
   "packages/pumble-adapter",
 ] as const;
 
 type PackageAssetRoot =
   | "packages/contracts"
   | "packages/core"
+  | "packages/http-adapter"
   | "packages/pumble-adapter";
 
 /** Runtime files copied from each private package into the asset tree. */
 export const PACKAGE_ASSET_PATHS: Record<PackageAssetRoot, readonly string[]> = {
   "packages/contracts": ["package.json", "package-lock.json", "src", "schemas"],
   "packages/core": ["package.json", "package-lock.json", "src"],
+  "packages/http-adapter": ["package.json", "package-lock.json", "src"],
   "packages/pumble-adapter": ["package.json", "package-lock.json", "src"],
 };
 

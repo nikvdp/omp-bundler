@@ -17,16 +17,16 @@ RUN bun add --global @oh-my-pi/pi-coding-agent@17.1.3
 # ── runtime layout ───────────────────────────────────────────────────
 WORKDIR /app
 
-# Copy all three staged package trees: contracts (shared types and
-# schemas, resolved via file:../contracts by core and pumble-adapter),
-# core (inbound HTTP server on port 8787, RPC pool, orphan sweep,
-# ambient ingest extension), and pumble-adapter (Pumble webhook +
-# outbound callback + attachment download server on port 8765).
+# Copy all four staged package trees: contracts (shared types and
+# schemas), core (inbound HTTP server on port 8787), http-adapter
+# (default agent-like agent HTTP API on port 8765), and pumble-adapter
+# (optional Pumble webhook/callback service on port 8765).
 # node_modules and secrets are excluded by .dockerignore; Bun executes
 # the TypeScript source directly.
-COPY packages/contracts/     ./packages/contracts/
-COPY packages/core/         ./packages/core/
-COPY packages/pumble-adapter/ ./packages/pumble-adapter/
+COPY packages/contracts/       ./packages/contracts/
+COPY packages/core/            ./packages/core/
+COPY packages/http-adapter/     ./packages/http-adapter/
+COPY packages/pumble-adapter/   ./packages/pumble-adapter/
 
 # Copy the build renderer and the entrypoint supervisor.
 COPY build/            ./build/
@@ -55,11 +55,12 @@ COPY agents/          /agents/
 # all provider credentials resolve at container start from runtime env.
 RUN cd packages/contracts && bun install --frozen-lockfile --production \
  && cd /app/packages/core && bun install --frozen-lockfile --production \
+ && cd /app/packages/http-adapter && bun install --frozen-lockfile --production \
  && cd /app/packages/pumble-adapter && bun install --frozen-lockfile --production
 
 # ── /data mount ──────────────────────────────────────────────────────
 # A single shared volume covers sessions, workspace, artifacts, and
-# the pumble adapter's persistent state (token store, SQLite DBs).
+# adapter-specific persistent state.
 # OMP's default agent dir is $HOME/.omp/agent; session data lives at
 # $HOME/.omp/agent/sessions and artifacts at .../artifacts. To keep
 # these on the durable volume instead of the ephemeral layer:
@@ -67,8 +68,8 @@ RUN cd packages/contracts && bun install --frozen-lockfile --production \
 #     OMP env var).
 #   - The entrypoint symlinks sessions -> /data/sessions (no dedicated
 #     OMP env var relocates session data).
-#   - /data/workspace is the shared agent cwd, also where the pumble
-#     adapter writes attachments (/data/workspace/pumble-files).
+#   - /data/workspace is the shared agent cwd; the Pumble adapter stores
+#     downloaded attachments beneath it when that adapter is selected.
 ENV OMP_DATA_DIR=/data
 ENV OMP_SESSIONS_DIR=/data/sessions
 ENV OMP_WORKSPACE_DIR=/data/workspace
@@ -94,12 +95,18 @@ ENV OMP_RETRY_DELAYS_MS=250,1000,5000
 ENV PUMBLE_BRIDGE_HOST=0.0.0.0
 ENV PUMBLE_BRIDGE_PORT=8765
 ENV PUMBLE_CORE_URL=http://127.0.0.1:8787
+
+# Bundled adapter mode. HTTP is the credential-free default; switch to
+# pumble to run the Pumble bridge instead. Both use external port 8765.
+ENV OMP_BUNDLER_ADAPTER=http
+ENV OMP_HTTP_HOST=0.0.0.0
+ENV OMP_HTTP_PORT=8765
+ENV OMP_HTTP_CORE_URL=http://127.0.0.1:8787
 VOLUME ["/data"]
 
 # ── exposed ports ─────────────────────────────────────────────────────
-# Core inbound HTTP server listens on 8787; the Pumble adapter
-# (webhook ingestion + outbound callback + attachment download) on
-# 8765.
+# Core's internal adapter protocol listens on 8787. The selected public
+# adapter listens on 8765 (HTTP agent API by default, Pumble when selected).
 EXPOSE 8787
 EXPOSE 8765
 
@@ -118,19 +125,20 @@ EXPOSE 8765
 #   OPENCODE_GO_API_KEY  opencode-go key without a broker
 #   SYNTHETIC_API_KEY    synthetic key without a broker
 
-# ── Pumble adapter runtime config ────────────────────────────────────
+# ── bundled adapter runtime config ───────────────────────────────────
+# OMP_BUNDLER_ADAPTER   selected bundled adapter: http (default) or pumble
+# OMP_HTTP_API_TOKEN    optional Bearer token for the public HTTP API
+# OMP_HTTP_TURN_TIMEOUT_MS optional synchronous turn timeout
+#
 # PUMBLE_CORE_URL        core base URL for posting inbound messages
 # PUMBLE_ADAPTER_ID      adapter id (schema default: pumble)
 # PUMBLE_AGENT_ID        filesystem agent id for the synthesized registration
 # PUMBLE_CORE_SHARED_SECRET  shared secret for inbound auth + outbound HMAC
-# PUMBLE_PUBLIC_BASE_URL public base URL for attachment links (required
-#                        for signed download links to resolve externally)
+# PUMBLE_PUBLIC_BASE_URL public base URL for attachment links
 # PUMBLE_CORE_CALLBACK_URL optional core-to-adapter callback override
-#                          (default: http://127.0.0.1:8765/core/events)
 #
-# OMP_ADAPTERS is caller-owned and may override the generated Pumble
-# registration with a JSON array of {adapterId,callbackUrl,sharedSecret,agentId}
-# entries. PUMBLE_AGENT_ID is required only when OMP_ADAPTERS is unset.
+# OMP_ADAPTERS is caller-owned and may override the registration synthesized
+# for the selected bundled adapter.
 
 # ── child registry ──────────────────────────────────────────────────
 # The orphan sweep and core server share a JSON registry of live RPC
@@ -139,8 +147,8 @@ EXPOSE 8765
 ENV OMP_CHILD_REGISTRY_PATH=/data/child-registry.json
 
 # ── entrypoint ───────────────────────────────────────────────────────
-# Boot order: render models, orphan sweep (fail if absent/fails),
-# then the entrypoint acts as PID 1 supervisor for core + pumble.
+# Boot order: render models, configure the selected bundled adapter,
+# orphan sweep, then supervise core + adapter.
 RUN chmod +x /app/entrypoint/entrypoint.sh
 ENTRYPOINT ["/app/entrypoint/entrypoint.sh"]
 CMD []

@@ -17,7 +17,8 @@ export const PUMBLE_RUNTIME_FIELDS = [
   "PUMBLE_CORE_SHARED_SECRET",
 ] as const;
 
-export const RUNTIME_ENV_EXAMPLE = "OMP_AUTH_BROKER_URL=\nOMP_AUTH_BROKER_TOKEN=\n";
+export const RUNTIME_ENV_EXAMPLE =
+  "OMP_BUNDLER_ADAPTER=http\nOMP_HTTP_API_TOKEN=\nOMP_AUTH_BROKER_URL=\nOMP_AUTH_BROKER_TOKEN=\n";
 
 export function bundleFiles(bundleName: string): readonly PlannedWrite[] {
   return [
@@ -98,7 +99,7 @@ export function componentFile(
 }
 
 function bundleReadme(bundleName: string): string {
-  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its components.\n2. Run omp-bundler check.\n3. Build and run the bundle.\n\nThe committed runtime.env.example contains placeholders only. Copy it to runtime.env and fill deployment values locally.\n`;
+  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its components.\n2. Run omp-bundler check.\n3. Build and run the bundle.\n4. Send a message to the default HTTP adapter:\n\n   curl -X POST http://localhost:8765/v1/agents/<agent-id>/conversations/local/messages \\\\\n     -H 'content-type: application/json' \\\\\n     -d '{\"message\":\"Hello\"}'\n\nThe request waits for the completed turn and returns its text, attachments, and usage as JSON. Set OMP_HTTP_API_TOKEN in runtime.env to require a Bearer token. Set OMP_BUNDLER_ADAPTER=pumble and generate the Pumble adapter fields only for Pumble deployments.\n\nThe committed runtime.env.example contains placeholders only. Copy it to runtime.env and fill deployment values locally.\n`;
 }
 
 function bundleConfig(bundleName: string): string {

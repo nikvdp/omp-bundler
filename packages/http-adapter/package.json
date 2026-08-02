@@ -1,0 +1,26 @@
+{
+  "name": "@omp-bundler/http-adapter",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/server.ts",
+      "import": "./src/server.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "bun src/server.ts"
+  },
+  "dependencies": {
+    "@omp-bundler/contracts": "file:../contracts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "typescript": "~5.9.3"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

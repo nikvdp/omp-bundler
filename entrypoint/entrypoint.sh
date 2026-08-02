@@ -4,16 +4,10 @@
 #
 # Boot order:
 #   1. Render models.yml from the env-var template.
-#   2. Run the orphan sweep once (a core module); fail if it is missing
-#      or exits non-zero. Its failures are never hidden. The sweep
-#      reclaims orphaned RPC child process groups recorded in
-#      OMP_CHILD_REGISTRY_PATH.
-#   3. Start the core server (port 8787) and the Pumble adapter (port
-#      8765) as supervised child processes. This shell remains PID 1,
-#      traps TERM/INT, forwards signals to both children, and reaps
-#      the sibling if either exits (fail-fast: the first child to
-#      exit tears down the other, and the container exits with that
-#      child's status).
+#   2. Configure the selected bundled adapter (HTTP by default).
+#   3. Run the orphan sweep once; fail if it is missing or fails.
+#   4. Supervise the core server (port 8787) and selected adapter
+#      (port 8765). The first child to exit tears down its sibling.
 #
 # The core server loads the ambient ingest extension at runtime; it
 # must be present in the staged packages/core/src tree.
@@ -30,8 +24,7 @@ BUILD_DIR="${OMP_BUILD_DIR:-/app/build}"
 MODELS_TMPL="${AGENT_DIR}/models.yml.tmpl"
 MODELS_OUT="${AGENT_DIR}/models.yml"
 
-# Explicit /data mount paths. The volume is shared with the pumble
-# adapter, which writes attachments under /data/workspace.
+# Explicit /data mount paths shared by core and the selected adapter.
 DATA_DIR="${OMP_DATA_DIR:-/data}"
 SESSIONS_DIR="${DATA_DIR}/sessions"
 WORKSPACE_DIR="${DATA_DIR}/workspace"
@@ -44,11 +37,11 @@ DURABLE_AGENTS_DIR="${DATA_DIR}/agents"
 CHILD_REGISTRY="${OMP_CHILD_REGISTRY_PATH:-${DATA_DIR}/child-registry.json}"
 export OMP_CHILD_REGISTRY_PATH="$CHILD_REGISTRY"
 
-# Core and Pumble entrypoints, overridable for development. The
-# orphan sweep, core server, and pumble server land in their package
-# src trees. Bun executes the TypeScript source directly.
+# Runtime entrypoints, overridable for development. Bun executes the
+# TypeScript source directly.
 ORPHAN_SWEEP="${OMP_ORPHAN_SWEEP:-/app/packages/core/src/orphan-sweep.ts}"
 CORE_SERVER="${OMP_CORE_SERVER:-/app/packages/core/src/server.ts}"
+HTTP_SERVER="${OMP_HTTP_SERVER:-/app/packages/http-adapter/src/server.ts}"
 PUMBLE_SERVER="${OMP_PUMBLE_SERVER:-/app/packages/pumble-adapter/src/server.ts}"
 
 # Ambient ingest extension loaded by the core server at runtime.
@@ -245,33 +238,69 @@ if [ -n "${OMP_AUTH_BROKER_URL:-}" ] || [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ]; the
 	log "configured OMP auth broker"
 fi
 
-# Default image composition: register the bundled Pumble adapter against its
-# loopback callback and the selected filesystem agent. OMP_ADAPTERS remains
-# caller-owned for multi-adapter deployments. Build the JSON with Bun so
-# arbitrary secret bytes are escaped.
-if [ -z "${OMP_ADAPTERS:-}" ]; then
-	[ -n "${PUMBLE_AGENT_ID:-}" ] || die "PUMBLE_AGENT_ID is required when OMP_ADAPTERS is unset"
-	[ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
-	# shellcheck disable=SC2016
-	OMP_ADAPTERS="$(
-		bun -e '
-      const adapterId = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
-      const agentId = process.env.PUMBLE_AGENT_ID;
-      const port = process.env.PUMBLE_BRIDGE_PORT?.trim() || "8765";
-      const callbackUrl =
-        process.env.PUMBLE_CORE_CALLBACK_URL?.trim() ||
-        `http://127.0.0.1:${port}/core/events`;
-      process.stdout.write(JSON.stringify([{
-        adapterId,
-        callbackUrl,
-        sharedSecret: process.env.PUMBLE_CORE_SHARED_SECRET,
-        agentId,
-      }]));
-    '
-	)"
-	export OMP_ADAPTERS
-	log "configured bundled Pumble adapter registration"
-fi
+# Select one bundled adapter process. HTTP is the default and registers every
+# baked agent. Pumble retains the existing one-agent registration. Callers may
+# still provide OMP_ADAPTERS directly for advanced registration layouts.
+ADAPTER_MODE="${OMP_BUNDLER_ADAPTER:-http}"
+case "$ADAPTER_MODE" in
+http)
+	ADAPTER_SERVER="$HTTP_SERVER"
+	ADAPTER_LABEL="http"
+	if [ -z "${OMP_ADAPTERS:-}" ]; then
+		OMP_HTTP_AGENT_IDS="$(IFS=,; printf '%s' "${_baked_ids[*]}")"
+		export OMP_HTTP_AGENT_IDS
+		# shellcheck disable=SC2016
+		OMP_ADAPTERS="$(
+			bun -e '
+        import { randomBytes } from "node:crypto";
+        const ids = (process.env.OMP_HTTP_AGENT_IDS || "").split(",").filter(Boolean);
+        const port = process.env.OMP_HTTP_PORT?.trim() || "8765";
+        const secret =
+          process.env.OMP_HTTP_CORE_SHARED_SECRET ||
+          randomBytes(32).toString("hex");
+        process.stdout.write(JSON.stringify(ids.map((agentId) => ({
+          adapterId: `http-${agentId}`,
+          callbackUrl: `http://127.0.0.1:${port}/core/events/${encodeURIComponent(agentId)}`,
+          sharedSecret: secret,
+          agentId,
+        }))));
+      '
+		)"
+		export OMP_ADAPTERS
+		log "configured bundled HTTP adapter registrations for ${#_baked_ids[@]} agent(s)"
+	fi
+	;;
+pumble)
+	ADAPTER_SERVER="$PUMBLE_SERVER"
+	ADAPTER_LABEL="pumble"
+	if [ -z "${OMP_ADAPTERS:-}" ]; then
+		[ -n "${PUMBLE_AGENT_ID:-}" ] || die "PUMBLE_AGENT_ID is required in pumble mode"
+		[ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
+		# shellcheck disable=SC2016
+		OMP_ADAPTERS="$(
+			bun -e '
+        const adapterId = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
+        const agentId = process.env.PUMBLE_AGENT_ID;
+        const port = process.env.PUMBLE_BRIDGE_PORT?.trim() || "8765";
+        const callbackUrl =
+          process.env.PUMBLE_CORE_CALLBACK_URL?.trim() ||
+          `http://127.0.0.1:${port}/core/events`;
+        process.stdout.write(JSON.stringify([{
+          adapterId,
+          callbackUrl,
+          sharedSecret: process.env.PUMBLE_CORE_SHARED_SECRET,
+          agentId,
+        }]));
+      '
+		)"
+		export OMP_ADAPTERS
+		log "configured bundled Pumble adapter registration"
+	fi
+	;;
+*)
+	die "OMP_BUNDLER_ADAPTER must be http or pumble (got ${ADAPTER_MODE})"
+	;;
+esac
 
 # -- 2. orphan sweep ---------------------------------------------------
 # The orphan sweep is a core module. It MUST run once; we do not
@@ -284,25 +313,23 @@ log "running orphan sweep: ${ORPHAN_SWEEP}"
 bun "$ORPHAN_SWEEP"
 log "orphan sweep complete"
 
-# -- 3. start core + pumble under supervision ---------------------------
-# This shell is PID 1. It starts both services as child processes
-# and stays resident to forward signals and tear down siblings.
+# -- 3. start core + selected adapter under supervision -----------------
+# This shell remains PID 1, forwards signals, and tears down the sibling
+# when either supervised service exits.
 
 [ -f "$CORE_SERVER" ] || die "core server not found at ${CORE_SERVER}"
-[ -f "$PUMBLE_SERVER" ] || die "pumble server not found at ${PUMBLE_SERVER}"
+[ -f "$ADAPTER_SERVER" ] || die "${ADAPTER_LABEL} adapter server not found at ${ADAPTER_SERVER}"
 [ -f "$AMBIENT_EXTENSION" ] || die "ambient ingest extension not found at ${AMBIENT_EXTENSION}"
 
 CORE_PID=""
-PUMBLE_PID=""
+ADAPTER_PID=""
 EXIT_CODE=0
 TEARING_DOWN=0
 
-# Forward a signal to both children. Uses the negative-pid kill to
-# hit the whole process group when the child spawned its own group.
 forward_signal() {
 	local sig="$1"
-	if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-		kill -"$sig" "$PUMBLE_PID" 2>/dev/null || true
+	if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
+		kill -"$sig" "$ADAPTER_PID" 2>/dev/null || true
 	fi
 	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 		kill -"$sig" "$CORE_PID" 2>/dev/null || true
@@ -316,44 +343,35 @@ log "starting core server: ${CORE_SERVER}"
 bun "$CORE_SERVER" &
 CORE_PID=$!
 
-log "starting pumble adapter: ${PUMBLE_SERVER}"
-bun "$PUMBLE_SERVER" &
-PUMBLE_PID=$!
+log "starting ${ADAPTER_LABEL} adapter: ${ADAPTER_SERVER}"
+bun "$ADAPTER_SERVER" &
+ADAPTER_PID=$!
 
-log "core pid=${CORE_PID}, pumble pid=${PUMBLE_PID}"
+log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}"
 
-# Wait for the first child to exit. When either service dies, the
-# other is torn down (fail-fast sibling termination) and the
-# container exits with the first child's status. No background
-# process is left unmonitored.
 set +e
 wait -n
 FIRST_EXIT=$?
 set -e
 
 if [ "$TEARING_DOWN" -eq 1 ]; then
-	# Signal-driven shutdown: forward already sent. Wait for both to
-	# finish, then exit with the first child's status (0 if it exited
-	# cleanly after the signal, non-zero if it had already crashed).
 	EXIT_CODE="$FIRST_EXIT"
 else
-	# A child died on its own. Fail fast: tear down the sibling.
 	log "child exited (status ${FIRST_EXIT}); tearing down sibling"
 	EXIT_CODE="$FIRST_EXIT"
 	forward_signal TERM
 fi
 
-# Give both children a bounded grace period, then SIGKILL stragglers.
 for _ in {1..50}; do
 	CORE_ALIVE=0
-	PUMBLE_ALIVE=0
+	ADAPTER_ALIVE=0
 	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 		CORE_ALIVE=1
 	fi
-	if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-		PUMBLE_ALIVE=1
+	if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
+		ADAPTER_ALIVE=1
 	fi
-	if [ "$CORE_ALIVE" -eq 0 ] && [ "$PUMBLE_ALIVE" -eq 0 ]; then
+	if [ "$CORE_ALIVE" -eq 0 ] && [ "$ADAPTER_ALIVE" -eq 0 ]; then
 		break
 	fi
 	sleep 0.1
@@ -363,10 +381,10 @@ if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 	kill -9 "$CORE_PID" 2>/dev/null || true
 	wait "$CORE_PID" 2>/dev/null || true
 fi
-if [ -n "$PUMBLE_PID" ] && kill -0 "$PUMBLE_PID" 2>/dev/null; then
-	log "pumble did not exit; sending SIGKILL"
-	kill -9 "$PUMBLE_PID" 2>/dev/null || true
-	wait "$PUMBLE_PID" 2>/dev/null || true
+if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
+	log "${ADAPTER_LABEL} adapter did not exit; sending SIGKILL"
+	kill -9 "$ADAPTER_PID" 2>/dev/null || true
+	wait "$ADAPTER_PID" 2>/dev/null || true
 fi
 
 log "supervisor exiting (status ${EXIT_CODE})"
