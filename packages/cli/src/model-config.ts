@@ -59,7 +59,7 @@ export const MODEL_FIELDS: readonly ModelField[] = [
     key: "model",
     flag: "model",
     label: "Model name",
-    description: "Provider model identifier, e.g. gpt-5.4 or claude-sonnet-5.",
+    description: "Provider model identifier, e.g. gpt-5.4 or claude-sonnet-5. Use ${ENV_VAR} for templated values.",
     required: true,
   },
   {
@@ -120,7 +120,7 @@ export function renderModelTemplate(agentId: string, existing?: ModelConfig): st
   const lines: string[] = [
     `# Model configuration for agent '${agentId}'.`,
     `# Edit directly or regenerate with: omp-bundler set-model ${agentId}`,
-    `# Accept literal values or \${ENV_VAR} templates for baseUrl and apiKey.`,
+    `# Accept literal values or \${ENV_VAR} templates for baseUrl, model, and apiKey.`,
     `# An empty quoted apiKey ("") means no authentication.`,
     "",
   ];

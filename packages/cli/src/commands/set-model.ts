@@ -127,7 +127,7 @@ async function runEditor(
   const tempDir = await mkdtemp(join(tmpdir(), "omp-set-model-"));
   const tempPath = join(tempDir, `${agentId}.yml`);
   try {
-    await writeFile(tempPath, template, "utf8");
+    await writeFile(tempPath, template, { encoding: "utf8", mode: 0o600 });
     const editor = process.env.VISUAL ?? process.env.EDITOR ?? "vi";
     const result = await executeChild(editor, [tempPath], { stdio: "inherit" });
     if (result.exitCode !== 0) {
@@ -142,7 +142,7 @@ async function runEditor(
       parseModelConfig(edited, configPath);
       return commitConfig(context, project, agentId, configPath, edited, existingFile!.content);
     }
-    parseModelConfig(edited, tempPath);
+    parseModelConfig(edited, configPath);
     return commitConfig(context, project, agentId, configPath, edited, existingFile?.content);
   } finally {
     await rm(tempDir, { recursive: true, force: true });

@@ -246,7 +246,7 @@ function unquote(value: string): string {
     try {
       return JSON.parse(value) as string;
     } catch {
-      throw new YamlError(`invalid quoted scalar: ${value}`);
+      throw new YamlError("invalid quoted scalar");
     }
   }
   return value;
