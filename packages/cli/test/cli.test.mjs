@@ -21,6 +21,7 @@ import {
   handlerContext,
   newCommand,
   runCommand,
+  serviceCommand,
   PACKAGE_ASSET_PATHS,
   removeDockerContext,
   setModelCommand,
@@ -1147,12 +1148,13 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
       dataVolume: "configured-data",
       corePort: 9100,
       adapterPort: 9200,
+      containerName: "configured-data-service",
     });
     assert.equal(resolveRunSettings({ project }, "override:tag").image, "override:tag");
     assert.equal(buildPreviewCommand("override:tag", "/tmp/docker-context"), "docker build -t override:tag /tmp/docker-context");
     assert.equal(
       runPreviewCommand(settings, "/tmp/runtime.env"),
-      "docker run --rm -p 9100:8787 -p 9200:8765 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
+      "docker run --rm --name configured-data-service -p 9100:8787 -p 9200:8765 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
     );
 
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
@@ -1170,10 +1172,74 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
     assert.equal(dryRun.stderr, "");
     assert.equal(
       dryRun.stdout.trim(),
-      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} override:tag`,
+      `docker run --rm --name bundle-data-service -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} override:tag`,
     );
   });
 });
+test("service lifecycle uses one deterministic detached Docker container", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "runtime.env"), runtimeEnv());
+
+    const preview = await invoke(serviceCommand, bundle, ["start"], { "dry-run": true });
+    assert.equal(preview.result, 0, preview.stderr);
+    assert.match(preview.stdout, /^docker run --rm -d --name bundle-data-service /);
+
+    const capturePath = join(parent, "docker-calls.jsonl");
+    await writeFile(join(parent, "docker"), `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args) + "\\n");
+if (process.env.DOCKER_MISSING === "1" && ["inspect", "stop", "restart"].includes(args[0])) {
+  console.error("Error: No such object: " + args.at(-1));
+  process.exit(1);
+}
+if (args[0] === "inspect") console.log("running");
+if (args[0] === "run") console.log("container-id");
+`, { mode: 0o755 });
+
+    const previousPath = process.env.PATH;
+    const previousMissing = process.env.DOCKER_MISSING;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      const started = await invoke(serviceCommand, bundle, ["start"]);
+      assert.equal(started.result, 0, started.stderr);
+      assert.match(started.stdout, /Started service bundle-data-service/);
+      const status = await invoke(serviceCommand, bundle, ["status"]);
+      assert.equal(status.result, 0, status.stderr);
+      assert.equal(status.stdout, "Service bundle-data-service: running\n");
+      const stopped = await invoke(serviceCommand, bundle, ["stop"]);
+      assert.equal(stopped.result, 0, stopped.stderr);
+      assert.equal(stopped.stdout, "Service bundle-data-service: stopped\n");
+      const restarted = await invoke(serviceCommand, bundle, ["restart"]);
+      assert.equal(restarted.result, 0, restarted.stderr);
+      assert.equal(restarted.stdout, "Service bundle-data-service: restarted\n");
+
+      process.env.DOCKER_MISSING = "1";
+      const missingStatus = await invoke(serviceCommand, bundle, ["status"]);
+      assert.equal(missingStatus.result, 1);
+      assert.equal(missingStatus.stdout, "Service bundle-data-service: stopped\n");
+      assert.equal((await invoke(serviceCommand, bundle, ["stop"])).result, 0);
+      const missingRestart = await invoke(serviceCommand, bundle, ["restart"]);
+      assert.equal(missingRestart.result, 1);
+      assert.match(missingRestart.stderr, /service start/);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousMissing === undefined) delete process.env.DOCKER_MISSING;
+      else process.env.DOCKER_MISSING = previousMissing;
+    }
+
+    const calls = (await readFile(capturePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(calls[0].slice(0, 5), ["run", "--rm", "-d", "--name", "bundle-data-service"]);
+    assert.deepEqual(calls[1], ["inspect", "--type", "container", "--format", "{{.State.Status}}", "bundle-data-service"]);
+    assert.deepEqual(calls[2], ["stop", "bundle-data-service"]);
+    assert.deepEqual(calls[3], ["restart", "bundle-data-service"]);
+  });
+});
+
 
 test("run --agents validates bindings against the same alternate collection as build", async () => {
   await withTempDirectory(async (parent) => {
@@ -1205,7 +1271,7 @@ test("run --agents validates bindings against the same alternate collection as b
     assert.equal(passed.stderr, "");
     assert.equal(
       passed.stdout.trim(),
-      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${betaEnv} bundle:local`,
+      `docker run --rm --name bundle-data-service -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${betaEnv} bundle:local`,
     );
     await seedModel(bundle, "alpha");
     await rm(join(bundle, "models", "beta.yml"));
@@ -1586,11 +1652,19 @@ writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
   }
 });
 
-test("agent parent prints its available subcommands", async () => {
-  const help = await invoke(agentCommand, process.cwd(), []);
-  assert.equal(help.result, 0);
-  assert.match(help.stdout, /agent rename <old-agent-id> <new-agent-id>/);
-  assert.equal(help.stderr, "");
+test("parent command groups print their available subcommands", async () => {
+  for (const [command, pattern] of [
+    [generateCommand, /generate agent <agent-id>/],
+    [destroyCommand, /destroy agent <agent-id>/],
+    [agentCommand, /agent rename <old-agent-id> <new-agent-id>/],
+    [migrateCommand, /migrate visible-layout/],
+    [serviceCommand, /service start/],
+  ]) {
+    const help = await invoke(command, process.cwd(), []);
+    assert.equal(help.result, 0);
+    assert.match(help.stdout, pattern);
+    assert.equal(help.stderr, "");
+  }
 });
 
 test("set-model imports an exact OMP model and credential without exposing the token", async () => {
