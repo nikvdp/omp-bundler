@@ -606,6 +606,8 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
     const generatedReadme = await readFile(join(derived, "README.md"), "utf8");
     assert.match(generatedReadme, /\.example.*inactive/);
     assert.match(generatedReadme, /omp-bundler generate skill meeting-notes/);
+    assert.match(generatedReadme, /generated `model\.yml`/);
+    assert.match(generatedReadme, /discovers the live adapter port automatically/);
 
     await invoke(newCommand, parent, ["custom"], { id: "alpha" });
     const custom = join(parent, "custom");
