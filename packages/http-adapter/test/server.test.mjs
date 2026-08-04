@@ -9,7 +9,7 @@ import {
   OUTBOUND_EVENT_SIGNATURE_HEADER,
   OUTBOUND_EVENT_TYPE_HEADER,
 } from "@omp-bundler/contracts/outbound";
-import { HttpAgentAdapter } from "../src/server.ts";
+import { HttpAgentAdapter, loadHttpAdapterConfig } from "../src/server.ts";
 
 const SHARED_SECRET = "test-shared-secret";
 const API_TOKEN = "test-api-token";
@@ -35,6 +35,39 @@ function signedEventHeaders(body, type) {
     [OUTBOUND_EVENT_TYPE_HEADER]: type,
   };
 }
+
+test("HTTP config requires one registration bound to OMP_AGENT_ID", () => {
+  const registration = {
+    adapterId: "http-meetings-agent",
+    agentId: "meetings-agent",
+    sharedSecret: SHARED_SECRET,
+    callbackUrl: "http://127.0.0.1:8765/core/events/meetings-agent",
+  };
+  const env = {
+    OMP_AGENT_ID: "meetings-agent",
+    OMP_ADAPTERS: JSON.stringify([registration]),
+  };
+  assert.deepEqual(loadHttpAdapterConfig(env).agents, [{
+    agentId: "meetings-agent",
+    adapterId: "http-meetings-agent",
+    sharedSecret: SHARED_SECRET,
+  }]);
+  assert.throws(
+    () => loadHttpAdapterConfig({ ...env, OMP_ADAPTERS: "[]" }),
+    /must contain exactly one adapter registration/,
+  );
+  assert.throws(
+    () => loadHttpAdapterConfig({
+      ...env,
+      OMP_ADAPTERS: JSON.stringify([{ ...registration, agentId: undefined }]),
+    }),
+    /OMP_ADAPTERS\[0\]\.agentId must be a non-empty string/,
+  );
+  assert.throws(
+    () => loadHttpAdapterConfig({ ...env, OMP_AGENT_ID: "other-agent" }),
+    /does not match OMP_AGENT_ID "other-agent"/,
+  );
+});
 
 test("HTTP adapter returns a completed core turn without Pumble", async (t) => {
   let adapterBaseUrl = "";

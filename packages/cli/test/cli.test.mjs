@@ -737,6 +737,29 @@ test("check accepts root VCS metadata and Pumble derives the project agent id", 
     await writeText(envPath, runtimeEnv());
     const pumble = await validateBundle({ cwd: bundle, envFile: envPath });
     assert.equal(pumble.ok, true, pumble.errors.map((entry) => entry.message).join("\n"));
+    await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=[]\n`);
+    const emptyAdapters = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert(emptyAdapters.errors.some((entry) =>
+      entry.field === "OMP_ADAPTERS" && entry.message.includes("exactly one")
+    ));
+
+    const registration = {
+      adapterId: "pumble",
+      callbackUrl: "http://127.0.0.1:8765/core/events/alpha",
+      sharedSecret: "shared-secret",
+    };
+    await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=${JSON.stringify([registration])}\n`);
+    const unboundAdapters = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert(unboundAdapters.errors.some((entry) =>
+      entry.field === "OMP_ADAPTERS[0].agentId" && entry.message.includes("is required")
+    ));
+
+    await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=${JSON.stringify([{ ...registration, agentId: "stale" }])}\n`);
+    const mismatchedAdapters = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert(mismatchedAdapters.errors.some((entry) =>
+      entry.field === "OMP_ADAPTERS[0].agentId" && entry.message.includes("configured root agent 'alpha'")
+    ));
+
 
     await writeText(envPath, `${runtimeEnv()}PUMBLE_AGENT_ID=stale\n`);
     const rejected = await validateBundle({ cwd: bundle, envFile: envPath });

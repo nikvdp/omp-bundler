@@ -143,6 +143,16 @@ test("core config requires the singular id and root for bound adapters", () => {
     () => loadCoreConfig({ ...env, OMP_AGENT_ID: "beta" }),
     /does not match OMP_AGENT_ID "beta"/,
   );
+  assert.throws(
+    () => loadCoreConfig({ ...env, OMP_ADAPTERS: "[]" }),
+    /must contain exactly one adapter registration/,
+  );
+  const unboundRegistration = JSON.parse(env.OMP_ADAPTERS);
+  delete unboundRegistration[0].agentId;
+  assert.throws(
+    () => loadCoreConfig({ ...env, OMP_ADAPTERS: JSON.stringify(unboundRegistration) }),
+    /OMP_ADAPTERS\[0\]\.agentId must be a non-empty string/,
+  );
   const { OMP_AGENT_ROOT: _, ...withoutSingularRoot } = env;
   assert.throws(
     () =>
@@ -154,7 +164,7 @@ test("core config requires the singular id and root for bound adapters", () => {
   );
 });
 
-test("bound children use the singular workspace and unbound children keep the legacy cwd", () => {
+test("bound children use the singular workspace and unbound children are rejected", () => {
   const coreConfig = testConfig({
     workspaceDir: "/data/workspace",
     agentId: "alpha",
@@ -176,16 +186,12 @@ test("bound children use the singular workspace and unbound children keep the le
       args: ["--thinking", "high"],
     },
   );
-  assert.deepEqual(
-    resolveChildSpawnPlan(coreConfig, {
+  assert.throws(
+    () => resolveChildSpawnPlan(coreConfig, {
       adapterId: "legacy",
       callbackUrl: "http://127.0.0.1/callback",
       sharedSecret: "test-secret",
     }),
-    {
-      cwd: "/data/workspace",
-      model: "provider/model",
-      args: ["--thinking", "high"],
-    },
+    /adapter "legacy" is not bound to OMP_AGENT_ID/,
   );
 });
