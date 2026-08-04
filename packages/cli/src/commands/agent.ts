@@ -27,11 +27,11 @@ import { updateAgentModelEnvBlock } from "./templates.ts";
 const AGENT_HELP = "omp-bundler agent rename <old-agent-id> <new-agent-id>";
 
 export const agentCommand: CommandHandler = async (args, context) => {
-  if (args.options.help === true) {
+  const subcommand = args.positionals[0];
+  if (args.options.help === true || subcommand === undefined) {
     context.io.stdout.write(`${AGENT_HELP}\n`);
     return 0;
   }
-  const subcommand = args.positionals[0];
   if (subcommand === "rename") return agentRename(args, context);
   throw new Error(`unknown agent subcommand '${subcommand ?? ""}'. Run 'omp-bundler agent --help' for available commands`);
 };
