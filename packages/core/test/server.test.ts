@@ -6,7 +6,13 @@ import { tmpdir } from "node:os";
 import { test } from "bun:test";
 
 import { bootCoreServer } from "../src/server.ts";
-import type { CoreConfig } from "../src/config.ts";
+import {
+  loadCoreConfig,
+  safeDescribe,
+  testConfig,
+  type CoreConfig,
+} from "../src/config.ts";
+import { resolveChildSpawnPlan } from "../src/supervisor.ts";
 
 async function withTempDirectory(
   callback: (root: string) => Promise<void>,
@@ -46,7 +52,8 @@ function config(root: string, agentId: string): CoreConfig {
         agentId,
       },
     ],
-    agentsRootDir: join(root, "agents"),
+    agentId,
+    agentRootDir: join(root, "agent"),
   };
 }
 
@@ -70,22 +77,23 @@ function waitForListening(server: Server): Promise<void> {
   return promise;
 }
 
-test("boot rejects a durable agent directory without .omp", async () => {
+test("boot rejects a singular agent root without .omp", async () => {
   await withTempDirectory(async (root) => {
-    const agentRoot = join(root, "agents");
-    await mkdir(join(agentRoot, "stale"), { recursive: true });
+    const agentRoot = join(root, "agent");
+    await mkdir(join(agentRoot, "workspace"), { recursive: true });
 
     await assert.rejects(
       () => bootCoreServer(config(root, "stale")),
-      /adapter "pumble" is bound to agent "stale" but agent \.omp directory .* does not exist/,
+      /OMP_AGENT_ROOT .* has no usable \.omp directory/,
     );
   });
 });
 
-test("boot accepts a current durable agent with .omp", async () => {
+test("boot accepts a singular agent root with .omp and workspace", async () => {
   await withTempDirectory(async (root) => {
-    const agentRoot = join(root, "agents");
-    await mkdir(join(agentRoot, "current", ".omp"), { recursive: true });
+    const agentRoot = join(root, "agent");
+    await mkdir(join(agentRoot, ".omp"), { recursive: true });
+    await mkdir(join(agentRoot, "workspace"), { recursive: true });
 
     const server = await bootCoreServer(config(root, "current"));
     await waitForListening(server);
@@ -95,4 +103,89 @@ test("boot accepts a current durable agent with .omp", async () => {
       await closeServer(server);
     }
   });
+});
+
+test("core config requires the singular id and root for bound adapters", () => {
+  const secret = "not-for-diagnostics";
+  const env = {
+    OMP_HOST: "127.0.0.1",
+    OMP_PORT: "8787",
+    OMP_SESSION_DB_PATH: "/data/core/sessions.sqlite",
+    OMP_IDEMPOTENCY_DB_PATH: "/data/core/idempotency.sqlite",
+    OMP_OUTBOX_DB_PATH: "/data/core/outbound.sqlite",
+    OMP_CHILD_REGISTRY_PATH: "/data/child-registry.json",
+    OMP_WORKSPACE_DIR: "/data/workspace",
+    OMP_MAX_CHILDREN: "1",
+    OMP_IDLE_TIMEOUT_MS: "1000",
+    OMP_ENGAGEMENT_WINDOW_MS: "1000",
+    OMP_CALLBACK_TIMEOUT_MS: "1000",
+    OMP_AGENT_ID: "alpha",
+    OMP_AGENT_ROOT: "/data/agent",
+    OMP_ADAPTERS: JSON.stringify([
+      {
+        adapterId: "http-alpha",
+        callbackUrl: "http://127.0.0.1:8765/core/events/alpha",
+        sharedSecret: secret,
+        agentId: "alpha",
+      },
+    ]),
+  };
+
+  const loaded = loadCoreConfig(env);
+  assert.equal(loaded.agentId, "alpha");
+  assert.equal(loaded.agentRootDir, "/data/agent");
+  const described = safeDescribe(loaded);
+  assert.equal(described.agentId, "alpha");
+  assert.equal(described.agentRootDir, "/data/agent");
+  assert.equal(JSON.stringify(described).includes(secret), false);
+
+  assert.throws(
+    () => loadCoreConfig({ ...env, OMP_AGENT_ID: "beta" }),
+    /does not match OMP_AGENT_ID "beta"/,
+  );
+  const { OMP_AGENT_ROOT: _, ...withoutSingularRoot } = env;
+  assert.throws(
+    () =>
+      loadCoreConfig({
+        ...withoutSingularRoot,
+        OMP_AGENTS_ROOT: "/data/agents",
+      }),
+    /requires OMP_AGENT_ROOT to be set/,
+  );
+});
+
+test("bound children use the singular workspace and unbound children keep the legacy cwd", () => {
+  const coreConfig = testConfig({
+    workspaceDir: "/data/workspace",
+    agentId: "alpha",
+    agentRootDir: "/data/agent",
+    ompModel: "provider/model",
+    ompArgs: ["--thinking", "high"],
+  });
+
+  assert.deepEqual(
+    resolveChildSpawnPlan(coreConfig, {
+      adapterId: "http-alpha",
+      callbackUrl: "http://127.0.0.1/callback",
+      sharedSecret: "test-secret",
+      agentId: "alpha",
+    }),
+    {
+      cwd: "/data/agent/workspace",
+      model: "provider/model",
+      args: ["--thinking", "high"],
+    },
+  );
+  assert.deepEqual(
+    resolveChildSpawnPlan(coreConfig, {
+      adapterId: "legacy",
+      callbackUrl: "http://127.0.0.1/callback",
+      sharedSecret: "test-secret",
+    }),
+    {
+      cwd: "/data/workspace",
+      model: "provider/model",
+      args: ["--thinking", "high"],
+    },
+  );
 });

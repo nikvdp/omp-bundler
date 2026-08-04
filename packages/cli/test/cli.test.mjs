@@ -166,10 +166,12 @@ async function createEntrypointHarness(root) {
   await writeText(httpServer, "export {};\n");
   await writeText(pumbleServer, "export {};\n");
   await writeText(ambientExtension, "export {};\n");
+  const capturePath = join(root, "entrypoint-capture.json");
   await writeFile(
     join(binDir, "bun"),
     `#!${process.execPath}
-const { copyFileSync, mkdirSync } = require("node:fs");
+const { copyFileSync, mkdirSync, writeFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
 const { dirname } = require("node:path");
 const args = process.argv.slice(2);
 if (args[0]?.endsWith("/render-models.ts")) {
@@ -177,17 +179,30 @@ if (args[0]?.endsWith("/render-models.ts")) {
   const output = args[args.indexOf("--output") + 1];
   mkdirSync(dirname(output), { recursive: true });
   copyFileSync(input, output);
+} else if (args[0] === "-e") {
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", args[1]], {
+    env: process.env,
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  process.exit(result.status ?? 1);
+} else if (process.env.ENTRYPOINT_CAPTURE_PATH && args[0] === process.env.OMP_CORE_SERVER) {
+  writeFileSync(process.env.ENTRYPOINT_CAPTURE_PATH, JSON.stringify({
+    OMP_ADAPTERS: process.env.OMP_ADAPTERS,
+    OMP_AGENT_ID: process.env.OMP_AGENT_ID,
+    OMP_AGENT_ROOT: process.env.OMP_AGENT_ROOT,
+    OMP_WORKSPACE_DIR: process.env.OMP_WORKSPACE_DIR,
+  }));
 }
 `,
     { encoding: "utf8", mode: 0o755 },
   );
 
   return {
-    run(agentsSrc, dataDir) {
-      const { promise, resolve: resolveRun, reject: rejectRun } = Promise.withResolvers();
+    async run(agentSrc, dataDir, overrides = {}) {
+      await rm(capturePath, { force: true });
       const env = {
         ...process.env,
-        AGENTS_SRC: agentsSrc,
+        AGENT_SRC: agentSrc,
         OMP_DATA_DIR: dataDir,
         OMP_BUILD_DIR: buildDir,
         OMP_ORPHAN_SWEEP: orphanSweep,
@@ -196,38 +211,62 @@ if (args[0]?.endsWith("/render-models.ts")) {
         OMP_PUMBLE_SERVER: pumbleServer,
         OMP_AMBIENT_EXTENSION: ambientExtension,
         OMP_CHILD_REGISTRY_PATH: join(dataDir, "child-registry.json"),
-        OMP_ADAPTERS: "[]",
+        OMP_BUNDLER_ADAPTER: "http",
+        OMP_HTTP_CORE_SHARED_SECRET: "http-test-secret",
+        ENTRYPOINT_CAPTURE_PATH: capturePath,
         HOME: homeDir,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
       };
+      for (const key of [
+        "AGENTS_SRC",
+        "OMP_ADAPTERS",
+        "OMP_AGENT_ID",
+        "OMP_AGENT_ROOT",
+        "OMP_WORKSPACE_DIR",
+        "PUMBLE_AGENT_ID",
+        "PUMBLE_CORE_SHARED_SECRET",
+      ]) {
+        delete env[key];
+      }
+      Object.assign(env, overrides);
       delete env.OMP_AUTH_BROKER_URL;
       delete env.OMP_AUTH_BROKER_TOKEN;
-      const child = spawn("bash", [ENTRYPOINT], {
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
+      const result = await new Promise((resolveRun, rejectRun) => {
+        const child = spawn("bash", [ENTRYPOINT], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+        });
+        child.once("error", rejectRun);
+        child.once("close", (code, signal) =>
+          resolveRun({ code, signal, stdout, stderr }),
+        );
       });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk;
-      });
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk;
-      });
-      child.once("error", rejectRun);
-      child.once("close", (code, signal) => resolveRun({ code, signal, stdout, stderr }));
-      return promise;
+      const capture = (await exists(capturePath))
+        ? JSON.parse(await readFile(capturePath, "utf8"))
+        : null;
+      return { ...result, capture };
     },
   };
 }
 
-async function createBakedAgents(root, name, agents) {
+async function createStagedAgent(root, name, agentId, config) {
   const source = join(root, name);
-  for (const [agentId, config] of Object.entries(agents)) {
-    await writeText(join(source, agentId, ".omp", "config.yml"), config);
-  }
+  await writeText(join(source, "id"), `${agentId}\n`);
+  await writeText(
+    join(source, ".omp", "AGENTS.md"),
+    `# ${agentId}\n\nStaged instructions.\n`,
+  );
+  await writeText(join(source, ".omp", "config.yml"), config);
   return source;
 }
 async function createLegacyAgent(root, agentId) {
@@ -324,58 +363,146 @@ async function writeEditorScript(parent, name, body) {
   return script;
 }
 
-test("entrypoint removes stale durable .omp trees while preserving workspaces", async () => {
+test("entrypoint refreshes only singular .omp, preserves workspace, and registers one HTTP adapter", async () => {
   await withTempDirectory(async (root) => {
     const harness = await createEntrypointHarness(root);
     const dataDir = join(root, "data");
-    const imageV1 = await createBakedAgents(root, "image-v1", {
-      old: "old-image\n",
-      current: "current-image-v1\n",
-    });
+    const imageV1 = await createStagedAgent(
+      root,
+      "image-v1",
+      "alpha",
+      "image-v1\n",
+    );
     const first = await harness.run(imageV1, dataDir);
     assert.equal(first.code, 0, first.stderr);
 
-    const oldWorkspace = join(dataDir, "agents", "old", "workspace.txt");
-    const currentWorkspace = join(dataDir, "agents", "current", "notes.txt");
-    await writeText(oldWorkspace, "keep old workspace\n");
-    await writeText(currentWorkspace, "keep current workspace\n");
+    const workspaceFile = join(dataDir, "agent", "workspace", "notes.txt");
+    const siblingFile = join(dataDir, "agent", "operator.txt");
+    const legacyDefinition = join(
+      dataDir,
+      "agents",
+      "old",
+      ".omp",
+      "config.yml",
+    );
+    await writeText(workspaceFile, "keep workspace\n");
+    await writeText(siblingFile, "keep sibling\n");
+    await writeText(legacyDefinition, "leave legacy tree untouched\n");
+    await writeText(
+      join(dataDir, "agent", ".omp", "stale.txt"),
+      "remove stale definition\n",
+    );
 
-    const imageV2 = await createBakedAgents(root, "image-v2", {
-      current: "current-image-v2\n",
-    });
+    const imageV2 = await createStagedAgent(
+      root,
+      "image-v2",
+      "alpha",
+      "image-v2\n",
+    );
     const second = await harness.run(imageV2, dataDir);
     assert.equal(second.code, 0, second.stderr);
-    assert.equal(await exists(join(dataDir, "agents", "old")), true);
-    assert.equal(await exists(join(dataDir, "agents", "old", ".omp")), false);
-    assert.equal(await readFile(oldWorkspace, "utf8"), "keep old workspace\n");
     assert.equal(
-      await readFile(join(dataDir, "agents", "current", ".omp", "config.yml"), "utf8"),
-      "current-image-v2\n",
+      await readFile(join(dataDir, "agent", ".omp", "config.yml"), "utf8"),
+      "image-v2\n",
     );
-    assert.equal(await readFile(currentWorkspace, "utf8"), "keep current workspace\n");
+    assert.equal(await exists(join(dataDir, "agent", ".omp", "stale.txt")), false);
+    assert.equal(await readFile(workspaceFile, "utf8"), "keep workspace\n");
+    assert.equal(await readFile(siblingFile, "utf8"), "keep sibling\n");
+    assert.equal(
+      await readFile(legacyDefinition, "utf8"),
+      "leave legacy tree untouched\n",
+    );
+    assert.equal(second.capture.OMP_AGENT_ID, "alpha");
+    assert.equal(second.capture.OMP_AGENT_ROOT, join(dataDir, "agent"));
+    assert.equal(second.capture.OMP_WORKSPACE_DIR, join(dataDir, "workspace"));
+    assert.deepEqual(JSON.parse(second.capture.OMP_ADAPTERS), [
+      {
+        adapterId: "http-alpha",
+        callbackUrl: "http://127.0.0.1:8765/core/events/alpha",
+        sharedSecret: "http-test-secret",
+        agentId: "alpha",
+      },
+    ]);
   });
 });
 
-test("entrypoint rejects durable agent and .omp symlinks", async () => {
+test("entrypoint synthesizes one Pumble registration and preserves an OMP_ADAPTERS override", async () => {
   await withTempDirectory(async (root) => {
     const harness = await createEntrypointHarness(root);
     const dataDir = join(root, "data");
-    const agentsDir = join(dataDir, "agents");
+    const source = await createStagedAgent(
+      root,
+      "image",
+      "alpha",
+      "config\n",
+    );
+
+    const pumble = await harness.run(source, dataDir, {
+      OMP_BUNDLER_ADAPTER: "pumble",
+      PUMBLE_ADAPTER_ID: "team-chat",
+      PUMBLE_CORE_SHARED_SECRET: "pumble-test-secret",
+    });
+    assert.equal(pumble.code, 0, pumble.stderr);
+    assert.deepEqual(JSON.parse(pumble.capture.OMP_ADAPTERS), [
+      {
+        adapterId: "team-chat",
+        callbackUrl: "http://127.0.0.1:8765/core/events",
+        sharedSecret: "pumble-test-secret",
+        agentId: "alpha",
+      },
+    ]);
+
+    const override = JSON.stringify([
+      {
+        adapterId: "custom",
+        callbackUrl: "https://adapter.example.test/events",
+        sharedSecret: "custom-secret",
+      },
+    ]);
+    const custom = await harness.run(source, dataDir, {
+      OMP_ADAPTERS: override,
+    });
+    assert.equal(custom.code, 0, custom.stderr);
+    assert.equal(custom.capture.OMP_ADAPTERS, override);
+  });
+});
+
+test("entrypoint rejects invalid ids and durable agent symlinks", async () => {
+  await withTempDirectory(async (root) => {
+    const harness = await createEntrypointHarness(root);
+    const dataDir = join(root, "data");
+    const invalid = await createStagedAgent(
+      root,
+      "invalid",
+      "../escape",
+      "config\n",
+    );
+
+    const invalidId = await harness.run(invalid, dataDir);
+    assert.notEqual(invalidId.code, 0);
+    assert.match(invalidId.stderr, /must contain an agent id matching/);
+    assert.equal(await exists(join(dataDir, "agent")), false);
+
+    const source = await createStagedAgent(
+      root,
+      "valid",
+      "alpha",
+      "config\n",
+    );
     const outside = join(root, "outside");
     await writeText(join(outside, "sentinel.txt"), "outside\n");
-    await mkdir(agentsDir, { recursive: true });
-    await symlink(outside, join(agentsDir, "unsafe"));
-    const image = await createBakedAgents(root, "image", { current: "current\n" });
+    await mkdir(dataDir, { recursive: true });
+    await symlink(outside, join(dataDir, "agent"));
 
-    const agentLink = await harness.run(image, dataDir);
+    const agentLink = await harness.run(source, dataDir);
     assert.notEqual(agentLink.code, 0);
     assert.match(agentLink.stderr, /must not be a symlink/);
     assert.equal(await readFile(join(outside, "sentinel.txt"), "utf8"), "outside\n");
 
-    await rm(join(agentsDir, "unsafe"), { force: true });
-    await mkdir(join(agentsDir, "unsafe"), { recursive: true });
-    await symlink(outside, join(agentsDir, "unsafe", ".omp"));
-    const ompLink = await harness.run(image, dataDir);
+    await rm(join(dataDir, "agent"), { force: true });
+    await mkdir(join(dataDir, "agent", "workspace"), { recursive: true });
+    await symlink(outside, join(dataDir, "agent", ".omp"));
+    const ompLink = await harness.run(source, dataDir);
     assert.notEqual(ompLink.code, 0);
     assert.match(ompLink.stderr, /must not be a symlink/);
     assert.equal(await readFile(join(outside, "sentinel.txt"), "utf8"), "outside\n");
