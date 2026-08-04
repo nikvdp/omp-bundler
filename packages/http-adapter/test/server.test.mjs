@@ -57,6 +57,10 @@ test("HTTP config requires one registration bound to OMP_AGENT_ID", () => {
     /must contain exactly one adapter registration/,
   );
   assert.throws(
+    () => loadHttpAdapterConfig({ ...env, OMP_ADAPTERS: "" }),
+    /OMP_ADAPTERS is required/,
+  );
+  assert.throws(
     () => loadHttpAdapterConfig({
       ...env,
       OMP_ADAPTERS: JSON.stringify([{ ...registration, agentId: undefined }]),
@@ -66,6 +70,16 @@ test("HTTP config requires one registration bound to OMP_AGENT_ID", () => {
   assert.throws(
     () => loadHttpAdapterConfig({ ...env, OMP_AGENT_ID: "other-agent" }),
     /does not match OMP_AGENT_ID "other-agent"/,
+  );
+  assert.throws(
+    () => loadHttpAdapterConfig({
+      ...env,
+      OMP_ADAPTERS: JSON.stringify([{
+        ...registration,
+        callbackUrl: "http://127.0.0.1:8765/core/events",
+      }]),
+    }),
+    /must target \/core\/events\/<agent-id>/,
   );
 });
 

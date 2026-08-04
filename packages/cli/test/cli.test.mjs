@@ -3,6 +3,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeF
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -54,6 +55,19 @@ async function waitForFile(path, timeoutMs = 2000) {
     await delay(10);
   }
   throw new Error(`Timed out waiting for ${path}`);
+}
+async function unusedTcpPort() {
+  const server = createServer();
+  await new Promise((resolvePromise, rejectPromise) => {
+    server.once("error", rejectPromise);
+    server.listen(0, "0.0.0.0", resolvePromise);
+  });
+  const address = server.address();
+  assert(address && typeof address === "object");
+  await new Promise((resolvePromise, rejectPromise) => {
+    server.close((error) => error ? rejectPromise(error) : resolvePromise());
+  });
+  return address.port;
 }
 
 async function writeText(path, content) {
@@ -521,6 +535,20 @@ test("entrypoint synthesizes one Pumble registration and preserves an OMP_ADAPTE
     });
     assert.equal(custom.code, 0, custom.stderr);
     assert.equal(custom.capture.OMP_ADAPTERS, override);
+
+    const mismatchedPumble = await harness.run(source, join(root, "pumble-mismatch"), {
+      OMP_BUNDLER_ADAPTER: "pumble",
+      PUMBLE_ADAPTER_ID: "team-chat",
+      PUMBLE_CORE_SHARED_SECRET: "pumble-test-secret",
+      OMP_ADAPTERS: JSON.stringify([{
+        adapterId: "other-chat",
+        callbackUrl: "http://127.0.0.1:8765/core/events",
+        sharedSecret: "pumble-test-secret",
+        agentId: "alpha",
+      }]),
+    });
+    assert.notEqual(mismatchedPumble.code, 0);
+    assert.match(mismatchedPumble.stderr, /adapterId matches PUMBLE_ADAPTER_ID/);
   });
 });
 
@@ -546,6 +574,11 @@ test("entrypoint rejects invalid ids and durable agent symlinks", async () => {
       "alpha",
       "config\n",
     );
+    const emptyAdapters = await harness.run(source, join(root, "empty-adapters"), {
+      OMP_ADAPTERS: "",
+    });
+    assert.notEqual(emptyAdapters.code, 0);
+    assert.match(emptyAdapters.stderr, /OMP_ADAPTERS must not be empty when explicitly set/);
     const outside = join(root, "outside");
     await writeText(join(outside, "sentinel.txt"), "outside\n");
     await mkdir(dataDir, { recursive: true });
@@ -745,10 +778,15 @@ test("check accepts root VCS metadata and Pumble derives the project agent id", 
     assert(emptyAdapters.errors.some((entry) =>
       entry.field === "OMP_ADAPTERS" && entry.message.includes("exactly one")
     ));
+    await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=\n`);
+    const blankAdapters = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert(blankAdapters.errors.some((entry) =>
+      entry.field === "OMP_ADAPTERS" && entry.message.includes("must not be empty")
+    ));
 
     const registration = {
       adapterId: "pumble",
-      callbackUrl: "http://127.0.0.1:8765/core/events/alpha",
+      callbackUrl: "http://127.0.0.1:8765/core/events",
       sharedSecret: "shared-secret",
     };
     await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=${JSON.stringify([registration])}\n`);
@@ -761,6 +799,24 @@ test("check accepts root VCS metadata and Pumble derives the project agent id", 
     const mismatchedAdapters = await validateBundle({ cwd: bundle, envFile: envPath });
     assert(mismatchedAdapters.errors.some((entry) =>
       entry.field === "OMP_ADAPTERS[0].agentId" && entry.message.includes("configured root agent 'alpha'")
+    ));
+    await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=${JSON.stringify([{
+      ...registration,
+      callbackUrl: "http://127.0.0.1:8765/core/events/alpha",
+      agentId: "alpha",
+    }])}\n`);
+    const mismatchedRoute = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert(mismatchedRoute.errors.some((entry) =>
+      entry.field === "OMP_ADAPTERS[0].callbackUrl" && entry.message.includes("must target '/core/events'")
+    ));
+    await writeText(envPath, `${runtimeEnv()}OMP_ADAPTERS=${JSON.stringify([{
+      ...registration,
+      adapterId: "other-chat",
+      agentId: "alpha",
+    }])}\n`);
+    const mismatchedAdapterId = await validateBundle({ cwd: bundle, envFile: envPath });
+    assert(mismatchedAdapterId.errors.some((entry) =>
+      entry.field === "OMP_ADAPTERS[0].adapterId" && entry.message.includes("must match PUMBLE_ADAPTER_ID 'pumble'")
     ));
 
 
@@ -823,7 +879,14 @@ test("live adapter discovery follows the labeled foreground container", async ()
     const docker = join(parent, "docker");
     await writeFile(docker, `#!${process.execPath}
 const args = process.argv.slice(2);
-if (args[0] === "port" && args[1] === "bundle-data-service") process.exit(1);
+if (args[0] === "inspect") {
+  const name = args.at(-1);
+  if (name === "bundle-data-service") process.stdout.write('"exited"\\n"/bundle"\\n');
+  else if (name === "foreign-service") process.stdout.write('"running"\\n"/other-bundle"\\n');
+  else if (name === "foreground-id") process.stdout.write('"running"\\n"/bundle"\\n');
+  else process.exit(1);
+  process.exit(0);
+}
 if (args[0] === "ps" && args.includes("label=io.omp-bundler.bundle-root=/bundle")) {
   process.stdout.write("foreground-id\\n");
   process.exit(0);
@@ -841,9 +904,113 @@ process.exit(1);
         await discoverPublishedAdapterPort("/bundle", "bundle-data-service"),
         10001,
       );
+      assert.equal(
+        await discoverPublishedAdapterPort("/bundle", "foreign-service"),
+        10001,
+      );
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
+    }
+  });
+});
+
+test("run and service reject a same-name container owned by another bundle", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "runtime.env"), await readFile(join(bundle, "runtime.env.example"), "utf8"));
+    await writeFile(join(parent, "docker"), `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "inspect") {
+  process.stdout.write('"running"\\n"/other-bundle"\\n');
+  process.exit(0);
+}
+process.exit(1);
+`, { mode: 0o755 });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      await assert.rejects(
+        () => invoke(serviceCommand, bundle, ["start"]),
+        /belongs to another bundle.*found \/other-bundle/,
+      );
+      await assert.rejects(
+        () => invoke(serviceCommand, bundle, ["status"]),
+        /belongs to another bundle.*found \/other-bundle/,
+      );
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+});
+
+test("run retries when Docker loses a selected host port", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    const racePort = await unusedTcpPort();
+    const configPath = join(bundle, "omp-bundler.yml");
+    await writeText(
+      configPath,
+      (await readFile(configPath, "utf8")).replace("adapterPort: 8765", `adapterPort: ${racePort}`),
+    );
+    const envPath = join(bundle, "runtime.env");
+    await writeText(envPath, await readFile(join(bundle, "runtime.env.example"), "utf8"));
+
+    const statePath = join(parent, "docker-state");
+    const readyPath = join(parent, "holder-ready");
+    const capturePath = join(parent, "docker-args.json");
+    const holderSource = `const fs=require("node:fs");const server=require("node:net").createServer();server.listen(${racePort},"0.0.0.0",()=>fs.writeFileSync(${JSON.stringify(readyPath)},"ready"));`;
+    await writeFile(join(parent, "docker"), `#!${process.execPath}
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const args = process.argv.slice(2);
+const statePath = ${JSON.stringify(statePath)};
+const readyPath = ${JSON.stringify(readyPath)};
+if (args[0] === "inspect") {
+  process.stderr.write("No such container");
+  process.exit(1);
+}
+if (args[0] !== "run") process.exit(1);
+if (!fs.existsSync(statePath)) {
+  const holder = spawn(process.execPath, ["-e", ${JSON.stringify(holderSource)}], {
+    detached: true,
+    stdio: "ignore",
+  });
+  holder.unref();
+  fs.writeFileSync(statePath, String(holder.pid));
+  for (let index = 0; index < 200 && !fs.existsSync(readyPath); index += 1) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  process.exit(fs.existsSync(readyPath) ? 1 : 2);
+}
+try { process.kill(Number(fs.readFileSync(statePath, "utf8")), "SIGTERM"); } catch {}
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args));
+process.exit(0);
+`, { mode: 0o755 });
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      const run = await invoke(runCommand, bundle, [], { "env-file": envPath });
+      assert.equal(run.result, 0, run.stderr);
+      assert.match(run.stderr, /selected host port became busy during Docker startup/);
+      const dockerArgs = JSON.parse(await readFile(capturePath, "utf8"));
+      const adapterMapping = dockerArgs.find((value) => value.endsWith(":8765"));
+      assert(adapterMapping);
+      assert.notEqual(Number(adapterMapping.split(":")[0]), racePort);
+      assert.match(run.stdout, new RegExp(`Agent endpoint if Docker starts: http://localhost:${racePort}/`));
+      assert.match(run.stdout, new RegExp(`Agent endpoint if Docker starts: http://localhost:${adapterMapping.split(":")[0]}/`));
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (await exists(statePath)) {
+        try { process.kill(Number(await readFile(statePath, "utf8")), "SIGTERM"); } catch {}
+      }
     }
   });
 });
@@ -880,7 +1047,7 @@ if (args[0] === "inspect") {
       assert.equal(run.result, 0, run.stderr);
       const lines = run.stdout.split(/\r?\n/).filter((line) => line.startsWith("Agent endpoint") || line.startsWith("TUI:"));
       assert.deepEqual(lines, [
-        "Agent endpoint (available once listening; not a readiness check): http://localhost:9999/v1/agents/alpha",
+        "Agent endpoint if Docker starts: http://localhost:9999/v1/agents/alpha",
         "TUI: omp-bundler tui",
       ]);
       assert.doesNotMatch(run.stdout, /--id/);
