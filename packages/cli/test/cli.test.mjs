@@ -574,6 +574,7 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
         "README.md",
         "omp-bundler.yml",
         "runtime.env.example",
+        "model.yml",
         "AGENTS.md",
         "config.yml",
         "subagents",
@@ -592,7 +593,9 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
     ]) {
       assert.equal(await exists(join(derived, relativePath)), true, relativePath);
     }
-    assert.equal(await exists(join(derived, "model.yml")), false);
+    const starterModel = await readFile(join(derived, "model.yml"), "utf8");
+    assert.match(starterModel, /# baseUrl: <value>/);
+    assert.match(starterModel, /# model: <value>/);
     assert.deepEqual(
       parseYaml(await readFile(join(derived, "omp-bundler.yml"), "utf8"))
         .agent,
@@ -672,6 +675,11 @@ test("set-model targets root model.yml and accepts a provider/model positional i
     assert.equal(await exists(join(bundle, "model.yml")), true);
     assert.equal(await exists(join(bundle, "models")), false);
     assert.match(await readFile(join(bundle, "model.yml"), "utf8"), /model: direct-model/);
+
+    await assert.rejects(
+      () => invoke(setModelCommand, bundle, [], { model: "${RUNTIME_MODEL}" }),
+      /model must be a literal model ID/,
+    );
 
     const ompConfig = join(parent, "omp-config");
     await writeText(join(ompConfig, "models.yml"), [
