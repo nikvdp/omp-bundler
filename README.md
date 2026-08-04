@@ -3,13 +3,13 @@
 Build and run one filesystem-configured OMP agent as a durable service.
 
 Each bundle is one deployment and one routable agent. The bundle root is the
-agent source: `AGENTS.md`, `config.yml`, optional component directories, and
-`model.yml`. There is no agent collection, registry, or repeated agent ID on
-component commands.
+agent source: `AGENTS.md`, `config.yml`, `models.yml`, `Dockerfile`, and optional
+component directories. There is no agent collection, registry, or repeated
+agent ID on component commands.
 
-`omp-bundler` creates the bundle, generates components, configures its model,
-validates the source and runtime environment, builds a Docker image, and runs
-that image in the foreground or as a managed service.
+`omp-bundler` creates the bundle, generates components, manages its native OMP
+model catalog, validates source and runtime configuration, builds the owned
+Dockerfile, and runs the image as a background service or foreground process.
 
 ## Install
 
@@ -18,7 +18,7 @@ npm install --global @omp-bundler/cli
 omp-bundler --version
 ```
 
-Docker is required for `build`, `run`, and `service` commands. Model and adapter
+Docker is required for `build`, `run`, and lifecycle commands. Model and adapter
 credentials are needed only when checking or starting a runtime environment.
 
 ## Quick start
@@ -31,16 +31,17 @@ omp-bundler new meetings-agent
 cd meetings-agent
 ```
 
-Edit the agent and configure its model:
+Edit the agent, add a model, and select it:
 
 ```bash
 $EDITOR AGENTS.md
-omp-bundler set-model deepseek/deepseek-v4-flash
+omp-bundler model add deepseek/deepseek-v4-flash
+omp-bundler model set-default deepseek/deepseek-v4-flash
 ```
 
-`set-model <provider/model>` imports an exact model from the local OMP
-installation. Run `omp-bundler set-model` without a selector to edit
-`model.yml` directly, or add `--wizard` for guided prompts.
+`model add` imports the exact provider/model from the local OMP installation by
+default. Adding another model is additive. `model set-default` changes only the
+agent's selection in `config.yml`.
 
 Create the ignored runtime file and fill its generated placeholders:
 
@@ -49,12 +50,12 @@ cp runtime.env.example runtime.env
 $EDITOR runtime.env
 ```
 
-Validate, build, and start a detached service:
+Validate, build, and start the background service:
 
 ```bash
 omp-bundler check
 omp-bundler build
-omp-bundler service start
+omp-bundler run
 ```
 
 Chat through the installed CLI:
@@ -75,7 +76,7 @@ curl -X POST \
 The development loop is:
 
 ```text
-new -> edit or generate -> set-model -> check -> build -> run
+new -> edit or generate -> model add -> model set-default -> check -> build -> run
 ```
 
 ## Source layout
@@ -91,7 +92,8 @@ meetings-agent/
 ├── commands/
 │   └── example-command.md.example
 ├── config.yml
-├── model.yml
+├── Dockerfile
+├── models.yml
 ├── extensions/
 │   └── example-extension.ts.example
 ├── omp-bundler.yml
@@ -135,9 +137,9 @@ run:
 ```
 
 The configured ports are preferred host ports, not fixed reservations. At
-launch, `run` and `service start` keep each preferred port when it is free and
-otherwise select the next free, distinct host port. The container ports remain
-8787 for core and 8765 for the adapter.
+launch, `run` keeps each preferred port when it is free and otherwise selects
+the next free, distinct host port. The container ports remain 8787 for core and
+8765 for the adapter.
 
 The ID is stable when the bundle directory is renamed. It determines the HTTP
 route and runtime registration. Change it by editing `agent.id`, then rebuild;
@@ -173,8 +175,8 @@ setupVersion: 1
 # Add agent-local OMP settings here.
 ```
 
-Do not hand-write `modelRoles.default`. `omp-bundler` generates the runtime
-binding from `model.yml` while staging the image.
+Use `omp-bundler model set-default <provider/model>` to maintain
+`modelRoles.default`. The selected model must exist in `models.yml`.
 
 ## Generate components
 
@@ -214,62 +216,59 @@ Destructive commands print affected paths and ask for confirmation. Use
 `--dry-run` to preview or `--yes` for non-interactive removal. They do not
 delete Docker volumes, sessions, or `runtime.env`.
 
-## Configure the model
+## Configure models
 
-Each new bundle includes one inert root `model.yml` template. Configure it
-before building. The shortest path is importing an exact provider/model
-selector from the local OMP installation:
-
-```bash
-omp-bundler set-model deepseek/deepseek-v4-flash
-```
-
-The command copies the model's protocol fields and credential reference; it
-does not copy a resolved secret value.
-
-Other modes use the same schema:
+Each bundle owns a native OMP `models.yml` catalog. A new bundle starts with an
+empty catalog, so add at least one model before deployment:
 
 ```bash
-# Edit model.yml in VISUAL, EDITOR, or vi
-omp-bundler set-model
+# Import provider and model metadata from the local OMP installation
+omp-bundler model add deepseek/deepseek-v4-flash
 
-# Guided prompts
-omp-bundler set-model --wizard
+# Add another model to the same provider
+omp-bundler model add deepseek/deepseek-chat
 
-# Direct fields
-omp-bundler set-model \
-  --base-url https://api.openai.com/v1 \
-  --dialect openai-responses \
-  --model gpt-5.4 \
-  --api-key '${OPENAI_API_KEY}'
+# Choose the agent default independently
+omp-bundler model set-default deepseek/deepseek-v4-flash
 
-# Print the handwritten YAML template
-omp-bundler set-model --print-template
+# Show the catalog; the default is marked with *
+omp-bundler model list
 ```
 
-`model.yml` has this schema:
+Model IDs are literal `provider/model` selectors. `model add` preserves every
+existing provider and model. It does not silently change the default.
+
+For a provider absent from local OMP configuration, supply its protocol fields:
+
+```bash
+omp-bundler model add deepseek/deepseek-chat \
+  --base-url https://api.deepseek.com \
+  --api openai-completions \
+  --api-key-env DEEPSEEK_API_KEY
+```
+
+For a local endpoint that requires no credential, use `--no-auth` instead of
+`--api-key-env`. Supported protocol values are `openai-responses`,
+`openai-completions`, and `anthropic-messages`.
+
+The resulting catalog uses OMP's native schema:
 
 ```yaml
-version: 1
-baseUrl: https://api.openai.com/v1
-dialect: openai-responses
-model: gpt-5.4
-apiKey: "${OPENAI_API_KEY}"
+providers:
+  deepseek:
+    baseUrl: https://api.deepseek.com
+    api: openai-completions
+    apiKey: "${DEEPSEEK_API_KEY}"
+    models:
+      - id: deepseek-chat
+        name: deepseek-chat
+setupVersion: 1
 ```
 
-- `baseUrl` is an HTTP(S) URL or `${ENV_VAR}`.
-- `dialect` is `openai-responses`, `openai-completions`, or
-  `anthropic-messages`.
-- `model` is a non-empty literal provider model ID.
-- `apiKey` is a literal, `${ENV_VAR}`, `null`, or an empty string for no auth.
-
-Referenced environment names are maintained in `runtime.env.example`.
-Re-running `set-model` adds new names, removes stale names, and preserves
-unrelated adapter sections. It never reads or changes ignored `runtime.env`.
-
-A literal API key is supported but becomes part of the committed source and
-built image. Use an environment template for production credentials.
-Diagnostic output never prints API key values.
+Provider credential names are mirrored into `runtime.env.example`. Imported
+secret values, when available from local OMP, are written only to ignored
+`runtime.env`, with mode `0600`, and are never printed. Existing providers,
+models, adapter fields, and unrelated runtime variables are preserved.
 
 ## Runtime adapters
 
@@ -340,10 +339,10 @@ performs source-only validation.
 Validation covers:
 
 - `omp-bundler.yml` and its singular `agent.id`
-- required root `AGENTS.md` and `config.yml`
+- required root `AGENTS.md`, `config.yml`, and owned `Dockerfile`
 - active component files and OMP frontmatter
 - TypeScript extension and tool entrypoints
-- root `model.yml` ownership and schema
+- native `models.yml` providers and the selected `modelRoles.default`
 - required runtime placeholders without exposing their values
 - accidental credentials, runtime state, and symlinks in agent source
 - Pumble or explicit adapter bindings against the bundle agent ID
@@ -361,17 +360,17 @@ omp-bundler build --tag registry.example.com/meetings-agent:2026-08-04
 `build`:
 
 1. Runs source, model, and credential-leak validation.
-2. Stages the shared runtime.
+2. Stages the shared runtime plus the bundle's exact `Dockerfile`.
 3. Writes the stable ID to the image as `/agent/id`.
 4. Maps root agent source to `/agent/.omp/`, including
    `subagents/` as `.omp/agents/`.
-5. Generates the internal provider catalog and default model binding.
+5. Copies the validated native model catalog and selected default binding.
 6. Builds the configured Docker image.
 
 Building does not contact a model provider or adapter and does not read
 `runtime.env`. Environment templates remain unresolved until container start.
 
-## Run
+## Run and lifecycle
 
 Copy and fill the local runtime file before running:
 
@@ -380,19 +379,43 @@ cp runtime.env.example runtime.env
 $EDITOR runtime.env
 ```
 
-Run in the foreground:
+Start the named background service:
 
 ```bash
 omp-bundler run
+omp-bundler status
+omp-bundler logs --follow
 ```
 
-`run` validates `runtime.env`, resolves busy host ports automatically, owns an
-unnamed temporary container, streams logs, and forwards termination signals.
-It prints the actual selected endpoint. If the managed service is already
-running, it asks whether to follow that service's logs, stop it and run a
-foreground container, or cancel.
+`run` is background-first. It validates `runtime.env`, resolves busy host ports,
+starts the deterministic `<dataVolume>-service` container, and prints the
+selected endpoint. Repeating `run` while that owned service is running reports
+its existing endpoint without replacing it.
 
-Useful overrides:
+Use foreground mode when the process should own the terminal:
+
+```bash
+omp-bundler run --foreground
+```
+
+If the named service is already running, foreground mode offers to follow its
+logs, restart it in the foreground, or cancel. Foreground mode uses an unnamed
+temporary container, streams logs, and forwards termination signals.
+
+Lifecycle commands are flat and bundle-aware:
+
+```bash
+omp-bundler status [bundle-path]
+omp-bundler stop [bundle-path]
+omp-bundler restart [bundle-path]
+omp-bundler logs [bundle-path] [--follow] [--tail 100]
+```
+
+`status` reports the service state, container name, agent ID, and live endpoint.
+`stop` is idempotent. `restart` requires an existing owned container. `logs`
+defaults to the last 100 lines; `--tail all` prints all retained logs.
+
+Useful run overrides:
 
 ```bash
 omp-bundler run ../meetings-agent \
@@ -401,10 +424,11 @@ omp-bundler run --image registry.example.com/meetings-agent:2026-08-04
 omp-bundler run --dry-run
 ```
 
-The direct Docker shape is:
+The background Docker shape is:
 
 ```bash
-docker run --rm \
+docker run --rm -d \
+  --name meetings-agent-data-service \
   --label io.omp-bundler.bundle-root=/absolute/path/to/meetings-agent \
   -p 8787:8787 \
   -p 8765:8765 \
@@ -412,22 +436,6 @@ docker run --rm \
   --env-file runtime.env \
   meetings-agent:local
 ```
-
-### Managed service
-
-```bash
-omp-bundler service start
-omp-bundler service status
-omp-bundler service restart
-omp-bundler service stop
-```
-
-The deterministic container name is `<dataVolume>-service`. `service start` is
-idempotent while it is running. `stop` is idempotent. `restart` requires an
-existing running container.
-
-`service start` accepts the same bundle path, `--env-file`, `--image`, and
-`--dry-run` options as `run`.
 
 ## Terminal chat
 
@@ -560,20 +568,20 @@ omp-bundler destroy tool <name> [--dry-run] [--yes]
 omp-bundler destroy extension <name> [--dry-run] [--yes]
 omp-bundler destroy subagent <name> [--dry-run] [--yes]
 
-omp-bundler set-model [provider/model]
-omp-bundler set-model [provider/model] --wizard
-omp-bundler set-model [provider/model] [--from omp]
-omp-bundler set-model [--base-url <value>] [--dialect <value>] [--model <value>] [--api-key <value>]
-omp-bundler set-model --print-template
+omp-bundler model add <provider/model> [--from omp]
+omp-bundler model add <provider/model> --base-url <url> --api <dialect> [--api-key-env <NAME> | --no-auth]
+omp-bundler model set-default <provider/model>
+omp-bundler model list
 
 omp-bundler check [bundle-path] [--env-file <path>]
 omp-bundler build [bundle-path] [--tag <image-tag>]
-omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]
-omp-bundler service start [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]
-omp-bundler service stop [bundle-path]
-omp-bundler service status [bundle-path]
-omp-bundler service restart [bundle-path]
+omp-bundler run [bundle-path] [--foreground] [--env-file <path>] [--image <tag>] [--dry-run]
+omp-bundler status [bundle-path]
+omp-bundler stop [bundle-path]
+omp-bundler restart [bundle-path]
+omp-bundler logs [bundle-path] [--follow] [--tail <lines>]
 omp-bundler tui [--dir <bundle-path>] [--endpoint <agent-url>]
+omp-bundler completion <bash|zsh|fish>
 ```
 
 Every command supports `--help`.
