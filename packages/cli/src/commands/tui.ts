@@ -168,8 +168,11 @@ class IncrementalSseParser {
   private eventName = "";
   private dataLines: string[] = [];
   private terminalSeen = false;
+  private readonly onEvent: (event: SseEvent) => void;
 
-  constructor(private readonly onEvent: (event: SseEvent) => void) {}
+  constructor(onEvent: (event: SseEvent) => void) {
+    this.onEvent = onEvent;
+  }
 
   feed(text: string): void {
     this.bufferedText += text;
@@ -280,12 +283,13 @@ async function consumeEventStream(
       if (!(result.value instanceof Uint8Array)) {
         throw new StreamProtocolError("stream yielded a non-byte chunk");
       }
+      let text: string;
       try {
-        parser.feed(decoder.decode(result.value, { stream: true }));
-      } catch (error) {
-        if (error instanceof StreamProtocolError) throw error;
+        text = decoder.decode(result.value, { stream: true });
+      } catch {
         throw new StreamProtocolError("stream contained invalid UTF-8");
       }
+      parser.feed(text);
     }
     if (aborted || signal.aborted) return;
     try {
