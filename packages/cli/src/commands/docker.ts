@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { resolvePackagedAsset } from "../assets.ts";
@@ -8,11 +8,7 @@ import {
 } from "../package-assets.ts";
 export { CANONICAL_ASSET_PATHS } from "../package-assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
-import {
-  renderModelCatalog,
-  stageAgentModelBinding,
-  type LoadedModelBundle,
-} from "../model-config.ts";
+import type { LoadedModelBundle } from "../model-config.ts";
 import type { AgentDirectory } from "../types.ts";
 
 
@@ -99,18 +95,14 @@ export async function stageDockerContext(
     assertSafeIdentifier(agent.id, "agent id");
     const stagedAgent = join(contextPath, "agent");
     const stagedOmp = join(stagedAgent, ".omp");
+    const bundleDockerfile = join(agent.path, "Dockerfile");
+    await copyTreeNoSymlinks(bundleDockerfile, join(contextPath, "Dockerfile"), false);
     await mkdir(stagedAgent, { recursive: true });
     await writeFile(join(stagedAgent, "id"), `${agent.id}\n`, "utf8");
     await copyAgentSourceNoSymlinks(agent.path, stagedOmp);
 
     if (models !== undefined) {
-      await writeFile(join(contextPath, "template", "models.yml.tmpl"), renderModelCatalog(models.connections), "utf8");
-      const connection = models.connections.find((entry) => entry.agentId === agent.id);
-      if (!connection) throw new Error(`missing validated model connection for agent '${agent.id}'`);
-      const configPath = join(agent.path, "config.yml");
-      const source = await readFile(configPath, "utf8");
-      const stagedConfig = stageAgentModelBinding(source, connection.providerId, connection.config.model, configPath);
-      await writeFile(join(stagedOmp, "config.yml"), stagedConfig, "utf8");
+      await writeFile(join(contextPath, "template", "models.yml.tmpl"), models.source, "utf8");
     }
     return contextPath;
   } catch (error) {

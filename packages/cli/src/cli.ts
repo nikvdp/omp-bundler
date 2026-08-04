@@ -2,47 +2,18 @@
 
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { ArgumentError, parseArgs } from "./args.ts";
+import yargs, { type ArgumentsCamelCase, type Argv } from "yargs";
 import {
-  COMMAND_HELP,
   ROOT_COMMANDS,
   ROOT_HANDLERS,
   commandArgs,
   handlerContext,
-  invokeHandler,
-  routeCommand,
+  type RootCommand,
 } from "./handlers.ts";
-import type {
-  CliIO,
-  CommandHandlerRegistry,
-  CommandContext,
-} from "./types.ts";
+import type { CliIO, CommandHandlerRegistry, CommandContext } from "./types.ts";
 
 export const CLI_NAME = "omp-bundler";
 export const CLI_VERSION = "0.1.0";
-
-export const ROOT_HELP = `${CLI_NAME} - Build and run filesystem-configured OMP agents as a durable service.
-
-Usage:
-  ${CLI_NAME} <command> [arguments] [options]
-
-Commands:
-  ${COMMAND_HELP.new}
-
-  ${COMMAND_HELP.generate.replaceAll("\n", "\n  ")}
-
-  ${COMMAND_HELP.destroy.replaceAll("\n", "\n  ")}
-
-  ${COMMAND_HELP["set-model"].replaceAll("\n", "\n  ")}
-
-  ${COMMAND_HELP.check}
-  ${COMMAND_HELP.build}
-  ${COMMAND_HELP.run}
-  ${COMMAND_HELP.service.replaceAll("\n", "\n  ")}
-  ${COMMAND_HELP.tui.replaceAll("\n", "\n  ")}
-Options:
-  -h, --help       Show help for a command
-  -v, --version    Show the installed version`;
 
 const DEFAULT_IO: CliIO = {
   stdin: process.stdin,
@@ -61,86 +32,243 @@ export async function main(
     io: DEFAULT_IO,
   },
 ): Promise<number> {
-  let parsed;
-  try {
-    parsed = parseArgs(argv);
-  } catch (error) {
-    return reportError(context.io, error instanceof Error ? error.message : String(error));
-  }
-
-  if (parsed.options.version === true) {
-    writeLine(context.io.stdout, CLI_VERSION);
-    return 0;
-  }
-  if (parsed.options.help === true && parsed.positionals.length === 0) {
-    writeLine(context.io.stdout, ROOT_HELP);
-    return 0;
-  }
-
-  const commandName = parsed.positionals[0];
-  if (commandName === undefined) {
-    const unknownOption = Object.keys(parsed.options).find((name) => name !== "help" && name !== "version");
-    if (unknownOption !== undefined) {
-      return reportError(context.io, `unknown option '--${unknownOption}'`);
+  let exitCode = 0;
+  const dispatch = async (
+    command: RootCommand,
+    positionals: readonly string[],
+    parsed: ArgumentsCamelCase,
+    optionNames: readonly string[],
+  ): Promise<void> => {
+    const handler = context.handlers?.[command] ?? ROOT_HANDLERS[command];
+    if (!handler) throw new Error(`command '${command}' is not available`);
+    const options: Record<string, string | boolean> = {};
+    for (const name of optionNames) {
+      const value = parsed[name];
+      if (typeof value === "string" || typeof value === "boolean") options[name] = value;
+      else if (typeof value === "number") options[name] = String(value);
     }
-    writeLine(context.io.stdout, ROOT_HELP);
-    return 0;
-  }
-  const command = routeCommand(commandName);
-  if (!command) {
-    return reportError(
-      context.io,
-      `unknown command '${commandName}'. Run '${CLI_NAME} --help' for available commands`,
-    );
-  }
-  if (parsed.options.help === true) {
-    writeLine(context.io.stdout, COMMAND_HELP[command]);
+    exitCode = (await handler(commandArgs(positionals, options), handlerContext(context.cwd, context.io))) ?? 0;
+  };
+
+  const parser = createParser(dispatch, context.io);
+  if (argv.length === 0) {
+    context.io.stdout.write(`${await parser.getHelp()}\n`);
     return 0;
   }
 
-  const handler = context.handlers?.[command] ?? ROOT_HANDLERS[command];
-
-  const args = commandArgs(parsed.positionals.slice(1), parsed.options);
+  let parseError: Error | undefined;
+  let parserOutput = "";
   try {
-    const result = await invokeHandler(handler, args, handlerContext(context.cwd, context.io));
-    return typeof result === "number" ? result : 0;
+    await parser.parseAsync([...argv], {}, (error, _parsed, output) => {
+      parseError = error ?? undefined;
+      parserOutput = output;
+    });
   } catch (error) {
-    return reportError(context.io, error instanceof Error ? error.message : String(error));
+    parseError ??= error instanceof Error ? error : new Error(String(error));
   }
+
+  if (parserOutput) {
+    const stream = parseError ? context.io.stderr : context.io.stdout;
+    stream.write(parserOutput.endsWith("\n") ? parserOutput : `${parserOutput}\n`);
+  }
+  if (parseError) {
+    if (!parserOutput) context.io.stderr.write(`Error: ${parseError.message}\n`);
+    return 1;
+  }
+  return exitCode;
 }
 
-function writeLine(stream: CliIO["stdout"] | CliIO["stderr"], text: string): void {
-  stream.write(`${text}\n`);
+function createParser(
+  dispatch: (
+    command: RootCommand,
+    positionals: readonly string[],
+    parsed: ArgumentsCamelCase,
+    optionNames: readonly string[],
+  ) => Promise<void>,
+  io: CliIO,
+): Argv {
+  const parser = yargs()
+    .scriptName(CLI_NAME)
+    .usage("$0 <command> [options]")
+    .epilogue("Run 'omp-bundler <command> --help' for command-specific help.")
+    .parserConfiguration({ "camel-case-expansion": false })
+    .strictCommands()
+    .strictOptions()
+    .recommendCommands()
+    .showHelpOnFail(false)
+    .exitProcess(false)
+    .help("help")
+    .alias("help", "h")
+    .version("version", "Show the installed version", CLI_VERSION)
+    .alias("version", "v")
+    .completion("completion-script", false);
+
+  parser.command(
+    "new <path>",
+    "Create a complete single-agent bundle",
+    (command) => command
+      .positional("path", { type: "string", describe: "Bundle directory" })
+      .option("id", { type: "string", describe: "Agent ID; defaults to the directory name" })
+      .option("dry-run", { type: "boolean", describe: "Print changes without writing files" }),
+    (args) => dispatch("new", [args.path as string], args, ["id", "dry-run"]),
+  );
+
+  parser.command(
+    "generate <kind> <name>",
+    "Generate an agent component or adapter configuration",
+    (command) => command
+      .positional("kind", {
+        choices: ["skill", "command", "tool", "extension", "subagent", "adapter"] as const,
+        describe: "Component type",
+      })
+      .positional("name", { type: "string", describe: "Component name or adapter type" })
+      .option("dry-run", { type: "boolean", describe: "Print changes without writing files" }),
+    (args) => dispatch("generate", [String(args.kind), args.name as string], args, ["dry-run"]),
+  );
+
+  parser.command(
+    "destroy <kind> <name>",
+    "Remove a generated component",
+    (command) => command
+      .positional("kind", {
+        choices: ["skill", "command", "tool", "extension", "subagent"] as const,
+        describe: "Component type",
+      })
+      .positional("name", { type: "string", describe: "Component name" })
+      .option("dry-run", { type: "boolean", describe: "Print changes without deleting files" })
+      .option("yes", { type: "boolean", describe: "Skip the confirmation prompt" }),
+    (args) => dispatch("destroy", [String(args.kind), args.name as string], args, ["dry-run", "yes"]),
+  );
+
+  parser.command(
+    "model <action> [selector]",
+    "Add, select, or list models in the native OMP catalog",
+    (command) => command
+      .positional("action", {
+        choices: ["add", "set-default", "list"] as const,
+        describe: "Catalog operation",
+      })
+      .positional("selector", { type: "string", describe: "Provider/model selector" })
+      .option("from", { choices: ["omp"] as const, describe: "Import provider metadata from installed OMP" })
+      .option("base-url", { type: "string", describe: "Provider API base URL" })
+      .option("api", {
+        choices: ["openai-responses", "openai-completions", "anthropic-messages"] as const,
+        describe: "Provider protocol dialect",
+      })
+      .option("api-key-env", { type: "string", describe: "Provider credential environment variable" })
+      .option("no-auth", { type: "boolean", describe: "Configure a provider that requires no API key" }),
+    (args) => dispatch(
+      "model",
+      [String(args.action), ...(args.selector === undefined ? [] : [String(args.selector)])],
+      args,
+      ["from", "base-url", "api", "api-key-env", "no-auth"],
+    ),
+  );
+
+  addBundleCommand(parser, "check", "Validate bundle source and runtime bindings", dispatch, [
+    ["env-file", { type: "string", describe: "Runtime environment file" }],
+  ]);
+  addBundleCommand(parser, "build", "Build the bundle's container image", dispatch, [
+    ["tag", { type: "string", describe: "Container image tag" }],
+  ]);
+  addBundleCommand(parser, "run", "Start the bundle as a background service", dispatch, [
+    ["foreground", { type: "boolean", describe: "Own the terminal instead of starting in the background" }],
+    ["env-file", { type: "string", describe: "Runtime environment file" }],
+    ["image", { type: "string", describe: "Container image tag" }],
+    ["dry-run", { type: "boolean", describe: "Print the Docker command without running it" }],
+  ]);
+  addBundleCommand(parser, "status", "Show owned service state and endpoint", dispatch, []);
+  addBundleCommand(parser, "stop", "Stop the owned service", dispatch, []);
+  addBundleCommand(parser, "restart", "Restart the owned service", dispatch, []);
+  addBundleCommand(parser, "logs", "Show logs from the owned service", dispatch, [
+    ["follow", { type: "boolean", alias: "f", describe: "Continue following new log output" }],
+    ["tail", { type: "string", alias: "n", default: "100", describe: "Lines to show from the end, or 'all'" }],
+  ]);
+  parser.command(
+    "tui",
+    "Chat with the live bundle in the terminal",
+    (command) => command
+      .option("dir", { type: "string", describe: "Bundle directory; defaults to the current directory" })
+      .option("endpoint", { type: "string", describe: "Exact agent URL, bypassing bundle discovery" }),
+    (args) => dispatch("tui", [], args, ["dir", "endpoint"]),
+  );
+
+  parser.command(
+    "completion <shell>",
+    "Print a shell completion script",
+    (command) => command.positional("shell", {
+      choices: ["bash", "zsh", "fish"] as const,
+      describe: "Target shell",
+    }),
+    (args) => {
+      io.stdout.write(completionScript(String(args.shell)));
+    },
+  );
+
+  return parser;
 }
 
-function reportError(io: CliIO, message: string): number {
-  writeLine(io.stderr, `${CLI_NAME}: ${message}`);
-  return 1;
+type OptionDefinition = readonly [
+  name: string,
+  config: {
+    readonly type: "string" | "boolean";
+    readonly alias?: string;
+    readonly default?: string;
+    readonly describe: string;
+  },
+];
+
+function addBundleCommand(
+  parser: Argv,
+  commandName: RootCommand,
+  description: string,
+  dispatch: (
+    command: RootCommand,
+    positionals: readonly string[],
+    parsed: ArgumentsCamelCase,
+    optionNames: readonly string[],
+  ) => Promise<void>,
+  definitions: readonly OptionDefinition[],
+): void {
+  parser.command(
+    `${commandName} [bundle-path]`,
+    description,
+    (command) => {
+      let builder = command.positional("bundle-path", { type: "string", describe: "Bundle directory" });
+      for (const [name, config] of definitions) builder = builder.option(name, config);
+      return builder;
+    },
+    (args) => dispatch(
+      commandName,
+      args["bundle-path"] === undefined ? [] : [String(args["bundle-path"])],
+      args,
+      definitions.map(([name]) => name),
+    ),
+  );
+}
+
+function completionScript(shell: string): string {
+  if (shell === "bash") {
+    return `# bash completion for omp-bundler\n_omp_bundler_completions() {\n  local cur="\${COMP_WORDS[COMP_CWORD]}"\n  mapfile -t COMPREPLY < <(compgen -W "$(omp-bundler --get-yargs-completions "\${COMP_WORDS[@]}")" -- "$cur")\n}\ncomplete -o bashdefault -o default -F _omp_bundler_completions omp-bundler\n`;
+  }
+  if (shell === "zsh") {
+    return `#compdef omp-bundler\n_omp_bundler_completions() {\n  local -a completions\n  completions=("\${(@f)$(omp-bundler --get-yargs-completions "\${words[@]}")}")\n  _describe 'omp-bundler commands and options' completions\n}\ncompdef _omp_bundler_completions omp-bundler\n`;
+  }
+  return `function __omp_bundler_completions\n  omp-bundler --get-yargs-completions (commandline -opc)\nend\ncomplete -c omp-bundler -f -a '(__omp_bundler_completions)'\n`;
 }
 
 function isInvokedAsCli(): boolean {
-  const moduleUrl = import.meta.url;
-  if (moduleUrl.startsWith("file:///$bunfs/")) {
-    // Standalone compiled binary: this module is always the entrypoint and
-    // its URL is a virtual path that realpathSync cannot resolve.
-    return true;
-  }
-  const invokedPath = process.argv[1];
-  if (!invokedPath) return false;
+  const argvEntry = process.argv[1];
+  if (!argvEntry) return false;
   try {
-    return realpathSync(invokedPath) === realpathSync(fileURLToPath(moduleUrl));
+    return realpathSync(argvEntry) === realpathSync(fileURLToPath(import.meta.url));
   } catch {
     return false;
   }
 }
 
 if (isInvokedAsCli()) {
-  main().then((exitCode) => {
-    if (exitCode !== 0) process.exitCode = exitCode;
-  }).catch((error: unknown) => {
-    reportError(DEFAULT_IO, error instanceof Error ? error.message : String(error));
-    process.exitCode = 1;
-  });
+  process.exitCode = await main();
 }
 
 export { ROOT_COMMANDS, ROOT_HANDLERS };

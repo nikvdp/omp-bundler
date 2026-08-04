@@ -1,5 +1,5 @@
-export { main, CLI_NAME, CLI_VERSION, ROOT_HELP } from "./cli.ts";
-export { ArgumentError, parseArgs, optionBoolean, optionString } from "./args.ts";
+export { main, CLI_NAME, CLI_VERSION } from "./cli.ts";
+export { optionBoolean, optionString } from "./args.ts";
 export { resolvePackagedAsset, requirePackagedAsset } from "./assets.ts";
 export {
   CANONICAL_ASSET_PATHS,
@@ -36,9 +36,12 @@ export {
   generateCommand,
   newCommand,
   runCommand,
-  serviceCommand,
+  logsCommand,
+  restartCommand,
+  statusCommand,
+  stopCommand,
   tuiCommand,
-  setModelCommand,
+  modelCommand,
 } from "./commands/index.ts";
 export {
   formatDockerCommand,
@@ -66,4 +69,3 @@ export type {
 } from "./types.ts";
 export type { ApplyFilePlanOptions, FilePlanOptions } from "./file-plan.ts";
 export type { ExecuteOptions } from "./process.ts";
-export type { OptionSpec, OptionType } from "./args.ts";

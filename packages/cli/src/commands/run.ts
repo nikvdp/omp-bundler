@@ -15,12 +15,12 @@ import {
 import type { CheckResult } from "./check.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 
-export const RUN_HELP = `omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]
+export const RUN_HELP = `omp-bundler run [bundle-path] [--foreground] [--env-file <path>] [--image <tag>] [--dry-run]
 
-Validate runtime bindings, then run the configured image in the foreground with
-its ports and named data volume. If the detached service is already running,
-choose whether to follow its logs, replace it with this foreground run, or
-cancel. --env-file defaults to the bundle's runtime.env.
+Validate runtime bindings and start the configured image as the named background
+service. --foreground owns the terminal instead. If a service is already running,
+foreground mode can follow logs, restart in the foreground, or cancel.
+--env-file defaults to the bundle's runtime.env.
 --dry-run prints the Docker command without executing it.`;
 
 const SAFE_IMAGE_TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
@@ -39,12 +39,11 @@ export interface RunSettings {
 export const runCommand: CommandHandler = async (
   args: ParsedArguments,
   context: CommandContext,
-): Promise<number> => runBundle(args, context, false);
+): Promise<number> => runBundle(args, context);
 
 export async function runBundle(
   args: ParsedArguments,
   context: CommandContext,
-  detached: boolean,
 ): Promise<number> {
   if (args.options.help === true) {
     context.io.stdout.write(`${RUN_HELP}\n`);
@@ -55,7 +54,7 @@ export async function runBundle(
   }
 
   try {
-    assertAllowedOptions(args, ["env-file", "image", "dry-run"]);
+    assertAllowedOptions(args, ["env-file", "image", "dry-run", "foreground"]);
   } catch (error) {
     return usageError(context, error instanceof Error ? error.message : String(error));
   }
@@ -65,6 +64,10 @@ export async function runBundle(
   if (args.options["dry-run"] !== undefined && !optionBoolean(args, "dry-run")) {
     return usageError(context, "--dry-run does not accept a value");
   }
+  if (args.options.foreground !== undefined && !optionBoolean(args, "foreground")) {
+    return usageError(context, "--foreground does not accept a value");
+  }
+  const detached = !optionBoolean(args, "foreground");
 
   let envFile: string | undefined;
   if (args.options["env-file"] !== undefined) {
@@ -296,7 +299,7 @@ async function findAvailablePort(
 export function runPreviewCommand(
   settings: RunSettings,
   envFile: string,
-  detached = false,
+  detached = true,
 ): string {
   const { containerName, ...containerSettings } = settings;
   return formatDockerCommand("docker", runDockerArgs({
@@ -316,7 +319,7 @@ async function resolveServiceConflict(
   context.io.stdout.write(`Service ${containerName} is already running.\n`);
   if (!("isTTY" in context.io.stdin) || context.io.stdin.isTTY !== true) {
     context.io.stderr.write(
-      "Run this command in an interactive terminal to choose an action, or stop the service with 'omp-bundler service stop'.\n",
+      "Run this command in an interactive terminal to choose an action, or stop it with 'omp-bundler stop'.\n",
     );
     return 1;
   }
@@ -326,14 +329,14 @@ async function resolveServiceConflict(
   try {
     while (true) {
       choice = (await readline.question(
-        "[f] Follow service logs  [r] Stop service and run in foreground  [c] Cancel (default: f): ",
+        "[f] Follow logs  [r] Restart in foreground  [c] Cancel (default: f): ",
       )).trim().toLowerCase();
       if (choice === "" || choice === "f" || choice === "follow") {
         choice = "follow";
         break;
       }
-      if (choice === "r" || choice === "run" || choice === "replace") {
-        choice = "replace";
+      if (choice === "r" || choice === "restart") {
+        choice = "restart";
         break;
       }
       if (choice === "c" || choice === "cancel") {
@@ -348,7 +351,7 @@ async function resolveServiceConflict(
 
   if (choice === "cancel") return 0;
   if (choice === "follow") {
-    const logs = await executeChild("docker", ["logs", "--follow", containerName], {
+    const logs = await executeChild("docker", ["logs", "--follow", "--tail", "100", containerName], {
       stdio: "inherit",
       forwardSignals: true,
     });
@@ -363,7 +366,7 @@ async function resolveServiceConflict(
     context.io.stderr.write(stopped.stderr || `docker stop failed with exit code ${stopped.exitCode}\n`);
     return stopped.exitCode;
   }
-  context.io.stdout.write(`Stopped service ${containerName}; starting foreground run.\n`);
+  context.io.stdout.write(`Restarting service ${containerName} in the foreground.\n`);
   return undefined;
 }
 

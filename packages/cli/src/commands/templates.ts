@@ -1,4 +1,4 @@
-import { renderModelTemplate } from "../model-config.ts";
+import { emptyModelCatalog } from "../model-config.ts";
 import type { PlannedWrite } from "../types.ts";
 
 export const AGENT_SURFACE_DIRECTORIES = [
@@ -38,10 +38,9 @@ export function runtimeEnvExample(): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** Comment heading that marks a generated model-connection block. */
-export function agentModelEnvHeading(agentId: string): string {
-  return `# Model connection for ${agentId}. Copy this file to runtime.env and fill these values.`;
-}
+/** Heading for the generated provider credential block. */
+export const MODEL_ENV_HEADING =
+  "# Model provider credentials. Copy this file to runtime.env and fill these values.";
 
 /** Comment heading that marks the generated Pumble adapter block. */
 export const PUMBLE_ENV_HEADING =
@@ -53,7 +52,7 @@ export function bundleFiles(bundleName: string, agentId: string): readonly Plann
     { path: "README.md", content: bundleReadme(bundleName, agentId) },
     { path: "omp-bundler.yml", content: bundleConfig(bundleName, agentId) },
     { path: "runtime.env.example", content: RUNTIME_ENV_EXAMPLE },
-    { path: "model.yml", content: renderModelTemplate(agentId) },
+    { path: "models.yml", content: emptyModelCatalog() },
   ];
 }
 
@@ -138,7 +137,7 @@ Agent instructions and every supported component surface live at the bundle root
 \`\`\`text
 AGENTS.md
 config.yml
-model.yml
+models.yml
 subagents/example-subagent.md.example
 commands/example-command.md.example
 extensions/example-extension.ts.example
@@ -160,10 +159,10 @@ omp-bundler generate tool read-transcript
 ## Development loop
 
 1. Edit \`AGENTS.md\` and generate or edit components under the bundle root.
-2. Configure the generated \`model.yml\` with \`omp-bundler set-model\`. The default mode opens an editor; add \`--wizard\` for guided prompts.
+2. Add models with \`omp-bundler model add <provider/model>\`, then choose the default with \`omp-bundler model set-default <provider/model>\`.
 3. Copy \`runtime.env.example\` to the ignored \`runtime.env\` file and fill its generated placeholders.
-4. Run \`omp-bundler check\` and \`omp-bundler build\`, then use \`omp-bundler run\` for the foreground process or \`omp-bundler service start\` for a detached container. Check, run, and service start select \`runtime.env\` automatically; run and service start select free host ports when the configured preferences are busy.
-5. Chat with the agent by running \`omp-bundler tui\`. It discovers the live adapter port automatically. You can also send a message to the endpoint printed by \`run\` or \`service start\`.
+4. Run \`omp-bundler check\` and \`omp-bundler build\`, then start the background service with \`omp-bundler run\`. Use \`--foreground\` when the process should own the terminal. Run selects \`runtime.env\` and free host ports automatically.
+5. Inspect the service with \`omp-bundler status\`, follow it with \`omp-bundler logs --follow\`, and chat with \`omp-bundler tui\`. TUI discovers the live adapter port automatically.
 
 The committed \`runtime.env.example\` contains placeholders only. Keep deployment values in \`runtime.env\`.
 `;
@@ -267,25 +266,33 @@ export function updateManagedEnvBlock(
   return `${lines.join(eol)}${eol}`;
 }
 
-/**
- * Update one agent's generated model-connection block. Replaces the block
- * with one `NAME=` row per env name (sorted, de-duped), removes it when empty,
- * or appends a new block when absent and non-empty. Idempotent.
- */
-export function updateAgentModelEnvBlock(
+/** Synchronize the provider credential block with placeholders used by models.yml. */
+export function updateModelEnvBlock(
   source: string,
-  agentId: string,
   envNames: readonly string[],
 ): string {
-  const unique = [...new Set(envNames)];
-  const assignments = unique.map((name) => `${name}=`);
-  return updateManagedEnvBlock(source, agentModelEnvHeading(agentId), assignments);
+  const eol = detectEol(source);
+  const lines = source.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!MODEL_ENV_HEADING_RE.test(lines[index])) continue;
+    let end = index + 1;
+    while (end < lines.length && ENV_ASSIGNMENT_RE.test(lines[end])) end += 1;
+    if (end < lines.length && lines[end].trim() === "") end += 1;
+    lines.splice(index, end - index);
+  }
+  const cleaned = lines.length > 0 ? `${lines.join(eol)}${eol}` : "";
+  return updateManagedEnvBlock(
+    cleaned,
+    MODEL_ENV_HEADING,
+    [...new Set(envNames)].sort().map((name) => `${name}=`),
+  );
 }
 
 /** Canonical Pumble adapter assignments, in declaration order. */
 const PUMBLE_BLOCK_FIELDS = PUMBLE_RUNTIME_FIELDS;
 const MODEL_ENV_HEADING_RE =
-  /^# Model connection for [a-z0-9][a-z0-9_-]{0,63}\. Copy this file to runtime\.env and fill these values\.$/;
+  /^(?:# Model provider credentials\. Copy this file to runtime\.env and fill these values\.|# Model connection for [a-z0-9][a-z0-9_-]{0,63}\. Copy this file to runtime\.env and fill these values\.)$/;
 const ENV_ASSIGNMENT_RE = /^\s*[A-Z_][A-Z0-9_]*\s*=/;
 
 function managedModelBlockLines(lines: readonly string[]): ReadonlySet<number> {

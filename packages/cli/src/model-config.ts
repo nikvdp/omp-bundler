@@ -1,164 +1,231 @@
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parseYaml, stringifyYaml, YamlError } from "./config.ts";
 import { resolveInside } from "./identifiers.ts";
 import type { AgentDirectory, ProjectContext, YamlValue } from "./types.ts";
 
-/** One schema-backed description of every model configuration field. */
-/** Flags, wizard prompts, editor templates, parsing, validation, defaults, and help derive from this array. */
-export interface ModelField {
-  readonly key: string;
-  readonly flag?: string;
-  readonly label: string;
-  readonly description: string;
-  readonly required: boolean;
-  readonly default?: string;
-  readonly defaultForAgent?: (agentId: string) => string;
-  readonly choices?: readonly string[];
-  readonly secret?: boolean;
-}
-
-export interface CliModelField extends ModelField {
-  readonly flag: string;
-}
-
-export const MODEL_DIALECTS = [
-  "openai-responses",
-  "openai-completions",
-  "anthropic-messages",
-] as const;
-
-export type ModelDialect = (typeof MODEL_DIALECTS)[number];
-const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 const ENV_TOKEN = /\$\{([^}]*)\}/g;
+const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+const PROVIDER_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const SUPPORTED_APIS = new Set(["openai-responses", "openai-completions", "anthropic-messages"]);
 
-export const MODEL_FIELDS: readonly ModelField[] = [
-  {
-    key: "version",
-    label: "Version",
-    description: "Schema version; must be 1.",
-    required: true,
-    default: "1",
-  },
-  {
-    key: "baseUrl",
-    flag: "base-url",
-    label: "Base URL",
-    description: "Provider API base URL, e.g. https://api.openai.com/v1. Use ${ENV_VAR} for templated values.",
-    required: true,
-  },
-  {
-    key: "dialect",
-    flag: "dialect",
-    label: "API dialect",
-    description: "Protocol dialect the provider speaks.",
-    required: true,
-    choices: MODEL_DIALECTS,
-  },
-  {
-    key: "model",
-    flag: "model",
-    label: "Model name",
-    description: "Literal provider model identifier, e.g. gpt-5.4 or claude-sonnet-5.",
-    required: true,
-  },
-  {
-    key: "apiKey",
-    flag: "api-key",
-    label: "API key",
-    description: "Literal key, empty string for no-auth, or ${ENV_VAR} template. Redacted from output.",
-    required: false,
-    defaultForAgent: defaultApiKeyPlaceholder,
-    secret: true,
-  },
-] as const;
+export interface ModelCatalog {
+  readonly providers: Record<string, Record<string, YamlValue>>;
+  readonly [key: string]: YamlValue;
+}
 
-export interface ModelConfig {
-  readonly version: number;
-  readonly baseUrl: string;
-  readonly dialect: string;
+export interface ModelMetadata {
+  readonly providerId: string;
   readonly model: string;
-  readonly apiKey: string;
+  readonly envNames: readonly string[];
 }
 
-export const MODEL_FIELD_KEYS: readonly string[] = MODEL_FIELDS.map((field) => field.key);
-
-export function resolveDefaultValue(field: ModelField, agentId: string): string | undefined {
-  if (field.defaultForAgent) return field.defaultForAgent(agentId);
-  return field.default;
+export interface ModelConnection {
+  readonly selector: string;
+  readonly baseUrl: string;
 }
 
-export function modelConfigPath(project: ProjectContext): string {
-  return resolveInside(project.rootDir, "model.yml");
+export interface LoadedModelBundle {
+  readonly catalog: ModelCatalog;
+  readonly source: string;
+  readonly connections: readonly ModelConnection[];
+  readonly metadata: readonly ModelMetadata[];
+  readonly envNames: readonly string[];
 }
 
-export function defaultApiKeyPlaceholder(agentId: string): string {
-  const suffix = agentId.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_");
-  return `\${OMP_MODEL_${suffix}_API_KEY}`;
+export function modelCatalogPath(project: ProjectContext): string {
+  return resolveInside(project.rootDir, "models.yml");
 }
 
-function redactLiteralApiKey(apiKey: string | undefined, agentId: string): string {
-  if (apiKey === undefined) return defaultApiKeyPlaceholder(agentId);
-  if (apiKey === "" || isEnvTemplate(apiKey)) return apiKey;
-  return defaultApiKeyPlaceholder(agentId);
+export function emptyModelCatalog(): string {
+  return "providers: {}\n";
 }
 
-function quoteYamlScalar(value: string): string {
-  if (value === "") return '""';
-  if (/^[A-Za-z0-9_./:@+-]+$/.test(value) && !/^(?:true|false|null|~)$/i.test(value)) return value;
-  return JSON.stringify(value);
-}
-
-export function renderModelTemplate(agentId: string, existing?: ModelConfig): string {
-  const values: Record<string, string> = {
-    version: "1",
-    baseUrl: existing?.baseUrl ?? "",
-    dialect: existing?.dialect ?? "",
-    model: existing?.model ?? "",
-    apiKey: redactLiteralApiKey(existing?.apiKey, agentId),
-  };
-  const lines: string[] = [
-    `# Model configuration for agent '${agentId}'.`,
-    `# Edit directly or regenerate with: omp-bundler set-model`,
-    `# Accept literal values or \${ENV_VAR} templates for baseUrl and apiKey.`,
-    `# An empty quoted apiKey ("") means no authentication.`,
-    "",
-  ];
-  for (const field of MODEL_FIELDS) {
-    if (field.key === "version") {
-      lines.push(`version: ${values.version}`);
-      lines.push("");
-      continue;
-    }
-    if (field.description) lines.push(`# ${field.description}`);
-    if (field.choices) lines.push(`# Choices: ${field.choices.join(", ")}`);
-    const raw = values[field.key];
-    if (field.key === "apiKey" && raw === "" && existing !== undefined) {
-      lines.push(`${field.key}: ""`);
-    } else if (raw) {
-      lines.push(`${field.key}: ${quoteYamlScalar(raw)}`);
-    } else {
-      lines.push(`# ${field.key}: ${field.key === "apiKey" ? '""' : "<value>"}`);
-    }
-    lines.push("");
+export function splitModelSelector(selector: string): { providerId: string; modelId: string } {
+  const slash = selector.indexOf("/");
+  if (slash < 1 || slash === selector.length - 1) {
+    throw new Error("model selector must use provider/model form");
   }
-  return `${lines.join("\n").trimEnd()}\n`;
+  const providerId = selector.slice(0, slash);
+  const modelId = selector.slice(slash + 1);
+  if (!PROVIDER_ID.test(providerId)) throw new Error(`provider id '${providerId}' is unsafe`);
+  if (!modelId.trim() || /[\n\0]/.test(modelId) || modelId.includes("${") || modelId.includes("../")) {
+    throw new Error(`model id '${modelId}' is unsafe`);
+  }
+  return { providerId, modelId };
 }
 
-interface ParsedModel {
-  readonly version: unknown;
-  readonly baseUrl: unknown;
-  readonly dialect: unknown;
-  readonly model: unknown;
-  readonly apiKey: unknown;
-  readonly [key: string]: unknown;
+export function providerCredentialEnvName(providerId: string): string {
+  const normalized = providerId.toUpperCase().replaceAll(/[^A-Z0-9]/g, "_");
+  return `${normalized}_API_KEY`;
 }
 
-function isRecord(value: YamlValue): value is Record<string, YamlValue> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+export function parseModelCatalog(
+  source: string,
+  contextLabel: string,
+  allowEmpty = false,
+): ModelCatalog {
+  let parsed: YamlValue;
+  try {
+    parsed = parseYaml(source);
+  } catch (error) {
+    if (error instanceof YamlError) throw new Error(`${contextLabel}: ${error.message}`);
+    throw error;
+  }
+  const root = asRecord(parsed, `${contextLabel}: expected a YAML mapping`);
+  const providers = asRecord(root.providers, `${contextLabel}: providers must be a YAML mapping`);
+  const providerIds = Object.keys(providers);
+  if (!allowEmpty && providerIds.length === 0) {
+    throw new Error(`${contextLabel}: providers must contain at least one provider; run 'omp-bundler model add <provider/model>'`);
+  }
+
+  for (const providerId of providerIds) {
+    if (!PROVIDER_ID.test(providerId)) throw new Error(`${contextLabel}: provider id '${providerId}' is unsafe`);
+    const provider = asRecord(providers[providerId], `${contextLabel}: provider '${providerId}' must be a mapping`);
+    const models = provider.models;
+    if (!Array.isArray(models) || models.length === 0) {
+      throw new Error(`${contextLabel}: provider '${providerId}' must contain at least one model`);
+    }
+    if (provider.auth === "none" && provider.apiKey !== undefined) {
+      throw new Error(`${contextLabel}: provider '${providerId}' cannot set both auth: none and apiKey`);
+    }
+    if (provider.auth !== "none") {
+      if (typeof provider.apiKey !== "string" || !isEnvTemplate(provider.apiKey)) {
+        throw new Error(`${contextLabel}: provider '${providerId}'.apiKey must be a \${PROVIDER_API_KEY} placeholder or use auth: none`);
+      }
+    }
+
+    const seen = new Set<string>();
+    for (const modelValue of models) {
+      const model = asRecord(modelValue, `${contextLabel}: provider '${providerId}' models must be mappings`);
+      const modelId = model.id;
+      if (typeof modelId !== "string") throw new Error(`${contextLabel}: provider '${providerId}' model id must be a string`);
+      splitModelSelector(`${providerId}/${modelId}`);
+      if (seen.has(modelId)) throw new Error(`${contextLabel}: provider '${providerId}' repeats model '${modelId}'`);
+      seen.add(modelId);
+      const baseUrl = stringValue(model.baseUrl) ?? stringValue(provider.baseUrl);
+      const api = stringValue(model.api) ?? stringValue(provider.api);
+      if (!baseUrl || !isValidBaseUrl(baseUrl)) {
+        throw new Error(`${contextLabel}: '${providerId}/${modelId}' must resolve an HTTP(S) baseUrl or environment placeholder`);
+      }
+      if (!api || !SUPPORTED_APIS.has(api)) {
+        throw new Error(`${contextLabel}: '${providerId}/${modelId}' api must be one of: ${[...SUPPORTED_APIS].join(", ")}`);
+      }
+    }
+  }
+
+  return { ...root, providers: providers as Record<string, Record<string, YamlValue>> };
 }
 
-export function parseModelConfig(source: string, contextLabel: string): ModelConfig {
+export function renderModelCatalog(catalog: ModelCatalog): string {
+  return stringifyYaml(catalog);
+}
+
+export function modelCatalogEnvNames(catalog: ModelCatalog, contextLabel: string): readonly string[] {
+  const names = new Set<string>();
+  const visit = (value: YamlValue, path: string): void => {
+    if (typeof value === "string") {
+      for (const name of placeholderNames(value, `${contextLabel} [${path}]`)) names.add(name);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => visit(entry, `${path}.${index}`));
+      return;
+    }
+    if (value !== null && typeof value === "object") {
+      for (const [key, entry] of Object.entries(value)) visit(entry, path ? `${path}.${key}` : key);
+    }
+  };
+  visit(catalog, "");
+  return [...names].sort((left, right) => left.localeCompare(right));
+}
+
+export function catalogHasSelector(catalog: ModelCatalog, selector: string): boolean {
+  const { providerId, modelId } = splitModelSelector(selector);
+  const provider = catalog.providers[providerId];
+  if (!provider || !Array.isArray(provider.models)) return false;
+  return provider.models.some((value) => isRecord(value) && value.id === modelId);
+}
+
+export function catalogSelectors(catalog: ModelCatalog): readonly string[] {
+  const selectors: string[] = [];
+  for (const [providerId, provider] of Object.entries(catalog.providers)) {
+    const models = Array.isArray(provider.models) ? provider.models : [];
+    for (const value of models) {
+      if (isRecord(value) && typeof value.id === "string") selectors.push(`${providerId}/${value.id}`);
+    }
+  }
+  return selectors.sort((left, right) => left.localeCompare(right));
+}
+
+export function addCatalogModel(
+  catalog: ModelCatalog,
+  providerId: string,
+  provider: Record<string, YamlValue>,
+  model: Record<string, YamlValue>,
+): { catalog: ModelCatalog; changed: boolean } {
+  const existing = catalog.providers[providerId];
+  if (existing) {
+    const models = Array.isArray(existing.models) ? existing.models : [];
+    if (models.some((value) => isRecord(value) && value.id === model.id)) return { catalog, changed: false };
+    return {
+      catalog: {
+        ...catalog,
+        providers: {
+          ...catalog.providers,
+          [providerId]: { ...existing, models: [...models, model] },
+        },
+      },
+      changed: true,
+    };
+  }
+  return {
+    catalog: {
+      ...catalog,
+      providers: { ...catalog.providers, [providerId]: { ...provider, models: [model] } },
+    },
+    changed: true,
+  };
+}
+
+export async function loadBundleModels(rootDir: string, agents: readonly AgentDirectory[]): Promise<LoadedModelBundle> {
+  if (agents.length !== 1) throw new Error(`${rootDir}: exactly one root agent is required`);
+  const path = resolveInside(rootDir, "models.yml");
+  const info = await lstat(path).catch(() => null);
+  if (!info) throw new Error(`${path}: model catalog is missing`);
+  if (info.isSymbolicLink()) throw new Error(`${path}: model catalog must not be a symlink`);
+  if (!info.isFile()) throw new Error(`${path}: model catalog must be a regular file`);
+  const source = await readFile(path, "utf8").catch((error: unknown) => {
+    throw new Error(`${path}: cannot read model catalog: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  const catalog = parseModelCatalog(source, path);
+  const envNames = modelCatalogEnvNames(catalog, path);
+  const connections: ModelConnection[] = [];
+  const metadata: ModelMetadata[] = [];
+  for (const selector of catalogSelectors(catalog)) {
+    const { providerId, modelId } = splitModelSelector(selector);
+    const provider = catalog.providers[providerId];
+    const model = (provider.models as YamlValue[]).find((value) => isRecord(value) && value.id === modelId) as Record<string, YamlValue>;
+    connections.push({ selector, baseUrl: stringValue(model.baseUrl) ?? stringValue(provider.baseUrl)! });
+    metadata.push({ providerId, model: modelId, envNames });
+  }
+
+  const configPath = join(agents[0].path, "config.yml");
+  const configSource = await readFile(configPath, "utf8");
+  const config = asRecord(parseYaml(configSource), `${configPath}: expected a YAML mapping`);
+  const roles = isRecord(config.modelRoles) ? config.modelRoles : undefined;
+  const defaultModel = roles?.default;
+  if (typeof defaultModel !== "string" || !defaultModel.trim()) {
+    throw new Error(`${configPath}: modelRoles.default is missing; run 'omp-bundler model set-default <provider/model>'`);
+  }
+  if (!catalogHasSelector(catalog, defaultModel)) {
+    throw new Error(`${configPath}: modelRoles.default '${defaultModel}' is not present in models.yml`);
+  }
+
+  return { catalog, source, connections, metadata, envNames };
+}
+
+export function setDefaultModelBinding(source: string, selector: string, contextLabel: string): string {
   let parsed: YamlValue;
   try {
     parsed = parseYaml(source);
@@ -167,90 +234,72 @@ export function parseModelConfig(source: string, contextLabel: string): ModelCon
     throw error;
   }
   if (!isRecord(parsed)) throw new Error(`${contextLabel}: expected a YAML mapping`);
-  const record = parsed as ParsedModel;
-  for (const key of Object.keys(parsed)) {
-    if (!MODEL_FIELD_KEYS.includes(key)) {
-      throw new Error(`${contextLabel}: unknown key '${key}'; valid keys are: ${MODEL_FIELD_KEYS.join(", ")}`);
+  if (parsed.modelRoles !== undefined && !isRecord(parsed.modelRoles)) {
+    throw new Error(`${contextLabel}: modelRoles must be a block mapping`);
+  }
+  const lines = splitYamlLines(source);
+  const rolesLine = lines.findIndex((line) => indentOf(line.body) === 0 && yamlKey(line.body) === "modelRoles");
+  const binding = `default: ${quoteYamlScalar(selector)}`;
+  const ending = yamlLineEnding(source);
+  if (rolesLine < 0) {
+    return `${source}${source.endsWith("\n") || source.endsWith("\r") ? "" : ending}modelRoles:${ending}  ${binding}${ending}`;
+  }
+  if (lines[rolesLine].body.slice(lines[rolesLine].body.indexOf(":") + 1).trim()) {
+    throw new Error(`${contextLabel}: modelRoles must be a block mapping`);
+  }
+  const parentIndent = indentOf(lines[rolesLine].body);
+  let childIndent: number | undefined;
+  let defaultLine = -1;
+  let end = lines.length;
+  for (let index = rolesLine + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.body.trim();
+    const indent = indentOf(line.body);
+    if (trimmed && !trimmed.startsWith("#") && indent <= parentIndent) {
+      end = index;
+      break;
+    }
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    childIndent ??= indent;
+    if (indent === childIndent && yamlKey(line.body) === "default") defaultLine = index;
+  }
+  childIndent ??= parentIndent + 2;
+  if (defaultLine >= 0) {
+    const colon = lines[defaultLine].body.indexOf(":");
+    const comment = lines[defaultLine].body.slice(colon + 1).match(/(\s+#.*)$/)?.[1] ?? "";
+    lines[defaultLine] = { body: `${" ".repeat(childIndent)}${binding}${comment}`, ending: lines[defaultLine].ending };
+  } else {
+    const inserted = { body: `${" ".repeat(childIndent)}${binding}`, ending };
+    if (end === lines.length && lines.length > 0 && lines[lines.length - 1].ending === "") {
+      const last = lines[lines.length - 1];
+      lines[lines.length - 1] = { body: last.body, ending };
+      lines.push(inserted);
+    } else {
+      lines.splice(end, 0, inserted);
     }
   }
-  if (record.version !== 1) throw new Error(`${contextLabel}: version must be 1`);
-
-  const baseUrl = record.baseUrl;
-  if (typeof baseUrl !== "string" || !baseUrl.trim()) throw new Error(`${contextLabel}: baseUrl must be a non-empty string`);
-  if (!isValidBaseUrl(baseUrl)) throw new Error(`${contextLabel}: baseUrl must be a URL or \${ENV_VAR} template`);
-
-  const dialect = record.dialect;
-  if (typeof dialect !== "string" || !MODEL_DIALECTS.includes(dialect as ModelDialect)) {
-    throw new Error(`${contextLabel}: dialect must be one of: ${MODEL_DIALECTS.join(", ")}`);
-  }
-
-  const model = record.model;
-  if (typeof model !== "string" || !model.trim()) throw new Error(`${contextLabel}: model must be a non-empty string`);
-  if (model.includes("${")) throw new Error(`${contextLabel}: model must be a literal model ID, not an environment template`);
-
-  const apiKey = record.apiKey;
-  if (apiKey === undefined || apiKey === null) return { version: 1, baseUrl, dialect, model, apiKey: "" };
-  if (typeof apiKey !== "string") throw new Error(`${contextLabel}: apiKey must be a string, empty, or \${ENV_VAR} template`);
-  if (!isValidApiKey(apiKey)) throw new Error(`${contextLabel}: apiKey must be a literal, empty string, or \${ENV_VAR} template`);
-  return { version: 1, baseUrl, dialect, model, apiKey };
+  return joinYamlLines(lines);
 }
 
-function isValidBaseUrl(value: string): boolean {
+export function readDefaultModel(source: string): string | undefined {
+  const parsed = parseYaml(source);
+  if (!isRecord(parsed) || !isRecord(parsed.modelRoles)) return undefined;
+  return typeof parsed.modelRoles.default === "string" ? parsed.modelRoles.default : undefined;
+}
+
+export function expandModelPlaceholders(value: string, env: ReadonlyMap<string, string>, contextLabel: string): string {
   const shaped = placeholderShape(value);
-  if (shaped === undefined) return false;
-  if (isEnvTemplate(value)) return true;
+  if (shaped === undefined) throw new Error(`${contextLabel}: contains a malformed environment placeholder`);
+  return value.replace(ENV_TOKEN, (_token, name: string) => env.get(name) ?? _token);
+}
+
+export function validateExpandedBaseUrl(value: string, contextLabel: string): void {
   try {
-    const url = new URL(shaped);
-    return url.protocol === "http:" || url.protocol === "https:";
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("protocol");
   } catch {
-    return false;
+    throw new Error(`${contextLabel}: must resolve to an absolute HTTP(S) URL`);
   }
-}
-
-function isValidApiKey(value: string): boolean {
-  if (value === "") return true;
-  return value.trim().length > 0 && placeholderShape(value) !== undefined;
-}
-
-function placeholderShape(value: string): string | undefined {
-  if (!value.includes("${")) return value;
-  let malformed = false;
-  const shaped = value.replace(ENV_TOKEN, (_token, name: string) => {
-    if (!ENV_NAME.test(name)) {
-      malformed = true;
-      return "";
-    }
-    return "placeholder";
-  });
-  return malformed || shaped.includes("${") ? undefined : shaped;
-}
-
-function isEnvTemplate(value: string): boolean {
-  const match = value.match(/^\$\{([^}]*)\}$/);
-  return match !== null && ENV_NAME.test(match[1]);
-}
-
-export interface ModelMetadata {
-  readonly agentId: string;
-  readonly dialect: string;
-  readonly model: string;
-  readonly envNames: readonly string[];
-}
-
-interface ValidatedModelConnection {
-  readonly agentId: string;
-  readonly providerId: string;
-  readonly config: ModelConfig;
-}
-
-export interface LoadedModelBundle {
-  readonly connections: readonly ValidatedModelConnection[];
-  readonly metadata: readonly ModelMetadata[];
-  readonly envNames: readonly string[];
-}
-
-function providerIdForAgent(agentId: string): string {
-  return `omp-bundler-${agentId}`;
 }
 
 function placeholderNames(value: string, contextLabel: string): readonly string[] {
@@ -261,57 +310,51 @@ function placeholderNames(value: string, contextLabel: string): readonly string[
     return "";
   });
   if (remainder.includes("${")) throw new Error(`${contextLabel}: contains a malformed environment placeholder`);
-  return [...new Set(names)].sort((left, right) => left.localeCompare(right));
+  return [...new Set(names)];
 }
 
-/**
- * Derive the model-connection environment variable names referenced by a
- * single agent's parsed config (baseUrl and apiKey), sorted and de-duped.
- */
-export function modelConfigEnvNames(config: ModelConfig, contextLabel: string): readonly string[] {
-  return [...new Set([
-    ...placeholderNames(config.baseUrl, `${contextLabel} [baseUrl]`),
-    ...placeholderNames(config.model, `${contextLabel} [model]`),
-    ...placeholderNames(config.apiKey, `${contextLabel} [apiKey]`),
-  ])].sort((left, right) => left.localeCompare(right));
-}
-
-export async function loadBundleModels(rootDir: string, agents: readonly AgentDirectory[]): Promise<LoadedModelBundle> {
-  if (agents.length !== 1) {
-    throw new Error(`${rootDir}: exactly one root agent is required`);
+function isValidBaseUrl(value: string): boolean {
+  const shaped = placeholderShape(value);
+  if (shaped === undefined) return false;
+  try {
+    const url = new URL(shaped);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return isEnvTemplate(value);
   }
-  const agent = agents[0];
-  const path = resolveInside(rootDir, "model.yml");
-  const info = await lstat(path).catch(() => null);
-  if (!info) throw new Error(`${path}: model file is missing`);
-  if (info.isSymbolicLink()) throw new Error(`${path}: model file must not be a symlink`);
-  if (!info.isFile()) throw new Error(`${path}: model path must be a regular file`);
-  const source = await readFile(path, "utf8").catch((error: unknown) => {
-    throw new Error(`${path}: cannot read model file: ${error instanceof Error ? error.message : String(error)}`);
+}
+
+function placeholderShape(value: string): string | undefined {
+  if (!value.includes("${")) return value;
+  let malformed = false;
+  const shaped = value.replace(ENV_TOKEN, (_token, name: string) => {
+    if (!ENV_NAME.test(name)) malformed = true;
+    return "placeholder";
   });
-  const config = parseModelConfig(source, path);
-  const names = modelConfigEnvNames(config, path);
-  const providerId = providerIdForAgent(agent.id);
-  return {
-    connections: [{ agentId: agent.id, providerId, config }],
-    metadata: [{ agentId: agent.id, dialect: config.dialect, model: config.model, envNames: names }],
-    envNames: names,
-  };
+  return malformed || shaped.includes("${") ? undefined : shaped;
 }
 
-export function renderModelCatalog(connections: readonly ValidatedModelConnection[]): string {
-  const providers: Record<string, YamlValue> = {};
-  for (const connection of [...connections].sort((left, right) => left.agentId.localeCompare(right.agentId))) {
-    const provider: Record<string, YamlValue> = {
-      baseUrl: connection.config.baseUrl,
-      api: connection.config.dialect,
-      models: [{ id: connection.config.model, name: connection.config.model }],
-    };
-    if (connection.config.apiKey === "") provider.auth = "none";
-    else provider.apiKey = connection.config.apiKey;
-    providers[connection.providerId] = provider;
-  }
-  return stringifyYaml({ providers });
+function isEnvTemplate(value: string): boolean {
+  const match = value.match(/^\$\{([^}]*)\}$/);
+  return match !== null && ENV_NAME.test(match[1]);
+}
+
+function asRecord(value: YamlValue | undefined, error: string = "expected a YAML mapping"): Record<string, YamlValue> {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) throw new Error(error);
+  return value;
+}
+
+function isRecord(value: YamlValue | undefined): value is Record<string, YamlValue> {
+  return value !== null && value !== undefined && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringValue(value: YamlValue | undefined): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function quoteYamlScalar(value: string): string {
+  if (/^[A-Za-z0-9_./:@+-]+$/.test(value) && !/^(?:true|false|null|~)$/i.test(value)) return value;
+  return JSON.stringify(value);
 }
 
 interface YamlTextLine {
@@ -351,81 +394,4 @@ function indentOf(value: string): number {
 
 function yamlLineEnding(source: string): string {
   return source.includes("\r\n") ? "\r\n" : "\n";
-}
-
-function quoteStagedModel(value: string): string {
-  if (/^[A-Za-z0-9_./:@+-]+$/.test(value) && !/^(?:true|false|null|~)$/i.test(value)) return value;
-  return JSON.stringify(value);
-}
-
-export function stageAgentModelBinding(source: string, providerId: string, model: string, contextLabel: string): string {
-  let parsed: YamlValue;
-  try {
-    parsed = parseYaml(source);
-  } catch (error) {
-    if (error instanceof YamlError) throw new Error(`${contextLabel}: ${error.message}`);
-    throw error;
-  }
-  if (!isRecord(parsed)) throw new Error(`${contextLabel}: expected a YAML mapping`);
-  if (parsed.modelRoles !== undefined && !isRecord(parsed.modelRoles)) {
-    throw new Error(`${contextLabel}: modelRoles must be a block mapping to stage model default`);
-  }
-  const lines = splitYamlLines(source);
-  const rolesLine = lines.findIndex((line) => indentOf(line.body) === 0 && yamlKey(line.body) === "modelRoles");
-  const binding = `default: ${quoteStagedModel(`${providerId}/${model}`)}`;
-  const ending = yamlLineEnding(source);
-  if (rolesLine < 0) {
-    return `${source}${source.endsWith("\n") || source.endsWith("\r") ? "" : ending}modelRoles:${ending}  ${binding}${ending}`;
-  }
-  if (lines[rolesLine].body.slice(lines[rolesLine].body.indexOf(":") + 1).trim()) {
-    throw new Error(`${contextLabel}: modelRoles must be a block mapping to stage model default`);
-  }
-  const parentIndent = indentOf(lines[rolesLine].body);
-  let childIndent: number | undefined;
-  let defaultLine = -1;
-  let end = lines.length;
-  for (let index = rolesLine + 1; index < lines.length; index += 1) {
-    const line = lines[index];
-    const trimmed = line.body.trim();
-    const indent = indentOf(line.body);
-    if (trimmed && !trimmed.startsWith("#") && indent <= parentIndent) {
-      end = index;
-      break;
-    }
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    childIndent ??= indent;
-    if (indent === childIndent && yamlKey(line.body) === "default") defaultLine = index;
-  }
-  childIndent ??= parentIndent + 2;
-  if (defaultLine >= 0) {
-    const colon = lines[defaultLine].body.indexOf(":");
-    const original = lines[defaultLine].body.slice(colon + 1);
-    const comment = original.match(/(\s+#.*)$/)?.[1] ?? "";
-    lines[defaultLine] = { body: `${" ".repeat(childIndent)}${binding}${comment}`, ending: lines[defaultLine].ending };
-  } else {
-    const inserted = { body: `${" ".repeat(childIndent)}${binding}`, ending };
-    if (end === lines.length && lines.length > 0 && lines[lines.length - 1].ending === "") {
-      const last = lines[lines.length - 1];
-      lines[lines.length - 1] = { body: last.body, ending };
-      lines.push(inserted);
-    } else {
-      lines.splice(end, 0, inserted);
-    }
-  }
-  return joinYamlLines(lines);
-}
-
-export function expandModelPlaceholders(value: string, env: ReadonlyMap<string, string>, contextLabel: string): string {
-  const shaped = placeholderShape(value);
-  if (shaped === undefined) throw new Error(`${contextLabel}: contains a malformed environment placeholder`);
-  return value.replace(ENV_TOKEN, (_token, name: string) => env.get(name) ?? _token);
-}
-
-export function validateExpandedBaseUrl(value: string, contextLabel: string): void {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("protocol");
-  } catch {
-    throw new Error(`${contextLabel}: must resolve to an absolute HTTP(S) URL`);
-  }
 }

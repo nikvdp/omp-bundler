@@ -81,9 +81,10 @@ const PROJECT_SOURCE_FILES: Record<string, true> = {
   ".gitignore": true,
   "README.md": true,
   "omp-bundler.yml": true,
+  "Dockerfile": true,
   "runtime.env": true,
   "runtime.env.example": true,
-  "model.yml": true,
+  "models.yml": true,
 };
 const GLOBAL_STATE_NAMES = /^(?:models\.ya?ml(?:\.tmpl)?|sessions?|(?:\.?cache|caches?)(?:[.-].*)?|agent\.db(?:[.-].*)?|runtime(?:[._-].*)?|\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?)$/i;
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
@@ -173,11 +174,22 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
     }
   }
 
+  const dockerfilePath = join(rootDir, "Dockerfile");
+  const dockerfileStat = await lstat(dockerfilePath).catch(() => null);
+  if (!dockerfileStat) errors.push(issue(dockerfilePath, undefined, "is missing; every bundle owns its Dockerfile"));
+  else if (dockerfileStat.isSymbolicLink()) errors.push(issue(dockerfilePath, undefined, "must not be a symlink"));
+  else if (!dockerfileStat.isFile()) errors.push(issue(dockerfilePath, undefined, "must be a regular file"));
   const projectInfo = buildProjectContext(rootDir, configPath, parsedConfig, errors);
   const agents = [projectInfo.project.agent] as [AgentDirectory];
   await validateAgent(projectInfo.project.agent, errors);
 
-  let modelBundle: LoadedModelBundle = { connections: [], metadata: [], envNames: [] };
+  let modelBundle: LoadedModelBundle = {
+    catalog: { providers: {} },
+    source: "providers: {}\n",
+    connections: [],
+    metadata: [],
+    envNames: [],
+  };
   try {
     modelBundle = await loadBundleModels(rootDir, agents);
   } catch (error) {
@@ -223,12 +235,12 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
           if (value) modelEnv.set(name, value);
         }
         for (const connection of modelBundle.connections) {
-          const baseUrl = expandModelPlaceholders(connection.config.baseUrl, modelEnv, `${resolvedEnvFile} [${connection.agentId}]`);
+          const baseUrl = expandModelPlaceholders(connection.baseUrl, modelEnv, `${resolvedEnvFile} [${connection.selector}]`);
           if (baseUrl.includes("${")) continue;
           try {
-            validateExpandedBaseUrl(baseUrl, `${resolvedEnvFile} [${connection.agentId}]`);
+            validateExpandedBaseUrl(baseUrl, `${resolvedEnvFile} [${connection.selector}]`);
           } catch {
-            errors.push(issue(resolvedEnvFile, connection.agentId, "model baseUrl must resolve to an absolute HTTP(S) URL"));
+            errors.push(issue(resolvedEnvFile, connection.selector, "model baseUrl must resolve to an absolute HTTP(S) URL"));
           }
         }
         validateRuntimeEnv(parsedEnv, envSource, resolvedEnvFile, agents, errors);
@@ -460,12 +472,21 @@ async function scanTree(
     const path = join(current, name);
     const info = await lstat(path).catch(() => null);
     if (!info) continue;
-    if (rootSource && name in PROJECT_SOURCE_FILES && name !== "model.yml") {
+    if (rootSource && name in PROJECT_SOURCE_FILES && name !== "models.yml") {
       if (info.isSymbolicLink()) errors.push(issue(path, undefined, "must not be a symlink"));
       continue;
     }
     if (info.isSymbolicLink()) {
       errors.push(issue(path, undefined, "symlinks are not allowed in agent source"));
+      continue;
+    }
+    if (rootSource && name === "models.yml") {
+      if (!info.isFile()) {
+        errors.push(issue(path, undefined, "must be a regular model catalog file"));
+      } else {
+        const source = await readFile(path, "utf8").catch(() => "");
+        scanCredentialAssignments(source, path, errors);
+      }
       continue;
     }
     if (GLOBAL_STATE_NAMES.test(name) || /^agent\.db/i.test(name)) {
@@ -749,9 +770,6 @@ async function validateJsonFile(path: string, errors: ValidationIssue[]): Promis
 function validateAgentConfig(value: RecordValue, path: string, errors: ValidationIssue[]): void {
   if (value.setupVersion !== 1) errors.push(issue(path, "setupVersion", "must be the number 1"));
   if (value.modelRoles !== undefined) {
-    if (isRecord(value.modelRoles) && value.modelRoles.default !== undefined) {
-      errors.push(issue(path, "modelRoles.default", "is legacy model ownership; use model.yml"));
-    }
     if (!isRecord(value.modelRoles)) {
       errors.push(issue(path, "modelRoles", "must be a mapping of role names to model names"));
     } else {

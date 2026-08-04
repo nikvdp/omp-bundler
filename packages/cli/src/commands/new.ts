@@ -1,4 +1,6 @@
+import { readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { requirePackagedAsset } from "../assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import { createFilePlan } from "../file-plan.ts";
 import { resolveCommandPath } from "../project.ts";
@@ -23,8 +25,10 @@ export const newCommand: CommandHandler = async (args, context) => {
   const agentId = args.options.id === undefined ? bundleName : requiredOptionString(args, "id");
   assertSafeIdentifier(agentId, "agent id");
 
+  const dockerfile = await readFile(await requirePackagedAsset("Dockerfile"), "utf8");
   const writes = [
     ...bundleFiles(bundleName, agentId),
+    { path: "Dockerfile", content: dockerfile },
     ...agentScaffoldFiles(agentId),
   ];
   const plan = await createFilePlan(destination, writes);

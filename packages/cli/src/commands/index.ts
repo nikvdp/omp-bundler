@@ -3,8 +3,17 @@ export { checkCommand, formatIssue, validateBundle } from "./check.ts";
 export { destroyCommand } from "./destroy.ts";
 export { generateCommand } from "./generate.ts";
 export { newCommand } from "./new.ts";
-export { setModelCommand, SET_MODEL_HELP } from "./set-model.ts";
-export { serviceCommand, SERVICE_HELP } from "./service.ts";
+export { modelCommand, MODEL_HELP } from "./model.ts";
+export {
+  logsCommand,
+  LOGS_HELP,
+  restartCommand,
+  RESTART_HELP,
+  statusCommand,
+  STATUS_HELP,
+  stopCommand,
+  STOP_HELP,
+} from "./lifecycle.ts";
 export { resolveTuiTarget, runReadlineChat, tuiCommand, TUI_HELP } from "./tui.ts";
 export {
   CANONICAL_ASSET_PATHS,
