@@ -1327,6 +1327,10 @@ test("readline chat reports terminal, malformed, and truncated SSE failures", as
 test("readline chat detaches a Ctrl-C aborted SSE request without an error", async () => {
   const capture = captureIO();
   capture.io.stdin = new Readable({ read() {} });
+  capture.io.stdin.isTTY = true;
+  capture.io.stdin.setRawMode = () => {};
+  capture.io.stdout.isTTY = true;
+  capture.io.stdout.columns = 80;
   capture.io.stdin.push("hello\n");
   let cancelled = false;
   await runReadlineChat(
