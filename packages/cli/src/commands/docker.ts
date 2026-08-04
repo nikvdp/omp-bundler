@@ -16,12 +16,15 @@ import {
 import type { AgentDirectory } from "../types.ts";
 
 
+export const BUNDLE_ROOT_LABEL = "io.omp-bundler.bundle-root";
+
 export interface RunDockerArguments {
   readonly image: string;
   readonly corePort: number;
   readonly adapterPort: number;
   readonly dataVolume: string;
   readonly envFile: string;
+  readonly bundleRoot: string;
   readonly containerName?: string;
   readonly detached?: boolean;
 }
@@ -46,6 +49,8 @@ export function runDockerArgs(
     "--rm",
     ...(options.detached ? ["-d"] : []),
     ...(options.containerName === undefined ? [] : ["--name", options.containerName]),
+    "--label",
+    `${BUNDLE_ROOT_LABEL}=${options.bundleRoot}`,
     "-p",
     `${options.corePort}:8787`,
     "-p",

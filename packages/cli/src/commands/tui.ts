@@ -7,7 +7,7 @@ import { loadProject, resolveDefaultEnvFile } from "../project.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 import { getDockerEnvValue } from "./check.ts";
 import { assertAllowedOptions } from "./common.ts";
-import { resolveRunSettings } from "./run.ts";
+import { discoverPublishedAdapterPort, resolveRunSettings } from "./run.ts";
 
 export const TUI_HELP = `omp-bundler tui [--dir <bundle-path>] [--endpoint <agent-url>]
 
@@ -31,7 +31,11 @@ export const tuiCommand: CommandHandler = async (args, context) => {
   return runReadlineChat(await resolveTuiTarget(args, context.cwd), context);
 };
 
-export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Promise<TuiTarget> {
+export async function resolveTuiTarget(
+  args: ParsedArguments,
+  cwd: string,
+  discoverPort: (bundleRoot: string, containerName: string) => Promise<number | undefined> = discoverPublishedAdapterPort,
+): Promise<TuiTarget> {
   const directory = requiredStringOption(args, "dir");
   const endpoint = requiredStringOption(args, "endpoint");
   if (endpoint !== undefined) {
@@ -44,7 +48,8 @@ export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Prom
   }
 
   const project = await loadProject(directory, cwd);
-  const { adapterPort } = resolveRunSettings({ project });
+  const settings = resolveRunSettings({ project });
+  const adapterPort = await discoverPort(project.rootDir, settings.containerName) ?? settings.adapterPort;
   const envFile = await resolveDefaultEnvFile(project.rootDir);
   let token: string | undefined;
   if (envFile !== undefined) {

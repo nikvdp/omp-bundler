@@ -15,4 +15,12 @@ export {
   shellQuote,
   stageDockerContext,
 } from "./docker.ts";
-export { runBundle, runCommand, runPreviewCommand, resolveRunSettings, RUN_HELP } from "./run.ts";
+export {
+  discoverPublishedAdapterPort,
+  resolveAvailableRunSettings,
+  resolveRunSettings,
+  runBundle,
+  runCommand,
+  runPreviewCommand,
+  RUN_HELP,
+} from "./run.ts";

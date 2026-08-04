@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import { basename, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { optionBoolean } from "../args.ts";
@@ -6,6 +7,7 @@ import { resolveBundleRoot, resolveDefaultEnvFile } from "../project.ts";
 import { validateBundle, formatIssue } from "./check.ts";
 import { assertAllowedOptions, requiredOptionString } from "./common.ts";
 import {
+  BUNDLE_ROOT_LABEL,
   formatDockerCommand,
   runDockerArgs,
   shellQuote,
@@ -31,6 +33,7 @@ export interface RunSettings {
   readonly adapterPort: number;
   readonly dataVolume: string;
   readonly containerName: string;
+  readonly bundleRoot: string;
 }
 
 export const runCommand: CommandHandler = async (
@@ -106,27 +109,26 @@ export async function runBundle(
     return usageError(context, "--env-file was not resolved");
   }
 
-  const settings = resolveRunSettings(result, imageOverride);
-  const { containerName, ...containerSettings } = settings;
-  const dockerArgs = runDockerArgs({
-    ...containerSettings,
-    envFile: result.envFile,
-    ...(detached ? { detached: true, containerName } : {}),
-  });
+  const configuredSettings = resolveRunSettings(result, imageOverride);
+
   if (optionBoolean(args, "dry-run")) {
-    context.io.stdout.write(`${formatDockerCommand("docker", dockerArgs)}\n`);
+    const settings = await resolveAvailableRunSettings(configuredSettings);
+    printPortSelection(context, configuredSettings, settings);
+    context.io.stdout.write(`${runPreviewCommand(settings, result.envFile, detached)}\n`);
     return 0;
   }
 
   if (detached) {
-    const existingState = await inspectServiceContainer(containerName);
+    const existingState = await inspectServiceContainer(configuredSettings.containerName);
     if (existingState === "running") {
-      context.io.stdout.write(`Service ${containerName}: already running\n`);
-      printAgentEndpoints(context, result, settings);
+      context.io.stdout.write(`Service ${configuredSettings.containerName}: already running\n`);
+      const livePort = await inspectPublishedPort(configuredSettings.containerName, 8765)
+        ?? configuredSettings.adapterPort;
+      printAgentEndpoints(context, result, configuredSettings, livePort);
       return 0;
     }
     if (existingState !== undefined) {
-      const removal = await executeChild("docker", ["rm", "-f", containerName], {
+      const removal = await executeChild("docker", ["rm", "-f", configuredSettings.containerName], {
         stdio: "pipe",
         forwardSignals: false,
       });
@@ -135,7 +137,21 @@ export async function runBundle(
         return removal.exitCode;
       }
     }
+  } else {
+    const conflictResult = await resolveServiceConflict(context, configuredSettings.containerName);
+    if (conflictResult !== undefined) return conflictResult;
+  }
 
+  const settings = await resolveAvailableRunSettings(configuredSettings);
+  printPortSelection(context, configuredSettings, settings);
+  const { containerName, ...containerSettings } = settings;
+  const dockerArgs = runDockerArgs({
+    ...containerSettings,
+    envFile: result.envFile,
+    ...(detached ? { detached: true, containerName } : {}),
+  });
+
+  if (detached) {
     const docker = await executeChild("docker", dockerArgs, {
       stdio: "pipe",
       forwardSignals: false,
@@ -148,9 +164,6 @@ export async function runBundle(
     printAgentEndpoints(context, result, settings);
     return 0;
   }
-
-  const conflictResult = await resolveServiceConflict(context, containerName);
-  if (conflictResult !== undefined) return conflictResult;
 
   printAgentEndpoints(context, result, settings);
   const docker = await executeChild("docker", dockerArgs, {
@@ -186,7 +199,81 @@ export function resolveRunSettings(
   if (!Number.isSafeInteger(adapterPort) || adapterPort < 1 || adapterPort > 65535) {
     throw new Error(`adapter port is not valid: ${adapterPort}`);
   }
-  return { image, dataVolume, corePort, adapterPort, containerName };
+  return { image, dataVolume, corePort, adapterPort, containerName, bundleRoot: result.project.rootDir };
+}
+export type PortProbe = (port: number) => Promise<boolean>;
+
+export async function resolveAvailablePorts(
+  corePort: number,
+  adapterPort: number,
+  probe: PortProbe = isPortAvailable,
+): Promise<Pick<RunSettings, "corePort" | "adapterPort">> {
+  const selectedAdapterPort = await findAvailablePort(adapterPort, new Set(), probe);
+  const selectedCorePort = await findAvailablePort(corePort, new Set([selectedAdapterPort]), probe);
+  return { adapterPort: selectedAdapterPort, corePort: selectedCorePort };
+}
+
+export async function resolveAvailableRunSettings(
+  settings: RunSettings,
+  probe: PortProbe = isPortAvailable,
+): Promise<RunSettings> {
+  const ports = await resolveAvailablePorts(settings.corePort, settings.adapterPort, probe);
+  return ports.adapterPort === settings.adapterPort && ports.corePort === settings.corePort
+    ? settings
+    : { ...settings, ...ports };
+}
+
+export async function discoverPublishedAdapterPort(
+  bundleRoot: string,
+  containerName: string,
+): Promise<number | undefined> {
+  const namedPort = await inspectPublishedPort(containerName, 8765);
+  if (namedPort !== undefined) return namedPort;
+
+  try {
+    const containers = await executeChild(
+      "docker",
+      ["ps", "--filter", `label=${BUNDLE_ROOT_LABEL}=${bundleRoot}`, "--format", "{{.ID}}"],
+      { stdio: "pipe", forwardSignals: false },
+    );
+    if (containers.exitCode !== 0) return undefined;
+    for (const id of containers.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+      const port = await inspectPublishedPort(id, 8765);
+      if (port !== undefined) return port;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+async function isPortAvailable(port: number): Promise<boolean> {
+  const { promise, resolve: complete } = Promise.withResolvers<boolean>();
+  const server = createServer();
+  let settled = false;
+  const finish = (available: boolean): void => {
+    if (settled) return;
+    settled = true;
+    complete(available);
+  };
+  server.unref();
+  server.once("error", () => finish(false));
+  server.listen({ host: "0.0.0.0", port, exclusive: true }, () => {
+    server.close((error) => finish(error === undefined));
+  });
+  return promise;
+}
+
+async function findAvailablePort(
+  preferred: number,
+  excluded: ReadonlySet<number>,
+  probe: PortProbe,
+): Promise<number> {
+  for (let offset = 0; offset < 65_535; offset += 1) {
+    const candidate = ((preferred - 1 + offset) % 65_535) + 1;
+    if (!excluded.has(candidate) && await probe(candidate)) return candidate;
+  }
+  throw new Error("no host TCP port is available");
 }
 
 export function runPreviewCommand(
@@ -272,16 +359,53 @@ async function inspectServiceContainer(containerName: string): Promise<string | 
   if (/no such (?:object|container)/i.test(result.stderr)) return undefined;
   throw new Error(result.stderr.trim() || `docker inspect failed with exit code ${result.exitCode}`);
 }
+async function inspectPublishedPort(
+  container: string,
+  containerPort: number,
+): Promise<number | undefined> {
+  try {
+    const result = await executeChild(
+      "docker",
+      ["port", container, `${containerPort}/tcp`],
+      { stdio: "pipe", forwardSignals: false },
+    );
+    if (result.exitCode !== 0) return undefined;
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const match = line.trim().match(/:(\d+)$/);
+      if (!match) continue;
+      const port = Number(match[1]);
+      if (Number.isSafeInteger(port) && port >= 1 && port <= 65_535) return port;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function printPortSelection(
+  context: CommandContext,
+  configured: RunSettings,
+  selected: RunSettings,
+): void {
+  if (selected.adapterPort !== configured.adapterPort) {
+    context.io.stdout.write(`Adapter port ${configured.adapterPort} is busy; using ${selected.adapterPort}.\n`);
+  }
+  if (selected.corePort !== configured.corePort) {
+    context.io.stdout.write(`Core port ${configured.corePort} is busy; using ${selected.corePort}.\n`);
+  }
+}
+
 
 function printAgentEndpoints(
   context: CommandContext,
   result: CheckResult,
   settings: RunSettings,
+  adapterPort = settings.adapterPort,
 ): void {
   const directoryFlag = resolve(context.cwd) === result.project.rootDir
     ? ""
     : ` --dir ${shellQuote(result.project.rootDir)}`;
-  const base = `http://localhost:${settings.adapterPort}/v1/agents/${result.agent.id}`;
+  const base = `http://localhost:${adapterPort}/v1/agents/${result.agent.id}`;
   context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
   context.io.stdout.write(`TUI: omp-bundler tui${directoryFlag}\n`);
 }
