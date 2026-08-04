@@ -35,6 +35,7 @@ export interface CommandHandlerRegistry {
   readonly check?: CommandHandler;
   readonly build?: CommandHandler;
   readonly run?: CommandHandler;
+  readonly service?: CommandHandler;
   readonly migrate?: CommandHandler;
   readonly "set-model"?: CommandHandler;
 }

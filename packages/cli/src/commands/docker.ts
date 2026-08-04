@@ -22,6 +22,8 @@ export interface RunDockerArguments {
   readonly adapterPort: number;
   readonly dataVolume: string;
   readonly envFile: string;
+  readonly containerName: string;
+  readonly detached?: boolean;
 }
 
 /** Resolve the package asset directory without depending on process.cwd(). */
@@ -42,6 +44,9 @@ export function runDockerArgs(
   return [
     "run",
     "--rm",
+    ...(options.detached ? ["-d"] : []),
+    "--name",
+    options.containerName,
     "-p",
     `${options.corePort}:8787`,
     "-p",

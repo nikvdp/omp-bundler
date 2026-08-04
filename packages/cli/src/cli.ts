@@ -39,6 +39,7 @@ Commands:
   ${COMMAND_HELP.check}
   ${COMMAND_HELP.build}
   ${COMMAND_HELP.run}
+  ${COMMAND_HELP.service.replaceAll("\n", "\n  ")}
   ${COMMAND_HELP.migrate}
 
 Options:

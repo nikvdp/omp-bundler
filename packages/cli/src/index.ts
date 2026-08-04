@@ -37,6 +37,7 @@ export {
   generateCommand,
   newCommand,
   runCommand,
+  serviceCommand,
   setModelCommand,
 } from "./commands/index.ts";
 export {

@@ -6,6 +6,7 @@ export { generateCommand } from "./generate.ts";
 export { migrateCommand } from "./migrate.ts";
 export { newCommand } from "./new.ts";
 export { setModelCommand, SET_MODEL_HELP } from "./set-model.ts";
+export { serviceCommand, SERVICE_HELP } from "./service.ts";
 export {
   CANONICAL_ASSET_PATHS,
   formatDockerCommand,
@@ -15,4 +16,4 @@ export {
   shellQuote,
   stageDockerContext,
 } from "./docker.ts";
-export { runCommand, runPreviewCommand, resolveRunSettings, RUN_HELP } from "./run.ts";
+export { runBundle, runCommand, runPreviewCommand, resolveRunSettings, RUN_HELP } from "./run.ts";

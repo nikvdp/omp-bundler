@@ -21,18 +21,26 @@ changing the image. --dry-run prints the Docker command without executing it.`;
 
 const SAFE_IMAGE_TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
 const SAFE_VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const SAFE_CONTAINER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
 
 export interface RunSettings {
   readonly image: string;
   readonly corePort: number;
   readonly adapterPort: number;
   readonly dataVolume: string;
+  readonly containerName: string;
 }
 
 export const runCommand: CommandHandler = async (
   args: ParsedArguments,
   context: CommandContext,
-): Promise<number> => {
+): Promise<number> => runBundle(args, context, false);
+
+export async function runBundle(
+  args: ParsedArguments,
+  context: CommandContext,
+  detached: boolean,
+): Promise<number> {
   if (args.options.help === true) {
     context.io.stdout.write(`${RUN_HELP}\n`);
     return 0;
@@ -107,24 +115,38 @@ export const runCommand: CommandHandler = async (
   }
 
   const settings = resolveRunSettings(result, imageOverride);
-  const dockerArgs = runDockerArgs({ ...settings, envFile: result.envFile });
+  const dockerArgs = runDockerArgs({
+    ...settings,
+    envFile: result.envFile,
+    ...(detached ? { detached: true } : {}),
+  });
   if (optionBoolean(args, "dry-run")) {
     context.io.stdout.write(`${formatDockerCommand("docker", dockerArgs)}\n`);
     return 0;
   }
-  for (const agent of result.agents) {
-    const base = `http://localhost:${settings.adapterPort}/v1/agents/${agent.id}`;
-    context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
-    context.io.stdout.write(`TUI: omp-tui ${base}\n`);
+
+  if (detached) {
+    const docker = await executeChild("docker", dockerArgs, {
+      stdio: "pipe",
+      forwardSignals: false,
+    });
+    if (docker.exitCode !== 0) {
+      context.io.stderr.write(docker.stderr || `docker run failed with exit code ${docker.exitCode}\n`);
+      return docker.exitCode;
+    }
+    context.io.stdout.write(`Started service ${settings.containerName}.\n`);
+    printAgentEndpoints(context, result, settings);
+    return 0;
   }
 
+  printAgentEndpoints(context, result, settings);
   const docker = await executeChild("docker", dockerArgs, {
     stdio: "inherit",
     forwardSignals: true,
     signalMap: { SIGTERM: "SIGINT" },
   });
   return docker.exitCode;
-};
+}
 
 export function resolveRunSettings(
   result: Pick<CheckResult, "project">,
@@ -140,23 +162,42 @@ export function resolveRunSettings(
     : `${bundleName}-data`;
   const corePort = typeof configuredRun?.corePort === "number" ? configuredRun.corePort : 8787;
   const adapterPort = typeof configuredRun?.adapterPort === "number" ? configuredRun.adapterPort : 8765;
+  const containerName = `${dataVolume}-service`;
 
   if (!isSafeImageTag(image)) throw new Error(`image tag is not safe for Docker: ${image}`);
   if (!SAFE_VOLUME_NAME.test(dataVolume)) throw new Error(`data volume is not safe for Docker: ${dataVolume}`);
+  if (!SAFE_CONTAINER_NAME.test(containerName)) throw new Error(`service container name is not safe for Docker: ${containerName}`);
   if (!Number.isSafeInteger(corePort) || corePort < 1 || corePort > 65535) {
     throw new Error(`core port is not valid: ${corePort}`);
   }
   if (!Number.isSafeInteger(adapterPort) || adapterPort < 1 || adapterPort > 65535) {
     throw new Error(`adapter port is not valid: ${adapterPort}`);
   }
-  return { image, dataVolume, corePort, adapterPort };
+  return { image, dataVolume, corePort, adapterPort, containerName };
 }
 
 export function runPreviewCommand(
   settings: RunSettings,
   envFile: string,
+  detached = false,
 ): string {
-  return formatDockerCommand("docker", runDockerArgs({ ...settings, envFile }));
+  return formatDockerCommand("docker", runDockerArgs({
+    ...settings,
+    envFile,
+    ...(detached ? { detached: true } : {}),
+  }));
+}
+
+function printAgentEndpoints(
+  context: CommandContext,
+  result: CheckResult,
+  settings: RunSettings,
+): void {
+  for (const agent of result.agents) {
+    const base = `http://localhost:${settings.adapterPort}/v1/agents/${agent.id}`;
+    context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
+    context.io.stdout.write(`TUI: omp-tui ${base}\n`);
+  }
 }
 
 function isSafeImageTag(tag: string): boolean {
