@@ -91,6 +91,7 @@ meetings-agent/
 ├── commands/
 │   └── example-command.md.example
 ├── config.yml
+├── model.yml
 ├── extensions/
 │   └── example-extension.ts.example
 ├── omp-bundler.yml
@@ -109,10 +110,10 @@ extension point belongs. `.example` keeps each complete starter inactive while
 `check` still validates it. Use the matching generator to create an active
 component rather than removing the suffix by hand.
 
-After configuring a model and generating real components, the same root may
-also contain `model.yml`, `commands/summarize.md`,
-`extensions/lifecycle-log.ts`, `skills/meeting-notes/SKILL.md`,
-`subagents/transcript-researcher.md`, and `tools/read-transcript.ts`.
+After generating real components, the same root may also contain
+`commands/summarize.md`, `extensions/lifecycle-log.ts`,
+`skills/meeting-notes/SKILL.md`, `subagents/transcript-researcher.md`, and
+`tools/read-transcript.ts`.
 
 The source uses `subagents/`; Docker staging maps it to OMP's internal
 `.omp/agents/` directory.
@@ -132,6 +133,11 @@ run:
   corePort: 8787
   adapterPort: 8765
 ```
+
+The configured ports are preferred host ports, not fixed reservations. At
+launch, `run` and `service start` keep each preferred port when it is free and
+otherwise select the next free, distinct host port. The container ports remain
+8787 for core and 8765 for the adapter.
 
 The ID is stable when the bundle directory is renamed. It determines the HTTP
 route and runtime registration. Change it by editing `agent.id`, then rebuild;
@@ -210,8 +216,9 @@ delete Docker volumes, sessions, or `runtime.env`.
 
 ## Configure the model
 
-Each bundle requires one root `model.yml`. The shortest path is importing an
-exact provider/model selector from the local OMP installation:
+Each new bundle includes one inert root `model.yml` template. Configure it
+before building. The shortest path is importing an exact provider/model
+selector from the local OMP installation:
 
 ```bash
 omp-bundler set-model deepseek/deepseek-v4-flash
@@ -253,7 +260,7 @@ apiKey: "${OPENAI_API_KEY}"
 - `baseUrl` is an HTTP(S) URL or `${ENV_VAR}`.
 - `dialect` is `openai-responses`, `openai-completions`, or
   `anthropic-messages`.
-- `model` is a non-empty provider model ID or environment template.
+- `model` is a non-empty literal provider model ID.
 - `apiKey` is a literal, `${ENV_VAR}`, `null`, or an empty string for no auth.
 
 Referenced environment names are maintained in `runtime.env.example`.
@@ -302,14 +309,15 @@ The bundle's `agent.id` is registered automatically. There is no
 `PUMBLE_AGENT_ID` field. Repeating the generator is an idempotent no-op and
 unrelated model blocks remain unchanged.
 
-Advanced deployments may provide `OMP_ADAPTERS` directly as an unquoted JSON
-array on one `runtime.env` line. A singular registration looks like:
+Advanced deployments may provide `OMP_ADAPTERS` directly as one unquoted JSON
+array on one `runtime.env` line. It must contain exactly one registration:
 
 ```env
 OMP_ADAPTERS=[{"adapterId":"http-meetings-agent","callbackUrl":"http://127.0.0.1:8765/core/events/meetings-agent","sharedSecret":"replace-me","agentId":"meetings-agent"}]
 ```
 
-The registration's `agentId` must equal `agent.id`.
+The registration's `agentId` must equal `agent.id`; missing, extra, or unbound
+registrations are rejected before startup.
 
 ## Validate
 
@@ -378,8 +386,9 @@ Run in the foreground:
 omp-bundler run
 ```
 
-`run` validates `runtime.env`, owns an unnamed temporary container, streams
-logs, and forwards termination signals. If the managed service is already
+`run` validates `runtime.env`, resolves busy host ports automatically, owns an
+unnamed temporary container, streams logs, and forwards termination signals.
+It prints the actual selected endpoint. If the managed service is already
 running, it asks whether to follow that service's logs, stop it and run a
 foreground container, or cancel.
 
@@ -396,6 +405,7 @@ The direct Docker shape is:
 
 ```bash
 docker run --rm \
+  --label io.omp-bundler.bundle-root=/absolute/path/to/meetings-agent \
   -p 8787:8787 \
   -p 8765:8765 \
   -v meetings-agent-data:/data \
@@ -429,13 +439,14 @@ omp-bundler tui --dir ../meetings-agent
 omp-bundler tui --endpoint http://localhost:8765/v1/agents/meetings-agent
 ```
 
-With no flags, `tui` finds the current bundle and its root agent. `--dir`
-selects another bundle. `--endpoint` bypasses bundle discovery with an exact
-agent URL.
+With no flags, `tui` finds the current bundle and its root agent. It asks
+Docker for the running service or labeled foreground container's published
+adapter port, then falls back to `adapterPort` from `omp-bundler.yml` when no
+live container is discoverable. `--dir` selects another bundle. `--endpoint`
+bypasses bundle discovery with an exact agent URL.
 
-Bundle mode reads `adapterPort` from `omp-bundler.yml` and the optional Bearer
-token from `runtime.env`. Endpoint mode reads `OMP_HTTP_API_TOKEN` from the
-process environment.
+Bundle mode reads the optional Bearer token from `runtime.env`. Endpoint mode
+reads `OMP_HTTP_API_TOKEN` from the process environment.
 
 Each launch starts a fresh server-side conversation. Enter sends one line;
 `/quit`, `/exit`, or Ctrl+C exits. Requests are synchronous and show a spinner
@@ -444,7 +455,8 @@ supported.
 
 ## HTTP API
 
-The default adapter listens on `adapterPort`, 8765 by default:
+The default adapter listens on container port 8765. The preferred host port is
+8765, but startup selects another free host port when needed:
 
 ```text
 GET  /health
