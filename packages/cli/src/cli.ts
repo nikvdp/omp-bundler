@@ -177,9 +177,18 @@ function createParser(
     ["image", { type: "string", describe: "Container image tag" }],
     ["dry-run", { type: "boolean", describe: "Print the Docker command without running it" }],
   ]);
+  addBundleCommand(parser, "start", "Start the bundle as a background service", dispatch, [
+    ["env-file", { type: "string", describe: "Runtime environment file" }],
+    ["image", { type: "string", describe: "Container image tag" }],
+    ["dry-run", { type: "boolean", describe: "Print the Docker command without running it" }],
+  ]);
   addBundleCommand(parser, "status", "Show owned service state and endpoint", dispatch, []);
   addBundleCommand(parser, "stop", "Stop the owned service", dispatch, []);
-  addBundleCommand(parser, "restart", "Restart the owned service", dispatch, []);
+  addBundleCommand(parser, "restart", "Recreate the owned service from current bundle configuration", dispatch, [
+    ["env-file", { type: "string", describe: "Runtime environment file" }],
+    ["image", { type: "string", describe: "Container image tag" }],
+    ["dry-run", { type: "boolean", describe: "Print the Docker command without running it" }],
+  ]);
   addBundleCommand(parser, "logs", "Show logs from the owned service", dispatch, [
     ["follow", { type: "boolean", alias: "f", describe: "Continue following new log output" }],
     ["tail", { type: "string", alias: "n", default: "100", describe: "Lines to show from the end, or 'all'" }],

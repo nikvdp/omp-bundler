@@ -9,6 +9,8 @@ export {
   LOGS_HELP,
   restartCommand,
   RESTART_HELP,
+  startCommand,
+  START_HELP,
   statusCommand,
   STATUS_HELP,
   stopCommand,

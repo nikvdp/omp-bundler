@@ -7,12 +7,17 @@ import {
   discoverPublishedAdapterPort,
   inspectBundleServiceContainer,
   resolveRunSettings,
+  runBundle,
 } from "./run.ts";
 
+
+export const START_HELP = "omp-bundler start [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]";
 export const STATUS_HELP = "omp-bundler status [bundle-path]";
 export const STOP_HELP = "omp-bundler stop [bundle-path]";
-export const RESTART_HELP = "omp-bundler restart [bundle-path]";
+export const RESTART_HELP = "omp-bundler restart [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]";
 export const LOGS_HELP = "omp-bundler logs [bundle-path] [--follow] [--tail <lines>]";
+
+export const startCommand: CommandHandler = (args, context) => runBundle(args, context);
 
 export const statusCommand: CommandHandler = async (args, context) => {
   if (writeHelp(args, context, STATUS_HELP)) return 0;
@@ -39,21 +44,13 @@ export const stopCommand: CommandHandler = async (args, context) => {
   return dockerLifecycle("stop", settings.containerName, context);
 };
 
-export const restartCommand: CommandHandler = async (args, context) => {
-  if (writeHelp(args, context, RESTART_HELP)) return 0;
-  const { settings, state } = await resolveLifecycle(args, context, []);
-  if (state === undefined) {
-    context.io.stderr.write(`Service ${settings.containerName} does not exist; run 'omp-bundler run'.\n`);
-    return 1;
-  }
-  return dockerLifecycle("restart", settings.containerName, context);
-};
+export const restartCommand: CommandHandler = (args, context) => runBundle(args, context, true);
 
 export const logsCommand: CommandHandler = async (args, context) => {
   if (writeHelp(args, context, LOGS_HELP)) return 0;
   const { settings, state } = await resolveLifecycle(args, context, ["follow", "tail"]);
   if (state === undefined) {
-    context.io.stderr.write(`Service ${settings.containerName} does not exist; run 'omp-bundler run'.\n`);
+    context.io.stderr.write(`Service ${settings.containerName} does not exist; run 'omp-bundler start'.\n`);
     return 1;
   }
   if (args.options.follow !== undefined && !optionBoolean(args, "follow")) {
@@ -85,7 +82,7 @@ async function resolveLifecycle(
 }
 
 async function dockerLifecycle(
-  action: "stop" | "restart",
+  action: "stop",
   containerName: string,
   context: CommandContext,
 ): Promise<number> {
@@ -97,7 +94,7 @@ async function dockerLifecycle(
     context.io.stderr.write(result.stderr || `docker ${action} failed with exit code ${result.exitCode}\n`);
     return result.exitCode;
   }
-  context.io.stdout.write(`Service ${containerName}: ${action === "stop" ? "stopped" : "restarted"}\n`);
+  context.io.stdout.write(`Service ${containerName}: stopped\n`);
   return 0;
 }
 

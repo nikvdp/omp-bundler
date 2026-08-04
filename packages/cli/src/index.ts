@@ -36,6 +36,7 @@ export {
   generateCommand,
   newCommand,
   runCommand,
+  startCommand,
   logsCommand,
   restartCommand,
   statusCommand,

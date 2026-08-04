@@ -32,6 +32,7 @@ export interface CommandHandlerRegistry {
   readonly check?: CommandHandler;
   readonly build?: CommandHandler;
   readonly run?: CommandHandler;
+  readonly start?: CommandHandler;
   readonly status?: CommandHandler;
   readonly stop?: CommandHandler;
   readonly restart?: CommandHandler;

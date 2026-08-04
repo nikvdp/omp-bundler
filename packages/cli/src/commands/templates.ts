@@ -161,7 +161,7 @@ omp-bundler generate tool read-transcript
 1. Edit \`AGENTS.md\` and generate or edit components under the bundle root.
 2. Add models with \`omp-bundler model add <provider/model>\`, then choose the default with \`omp-bundler model set-default <provider/model>\`.
 3. Copy \`runtime.env.example\` to the ignored \`runtime.env\` file and fill its generated placeholders.
-4. Run \`omp-bundler check\` and \`omp-bundler build\`, then start the background service with \`omp-bundler run\`. Use \`--foreground\` when the process should own the terminal. Run selects \`runtime.env\` and free host ports automatically.
+4. Run \`omp-bundler check\` and \`omp-bundler build\`, then start the background service with \`omp-bundler start\`. Use \`omp-bundler run --foreground\` when the process should own the terminal. Both select \`runtime.env\` and free host ports automatically.
 5. Inspect the service with \`omp-bundler status\`, follow it with \`omp-bundler logs --follow\`, and chat with \`omp-bundler tui\`. TUI discovers the live adapter port automatically.
 
 The committed \`runtime.env.example\` contains placeholders only. Keep deployment values in \`runtime.env\`.

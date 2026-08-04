@@ -44,6 +44,7 @@ export const runCommand: CommandHandler = async (
 export async function runBundle(
   args: ParsedArguments,
   context: CommandContext,
+  restart = false,
 ): Promise<number> {
   if (args.options.help === true) {
     context.io.stdout.write(`${RUN_HELP}\n`);
@@ -123,7 +124,7 @@ export async function runBundle(
 
   if (detached) {
     const existingState = await inspectBundleServiceContainer(configuredSettings);
-    if (existingState === "running") {
+    if (existingState === "running" && !restart) {
       context.io.stdout.write(`Service ${configuredSettings.containerName}: already running\n`);
       const livePort = await inspectPublishedPort(configuredSettings.containerName, 8765)
         ?? configuredSettings.adapterPort;
