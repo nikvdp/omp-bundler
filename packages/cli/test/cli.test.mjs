@@ -34,6 +34,7 @@ import {
   resolveBuildTag,
   migrateCommand,
   resolveTuiTarget,
+  runReadlineChat,
   resolveRunSettings,
   runPreviewCommand,
   validateBundle,
@@ -128,6 +129,7 @@ async function invokeWithInput(handler, cwd, positionals, options, input) {
       await delay(1);
     }
   })());
+  Object.defineProperty(capture.io.stdin, "isTTY", { value: true });
   const result = await handler(
     commandArgs(positionals, options),
     handlerContext(cwd, capture.io),
@@ -1156,7 +1158,7 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
     assert.equal(buildPreviewCommand("override:tag", "/tmp/docker-context"), "docker build -t override:tag /tmp/docker-context");
     assert.equal(
       runPreviewCommand(settings, "/tmp/runtime.env"),
-      "docker run --rm --name configured-data-service -p 9100:8787 -p 9200:8765 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
+      "docker run --rm -p 9100:8787 -p 9200:8765 -v configured-data:/data --env-file /tmp/runtime.env configured:tag",
     );
 
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
@@ -1174,7 +1176,7 @@ test("Docker argument precedence is explicit and run dry-run never executes Dock
     assert.equal(dryRun.stderr, "");
     assert.equal(
       dryRun.stdout.trim(),
-      `docker run --rm --name bundle-data-service -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} override:tag`,
+      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${envPath} override:tag`,
     );
   });
 });
@@ -1194,7 +1196,10 @@ test("service lifecycle uses one deterministic detached Docker container", async
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args) + "\\n");
-if (process.env.DOCKER_MISSING === "1" && ["inspect", "stop", "restart"].includes(args[0])) {
+if (
+  (process.env.DOCKER_MISSING === "1" && ["inspect", "stop", "restart"].includes(args[0]))
+  || (process.env.DOCKER_START_MISSING === "1" && args[0] === "inspect")
+) {
   console.error("Error: No such object: " + args.at(-1));
   process.exit(1);
 }
@@ -1204,11 +1209,17 @@ if (args[0] === "run") console.log("container-id");
 
     const previousPath = process.env.PATH;
     const previousMissing = process.env.DOCKER_MISSING;
+    const previousStartMissing = process.env.DOCKER_START_MISSING;
     process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    process.env.DOCKER_START_MISSING = "1";
     try {
       const started = await invoke(serviceCommand, bundle, ["start"]);
       assert.equal(started.result, 0, started.stderr);
       assert.match(started.stdout, /Started service bundle-data-service/);
+      delete process.env.DOCKER_START_MISSING;
+      const alreadyRunning = await invoke(serviceCommand, bundle, ["start"]);
+      assert.equal(alreadyRunning.result, 0, alreadyRunning.stderr);
+      assert.match(alreadyRunning.stdout, /already running/);
       const status = await invoke(serviceCommand, bundle, ["status"]);
       assert.equal(status.result, 0, status.stderr);
       assert.equal(status.stdout, "Service bundle-data-service: running\n");
@@ -1232,13 +1243,60 @@ if (args[0] === "run") console.log("container-id");
       else process.env.PATH = previousPath;
       if (previousMissing === undefined) delete process.env.DOCKER_MISSING;
       else process.env.DOCKER_MISSING = previousMissing;
+      if (previousStartMissing === undefined) delete process.env.DOCKER_START_MISSING;
+      else process.env.DOCKER_START_MISSING = previousStartMissing;
     }
 
     const calls = (await readFile(capturePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.deepEqual(calls[0].slice(0, 5), ["run", "--rm", "-d", "--name", "bundle-data-service"]);
-    assert.deepEqual(calls[1], ["inspect", "--type", "container", "--format", "{{.State.Status}}", "bundle-data-service"]);
-    assert.deepEqual(calls[2], ["stop", "bundle-data-service"]);
-    assert.deepEqual(calls[3], ["restart", "bundle-data-service"]);
+    assert.deepEqual(calls[0], ["inspect", "--type", "container", "--format", "{{.State.Status}}", "bundle-data-service"]);
+    assert.deepEqual(calls[1].slice(0, 5), ["run", "--rm", "-d", "--name", "bundle-data-service"]);
+    assert.deepEqual(calls[2], ["inspect", "--type", "container", "--format", "{{.State.Status}}", "bundle-data-service"]);
+    assert.deepEqual(calls[3], ["inspect", "--type", "container", "--format", "{{.State.Status}}", "bundle-data-service"]);
+    assert.deepEqual(calls[4], ["stop", "bundle-data-service"]);
+    assert.deepEqual(calls[5], ["restart", "bundle-data-service"]);
+  });
+});
+
+test("run asks how to handle an active managed service", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "runtime.env"), runtimeEnv());
+
+    const capturePath = join(parent, "docker-calls.jsonl");
+    await writeFile(join(parent, "docker"), `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args) + "\\n");
+if (args[0] === "inspect") console.log("running");
+`, { mode: 0o755 });
+
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      const cancelled = await invokeWithInput(runCommand, bundle, [], {}, "c\n");
+      assert.equal(cancelled.result, 0, cancelled.stderr);
+      assert.match(cancelled.stdout, /already running.*Follow service logs.*Stop service and run in foreground/s);
+
+      const followed = await invokeWithInput(runCommand, bundle, [], {}, "f\n");
+      assert.equal(followed.result, 0, followed.stderr);
+
+      const replaced = await invokeWithInput(runCommand, bundle, [], {}, "r\n");
+      assert.equal(replaced.result, 0, replaced.stderr);
+      assert.match(replaced.stdout, /Stopped service bundle-data-service; starting foreground run/);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+
+    const calls = (await readFile(capturePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(calls.map((args) => args[0]), [
+      "inspect",
+      "inspect", "logs",
+      "inspect", "stop", "run",
+    ]);
+    assert.equal(calls[5].includes("--name"), false);
   });
 });
 
@@ -1273,7 +1331,7 @@ test("run --agents validates bindings against the same alternate collection as b
     assert.equal(passed.stderr, "");
     assert.equal(
       passed.stdout.trim(),
-      `docker run --rm --name bundle-data-service -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${betaEnv} bundle:local`,
+      `docker run --rm -p 8787:8787 -p 8765:8765 -v bundle-data:/data --env-file ${betaEnv} bundle:local`,
     );
     await seedModel(bundle, "alpha");
     await rm(join(bundle, "models", "beta.yml"));
@@ -1353,6 +1411,11 @@ test("run maps SIGTERM to Docker SIGINT, keeps SIGINT unchanged, and waits for c
     await writeFile(
       dockerPath,
       `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "inspect") {
+  console.error("Error: No such object: " + args.at(-1));
+  process.exit(1);
+}
 const { writeFileSync } = require("node:fs");
 const startedPath = ${JSON.stringify(startedPath)};
 const signalPath = ${JSON.stringify(signalPath)};
@@ -1708,6 +1771,43 @@ test("tui resolves current bundle, directory, agent id, and endpoint selectors",
   });
 });
 
+
+test("readline chat sends a real turn and renders the agent response", async () => {
+  const capture = captureIO();
+  capture.io.stdin = Readable.from((async function* () {
+    yield "hello agent\n";
+    await delay(300);
+    yield "/quit\n";
+  })());
+  Object.defineProperty(capture.io.stdin, "isTTY", { value: true });
+  Object.defineProperty(capture.io.stderr, "isTTY", { value: true });
+  const requests = [];
+
+  const result = await runReadlineChat(
+    {
+      endpoint: "http://localhost:8765/v1/agents/alpha/",
+      token: "secret-token",
+    },
+    handlerContext(process.cwd(), capture.io),
+    async (url, init) => {
+      requests.push({ url, init });
+      await delay(220);
+      return new Response(JSON.stringify({ text: "READY from alpha" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  );
+
+  assert.equal(result, 0);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].url, /^http:\/\/localhost:8765\/v1\/agents\/alpha\/conversations\/[0-9a-f-]+\/messages$/);
+  assert.equal(requests[0].init.headers.authorization, "Bearer secret-token");
+  assert.deepEqual(JSON.parse(requests[0].init.body), { message: "hello agent" });
+  assert.match(capture.stdout(), /Chatting with http:\/\/localhost:8765\/v1\/agents\/alpha/);
+  assert.match(capture.stdout(), /agent> READY from alpha/);
+  assert.match(capture.stderr(), /Waiting for agent\.\.\. \|.*Waiting for agent\.\.\. \//s);
+});
 test("set-model imports an exact OMP model and credential without exposing the token", async () => {
   await withTempDirectory(async (parent) => {
     const stateDir = join(parent, "omp-state");
