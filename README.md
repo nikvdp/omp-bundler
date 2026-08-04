@@ -727,9 +727,10 @@ against the effective agent collection before starting the container, streams
 logs, forwards termination signals, and prints copyable per-agent HTTP and
 `omp-bundler tui` commands.
 
-`run` owns the foreground process. It gives the container the deterministic
-name `<dataVolume>-service`, so the service lifecycle commands can address the
-same deployment without a PID file.
+`run` owns an unnamed, temporary foreground container. The detached
+`service` lifecycle owns the deterministic `<dataVolume>-service` container.
+If that service is already running, `run` asks whether to follow its logs,
+stop it and start a foreground container, or cancel.
 
 Run a bundle from another directory:
 
@@ -979,13 +980,12 @@ omp-bundler tui --endpoint http://localhost:8765/v1/agents/my-agent
 
 Bundle selection uses `adapterPort` from `omp-bundler.yml` and reads
 `OMP_HTTP_API_TOKEN` from the bundle's ignored `runtime.env`. Endpoint mode
-reads the token from the process environment instead. The TUI implementation
-is packaged inside `omp-bundler`; there is no second command to build or
-install.
+reads the token from the process environment instead. The readline client is
+implemented directly in TypeScript inside `omp-bundler`; there is no embedded
+binary or second command to build or install.
 
 Each launch starts a fresh server-side conversation; there is no resume or
 local history. Requests are synchronous with a spinner until the agent turn
 completes, and streaming is not currently supported.
 
-Keys: Enter sends a message, Ctrl+J inserts a newline, PgUp/PgDn scroll the
-transcript, and Ctrl+C quits.
+Enter sends one line. `/quit`, `/exit`, or Ctrl+C exits.
