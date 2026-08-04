@@ -126,6 +126,18 @@ function captureIO() {
     stderr: () => stderr.join(""),
   };
 }
+function sseResponse(source, byteChunks = []) {
+  const bytes = new TextEncoder().encode(source);
+  const boundaries = [...new Set([0, ...byteChunks, bytes.length])].sort((left, right) => left - right);
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (let index = 1; index < boundaries.length; index += 1) {
+        controller.enqueue(bytes.slice(boundaries[index - 1], boundaries[index]));
+      }
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream; charset=utf-8" } });
+}
 
 async function runChild(command, args, cwd) {
   return new Promise((resolveRun, rejectRun) => {
@@ -1226,4 +1238,111 @@ test("readline chat sends a real turn and renders the root agent response", asyn
   assert.match(capture.stdout(), /agent> hello from alpha/);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].options.headers.authorization, "Bearer secret-token");
+});
+
+test("readline chat incrementally parses arbitrarily fragmented UTF-8 SSE frames", async () => {
+  const capture = captureIO();
+  capture.io.stdin = Readable.from(["hello agent\n", "/quit\n"]);
+  const source = [
+    "event: accepted\r\n",
+    "data: {\"conversationId\":\"conversation-1\"}\r\n\r\n",
+    "event: progress\n",
+    "data: {\"status\":\"working\"}\n\n",
+    "event: delta\r\n",
+    "data: {\"text\":\"caf\u00e9 \"}\r\n\r\n",
+    "event: delta\n",
+    "data: {\"text\":\"done\"}\n\n",
+    "event: completed\r\n",
+    "data: {\"text\":\"caf\u00e9 done\"}\r\n\r\n",
+  ].join("");
+  const bytes = new TextEncoder().encode(source);
+  const requests = [];
+  await runReadlineChat(
+    { endpoint: "http://localhost:8765/v1/agents/alpha", token: "secret-token" },
+    handlerContext(process.cwd(), capture.io),
+    async (url, options) => {
+      requests.push({ url, options });
+      return sseResponse(source, [...bytes.keys()].slice(1));
+    },
+  );
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.headers.accept, "text/event-stream");
+  assert.equal(requests[0].options.headers.authorization, "Bearer secret-token");
+  assert.equal(requests[0].options.headers["content-type"], "application/json");
+  assert.deepEqual(JSON.parse(requests[0].options.body), { message: "hello agent" });
+  assert.match(capture.stdout(), /agent> café done\n\n/);
+  assert.equal((capture.stdout().match(/agent> /g) ?? []).length, 1);
+  assert.doesNotMatch(capture.stdout(), /working|conversation-1|corrected/);
+});
+
+test("readline chat reconciles completed SSE output without a second prompt", async () => {
+  const capture = captureIO();
+  capture.io.stdin = Readable.from(["hello\n", "/quit\n"]);
+  await runReadlineChat(
+    { endpoint: "http://localhost:8765/v1/agents/alpha" },
+    handlerContext(process.cwd(), capture.io),
+    async () => sseResponse(
+      "event: delta\ndata: {\"text\":\"hel\"}\n\nevent: completed\ndata: {\"text\":\"hello\"}\n\n",
+    ),
+  );
+  assert.match(capture.stdout(), /agent> hello\n\n/);
+  assert.equal((capture.stdout().match(/agent> /g) ?? []).length, 1);
+  assert.doesNotMatch(capture.stdout(), /corrected/);
+});
+
+test("readline chat visibly corrects mismatched completed SSE output", async () => {
+  const capture = captureIO();
+  capture.io.stdin = Readable.from(["hello\n", "/quit\n"]);
+  await runReadlineChat(
+    { endpoint: "http://localhost:8765/v1/agents/alpha" },
+    handlerContext(process.cwd(), capture.io),
+    async () => sseResponse(
+      "event: delta\ndata: {\"text\":\"partial\"}\n\nevent: completed\ndata: {\"text\":\"replacement\"}\n\n",
+    ),
+  );
+  assert.match(capture.stdout(), /agent> partial\n\[agent response corrected\]\nreplacement\n\n/);
+  assert.equal((capture.stdout().match(/agent> /g) ?? []).length, 1);
+});
+
+test("readline chat reports terminal, malformed, and truncated SSE failures", async () => {
+  const cases = [
+    ["event: error\ndata: {\"message\":\"turn failed\"}\n\n", /Error: turn failed/],
+    ["event: delta\ndata: not-json\n\n", /Error: agent event stream protocol error: SSE "delta" frame contains invalid JSON data/],
+    ["event: delta\ndata: {\"text\":\"unfinished\"}", /Error: agent event stream protocol error: stream ended in the middle of an SSE line/],
+    ["event: delta\ndata: {\"text\":\"unfinished\"}\n", /Error: agent event stream protocol error: stream ended before an SSE frame terminator/],
+    ["event: accepted\ndata: {}\n\n", /Error: agent event stream protocol error: stream ended before a completed or error event/],
+  ];
+  for (const [source, expected] of cases) {
+    const capture = captureIO();
+    capture.io.stdin = Readable.from(["hello\n", "/quit\n"]);
+    await runReadlineChat(
+      { endpoint: "http://localhost:8765/v1/agents/alpha" },
+      handlerContext(process.cwd(), capture.io),
+      async () => sseResponse(source),
+    );
+    assert.match(capture.stderr(), expected);
+  }
+});
+
+test("readline chat detaches a Ctrl-C aborted SSE request without an error", async () => {
+  const capture = captureIO();
+  capture.io.stdin = new Readable({ read() {} });
+  capture.io.stdin.push("hello\n");
+  let cancelled = false;
+  await runReadlineChat(
+    { endpoint: "http://localhost:8765/v1/agents/alpha" },
+    handlerContext(process.cwd(), capture.io),
+    async () => {
+      setTimeout(() => {
+        capture.io.stdin.emit("keypress", "\u0003", { name: "c", ctrl: true, meta: false, shift: false });
+      }, 0);
+      return new Response(new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  );
+  assert.equal(cancelled, true);
+  assert.doesNotMatch(capture.stderr(), /Error:/);
 });
