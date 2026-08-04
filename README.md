@@ -674,7 +674,7 @@ the runtime environment instead.
 `new` creates a compact HTTP-first `runtime.env.example`:
 
 ```env
-# Bundled adapter. HTTP serves the agent API and omp-tui.
+# Bundled adapter. HTTP serves the agent API and built-in terminal chat.
 OMP_BUNDLER_ADAPTER=http
 
 # Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.
@@ -725,7 +725,7 @@ The command uses the image tag, ports, and data volume from
 `omp-bundler.yml`. It validates runtime model values and adapter bindings
 against the effective agent collection before starting the container, streams
 logs, forwards termination signals, and prints copyable per-agent HTTP and
-`omp-tui` URLs.
+`omp-bundler tui` commands.
 
 `run` owns the foreground process. It gives the container the deterministic
 name `<dataVolume>-service`, so the service lifecycle commands can address the
@@ -947,35 +947,45 @@ omp-bundler service start [bundle-path] [--env-file <path>] [--image <tag>] [--a
 omp-bundler service stop [bundle-path]
 omp-bundler service status [bundle-path]
 omp-bundler service restart [bundle-path]
+omp-bundler tui [--dir <bundle-path>] [--id <agent-id>] [--endpoint <agent-url>]
 ```
 
 Every command supports `--help`. Generators support `--dry-run` and refuse to
 overwrite existing files. Destructive commands require confirmation unless
 `--yes` is supplied.
 
-## Terminal chat client (`omp-tui`)
+## Terminal chat
 
-A small terminal chat client is available under `tools/omp-tui`. It talks to
-one already-running omp-bundler HTTP agent using only that agent's URL.
-
-```bash
-cd tools/omp-tui
-go build -o omp-tui .
-./omp-tui http://localhost:8765/v1/agents/my-agent
-```
-
-The URL identifies exactly one agent. Each program launch starts a fresh
-server-side conversation; there is no resume or local history. Requests are
-synchronous with a spinner until the agent turn completes, and streaming is
-not currently supported.
-
-Optional Bearer authentication can be supplied through the environment without
-putting the token in the command arguments:
+Terminal chat is part of the main CLI:
 
 ```bash
-OMP_HTTP_API_TOKEN=... ./omp-tui http://localhost:8765/v1/agents/my-agent
+omp-bundler tui
 ```
+
+With no flags, the command finds the bundle from the current directory and
+uses its only agent. Point it at another bundle or select one agent explicitly:
+
+```bash
+omp-bundler tui --dir ../another-bundle
+omp-bundler tui --id researcher
+omp-bundler tui --dir ../another-bundle --id researcher
+```
+
+Bypass bundle discovery with an exact running agent URL:
+
+```bash
+omp-bundler tui --endpoint http://localhost:8765/v1/agents/my-agent
+```
+
+Bundle selection uses `adapterPort` from `omp-bundler.yml` and reads
+`OMP_HTTP_API_TOKEN` from the bundle's ignored `runtime.env`. Endpoint mode
+reads the token from the process environment instead. The TUI implementation
+is packaged inside `omp-bundler`; there is no second command to build or
+install.
+
+Each launch starts a fresh server-side conversation; there is no resume or
+local history. Requests are synchronous with a spinner until the agent turn
+completes, and streaming is not currently supported.
 
 Keys: Enter sends a message, Ctrl+J inserts a newline, PgUp/PgDn scroll the
-transcript, and Ctrl+C quits. See `tools/omp-tui/DESIGN.md` for the full
-design contract.
+transcript, and Ctrl+C quits.

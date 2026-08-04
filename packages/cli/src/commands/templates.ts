@@ -28,7 +28,7 @@ export const RUNTIME_ENV_EXAMPLE = runtimeEnvExample();
 /** Compact, commented fresh runtime.env.example for the default HTTP path. */
 export function runtimeEnvExample(): string {
   const lines = [
-    "# Bundled adapter. HTTP serves the agent API and omp-tui.",
+    "# Bundled adapter. HTTP serves the agent API and built-in terminal chat.",
     "OMP_BUNDLER_ADAPTER=http",
     "",
     "# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.",
@@ -125,7 +125,7 @@ export function componentFile(
 }
 
 function bundleReadme(bundleName: string): string {
-  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its components.\n2. Configure each agent with omp-bundler set-model <agent-id>. The default mode opens an editor; add --wizard for guided prompts.\n3. Copy runtime.env.example to the ignored runtime.env file and fill its generated placeholders.\n4. Run omp-bundler check and omp-bundler build, then use omp-bundler run for the foreground process or omp-bundler service start for a detached container. Check, run, and service start select runtime.env automatically.\n5. Send a message to the default HTTP adapter:\n\n   curl -X POST http://localhost:8765/v1/agents/<agent-id>/conversations/local/messages \\\\\n     -H 'content-type: application/json' \\\\\n     -d '{\"message\":\"Hello\"}'\n\nThe request waits for the completed turn and returns its text, attachments, and usage as JSON. Set OMP_HTTP_API_TOKEN in runtime.env to require a Bearer token. For Pumble, run omp-bundler generate adapter pumble --agent <agent-id> before copying the example.\n\nUse omp-bundler service status, service restart, and service stop to manage the detached bundle container. The committed runtime.env.example contains placeholders only. Keep deployment values in runtime.env.\n`;
+  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its components.\n2. Configure each agent with omp-bundler set-model <agent-id>. The default mode opens an editor; add --wizard for guided prompts.\n3. Copy runtime.env.example to the ignored runtime.env file and fill its generated placeholders.\n4. Run omp-bundler check and omp-bundler build, then use omp-bundler run for the foreground process or omp-bundler service start for a detached container. Check, run, and service start select runtime.env automatically.\n5. Chat with the only agent by running omp-bundler tui, or send a message to the HTTP adapter:\n\n   curl -X POST http://localhost:8765/v1/agents/<agent-id>/conversations/local/messages \\\\\n     -H 'content-type: application/json' \\\\\n     -d '{\"message\":\"Hello\"}'\n\nThe request waits for the completed turn and returns its text, attachments, and usage as JSON. Set OMP_HTTP_API_TOKEN in runtime.env to require a Bearer token. For Pumble, run omp-bundler generate adapter pumble --agent <agent-id> before copying the example.\n\nUse omp-bundler service status, service restart, and service stop to manage the detached bundle container. The committed runtime.env.example contains placeholders only. Keep deployment values in runtime.env.\n`;
 }
 
 function bundleConfig(bundleName: string): string {
