@@ -1042,9 +1042,9 @@ export class CoreSupervisor {
     const registration = this.adapters.get(ctx.adapterId);
     const plan = resolveChildSpawnPlan(this.config, registration);
     const args: string[] = ["--mode", "rpc"];
-    // Load the production ambient extension explicitly. The staged agent
-    // folder at $HOME/.omp/agent preserves tools/skills/agents through
-    // default discovery (no --no-extensions flag).
+    // Load the production ambient extension explicitly. OMP_AGENT_DIR
+    // points OMP at the ephemeral copy of the bundled definition, preserving
+    // config, tools, skills, commands, extensions, and subagents.
     args.push("-e", extensionPath);
     if (plan.model) {
       args.push("--model", plan.model);
@@ -1145,8 +1145,8 @@ export interface ChildSpawnPlan {
  *
  * When `registration.agentId` is present, the cwd is the persistent
  * `workspace` beneath `config.agentRootDir`. The model and args come straight
- * from the global `config` baseline. Per-agent overrides live in the sibling
- * `.omp/config.yml`, which OMP finds by walking up from that cwd. Missing or
+ * from the global `config` baseline. The entrypoint points OMP discovery at an
+ * ephemeral runtime copy of the sibling `.omp` definition. Missing or
  * mismatched singular agent configuration fails loudly rather than falling
  * back to the legacy shared workspace.
  */

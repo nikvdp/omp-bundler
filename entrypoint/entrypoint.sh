@@ -12,17 +12,19 @@
 # The core server loads the ambient ingest extension at runtime; it
 # must be present in the staged packages/core/src tree.
 #
-# The agent folder is installed at $HOME/.omp/agent (OMP's default
-# agent directory), NOT via OMP_AGENT_DIR, so every discovery
-# surface (config, extensions, tools, agents, skills) shares one
-# root without an explicit extension path.
+# The image-owned agent definition is refreshed beside its persistent
+# workspace, then copied into an ephemeral OMP agent directory. OMP uses that
+# explicit directory for config and component discovery while sessions remain
+# linked to /data.
 set -euo pipefail
 
 # -- paths -------------------------------------------------------------
 AGENT_DIR="${HOME}/.omp/agent"
+RUNTIME_AGENT_DIR="${HOME}/.omp/runtime-agent"
 BUILD_DIR="${OMP_BUILD_DIR:-/app/build}"
 MODELS_TMPL="${AGENT_DIR}/models.yml.tmpl"
-MODELS_OUT="${AGENT_DIR}/models.yml"
+MODELS_OUT="${RUNTIME_AGENT_DIR}/models.yml"
+export OMP_AGENT_DIR="$RUNTIME_AGENT_DIR"
 
 # Explicit /data mount paths shared by core and the selected adapter.
 DATA_DIR="${OMP_DATA_DIR:-/data}"
@@ -98,11 +100,6 @@ for _required in AGENTS.md config.yml; do
 	fi
 done
 
-# OMP walks upward from /data/agent/workspace. Refuse a higher-level .omp
-# tree that could merge into or override the staged definition.
-if [ -L "${DATA_DIR}/.omp" ] || [ -d "${DATA_DIR}/.omp" ]; then
-	die "${DATA_DIR}/.omp must not exist: project-level config discovery walks up from the agent workspace"
-fi
 
 # The durable root, refreshed definition, and persistent workspace are
 # operator state. Never follow symlinks while preparing them.
@@ -151,7 +148,6 @@ link_into_data() {
 	fi
 	ln -s "$expected" "$target"
 }
-link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 
 # -- 1. refresh the durable agent definition ---------------------------
 # Stage the image-owned tree beside the destination, then swap it into place.
@@ -187,6 +183,20 @@ if [ "$_had_previous_omp" -eq 1 ]; then
 	rm -rf "$_omp_backup"
 fi
 log "refreshed agent ${OMP_AGENT_ID}"
+
+# OMP only discovers project .omp files in the exact cwd. Materialize the
+# refreshed definition as its explicit agent directory so the child can keep
+# cwd in the empty persistent workspace without losing config or components.
+if [ -L "$RUNTIME_AGENT_DIR" ]; then
+	die "${RUNTIME_AGENT_DIR} must not be a symlink"
+fi
+rm -rf "$RUNTIME_AGENT_DIR"
+if ! cp -R "$DURABLE_OMP_DIR" "$RUNTIME_AGENT_DIR"; then
+	rm -rf "$RUNTIME_AGENT_DIR"
+	die "failed to materialize OMP runtime agent directory"
+fi
+link_into_data "${RUNTIME_AGENT_DIR}/sessions" "$SESSIONS_DIR"
+log "materialized OMP runtime agent directory"
 
 # -- 2. render models --------------------------------------------------
 # bun build/render-models.ts expands runtime placeholders, omits providers
