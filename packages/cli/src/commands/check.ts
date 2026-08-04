@@ -613,17 +613,18 @@ async function validateSkillsDirectory(directory: string, errors: ValidationIssu
     }
     if (seen.has(name)) errors.push(issue(path, "skill name", `duplicates active skill '${name}'`));
     seen.add(name);
-    const skillNames = await readdir(path).catch(() => [] as string[]);
-    for (const fileName of skillNames) {
+    let foundManifest = false;
+    for (const fileName of ["SKILL.md", "SKILL.md.example"]) {
       const filePath = join(path, fileName);
       const fileInfo = await lstat(filePath).catch(() => null);
       if (!fileInfo) continue;
+      foundManifest = true;
       if (fileInfo.isSymbolicLink()) {
-        errors.push(issue(filePath, undefined, "skill files must not be symlinks"));
+        errors.push(issue(filePath, undefined, "skill manifests must not be symlinks"));
         continue;
       }
-      if (!fileInfo.isFile() || (fileName !== "SKILL.md" && fileName !== "SKILL.md.example")) {
-        errors.push(issue(filePath, undefined, "a skill directory may contain only SKILL.md or SKILL.md.example"));
+      if (!fileInfo.isFile()) {
+        errors.push(issue(filePath, undefined, "skill manifests must be regular files"));
         continue;
       }
       const source = await readFile(filePath, "utf8").catch(() => null);
@@ -634,7 +635,7 @@ async function validateSkillsDirectory(directory: string, errors: ValidationIssu
       validateFrontmatter(filePath, source, "skill", name, errors);
       scanCredentialAssignments(source, filePath, errors);
     }
-    if (!skillNames.includes("SKILL.md") && !skillNames.includes("SKILL.md.example")) {
+    if (!foundManifest) {
       errors.push(issue(join(path, "SKILL.md"), undefined, "is required for every skill"));
     }
   }
