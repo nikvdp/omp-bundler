@@ -86,11 +86,17 @@ export async function runReadlineChat(
       } catch {
         break;
       }
+      if (interrupted) break;
       if (!message) continue;
       if (/^\/(?:quit|exit)$/i.test(message)) break;
 
       activeRequest = new AbortController();
       const stopSpinner = startSpinner(context.io.stderr);
+      const renderState: StreamRenderState = {
+        renderedText: "",
+        prefixWritten: false,
+        stopSpinner: once(stopSpinner),
+      };
       try {
         const response = await request(
           `${endpoint}/conversations/${encodeURIComponent(conversationKey)}/messages`,
@@ -98,22 +104,36 @@ export async function runReadlineChat(
             method: "POST",
             headers: {
               "content-type": "application/json",
+              accept: "text/event-stream",
               ...(target.token ? { authorization: `Bearer ${target.token}` } : {}),
             },
             body: JSON.stringify({ message }),
             signal: activeRequest.signal,
           },
         );
-        const body = await response.text();
-        if (!response.ok) throw new Error(serverError(response.status, body));
-        const parsed: unknown = JSON.parse(body);
-        const text = responseText(parsed);
-        if (text === undefined) throw new Error("agent response did not contain text");
-        stopSpinner();
-        context.io.stdout.write(`agent> ${text}\n\n`);
+        if (!response.ok) {
+          throw new Error(serverError(response.status, await response.text()));
+        }
+
+        if (isEventStream(response)) {
+          if (response.body === null) {
+            throw new StreamProtocolError("stream response did not contain a body");
+          }
+          await consumeEventStream(
+            response.body,
+            activeRequest.signal,
+            (event) => renderStreamEvent(event, renderState, context.io.stdout),
+          );
+        } else {
+          const parsed: unknown = JSON.parse(await response.text());
+          const text = responseText(parsed);
+          if (text === undefined) throw new Error("agent response did not contain text");
+          renderState.stopSpinner();
+          context.io.stdout.write(`agent> ${text}\n\n`);
+        }
       } catch (error) {
-        stopSpinner();
-        if (interrupted) break;
+        renderState.stopSpinner();
+        if (interrupted || activeRequest.signal.aborted) break;
         context.io.stderr.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
       } finally {
         activeRequest = undefined;
@@ -123,6 +143,262 @@ export async function runReadlineChat(
     readline.close();
   }
   return 0;
+}
+
+interface StreamRenderState {
+  renderedText: string;
+  prefixWritten: boolean;
+  stopSpinner: () => void;
+}
+
+interface SseEvent {
+  readonly type: string;
+  readonly data: unknown;
+}
+
+class StreamProtocolError extends Error {
+  constructor(detail: string) {
+    super(`agent event stream protocol error: ${detail}`);
+    this.name = "StreamProtocolError";
+  }
+}
+
+class IncrementalSseParser {
+  private bufferedText = "";
+  private eventName = "";
+  private dataLines: string[] = [];
+  private terminalSeen = false;
+
+  constructor(private readonly onEvent: (event: SseEvent) => void) {}
+
+  feed(text: string): void {
+    this.bufferedText += text;
+    let newlineIndex = this.bufferedText.indexOf("\n");
+    while (newlineIndex !== -1) {
+      let line = this.bufferedText.slice(0, newlineIndex);
+      this.bufferedText = this.bufferedText.slice(newlineIndex + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      this.consumeLine(line);
+      newlineIndex = this.bufferedText.indexOf("\n");
+    }
+  }
+
+  finish(): void {
+    if (this.bufferedText.length > 0) {
+      throw new StreamProtocolError("stream ended in the middle of an SSE line");
+    }
+    if (this.eventName.length > 0 || this.dataLines.length > 0) {
+      throw new StreamProtocolError("stream ended before an SSE frame terminator");
+    }
+    if (!this.terminalSeen) {
+      throw new StreamProtocolError("stream ended before a completed or error event");
+    }
+  }
+
+  private consumeLine(line: string): void {
+    if (line.length === 0) {
+      this.dispatchFrame();
+      return;
+    }
+    if (line.startsWith(":")) return;
+
+    const separator = line.indexOf(":");
+    const field = separator === -1 ? line : line.slice(0, separator);
+    let value = separator === -1 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    switch (field) {
+      case "event":
+        this.eventName = value;
+        break;
+      case "data":
+        this.dataLines.push(value);
+        break;
+      case "id":
+      case "retry":
+        break;
+      default:
+        throw new StreamProtocolError(`unsupported SSE field "${field}"`);
+    }
+  }
+
+  private dispatchFrame(): void {
+    if (this.eventName.length === 0 && this.dataLines.length === 0) return;
+    if (this.terminalSeen) {
+      throw new StreamProtocolError("received an event after the terminal event");
+    }
+    if (this.eventName.length === 0) {
+      throw new StreamProtocolError("SSE frame is missing an event type");
+    }
+    if (this.dataLines.length === 0) {
+      throw new StreamProtocolError(`SSE "${this.eventName}" frame is missing data`);
+    }
+
+    const type = this.eventName;
+    const payload = this.dataLines.join("\n");
+    let data: unknown;
+    try {
+      data = JSON.parse(payload);
+    } catch {
+      throw new StreamProtocolError(`SSE "${type}" frame contains invalid JSON data`);
+    }
+    this.eventName = "";
+    this.dataLines = [];
+    if (type === "completed" || type === "error") this.terminalSeen = true;
+    this.onEvent({ type, data });
+  }
+}
+
+async function consumeEventStream(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  onEvent: (event: SseEvent) => void,
+): Promise<void> {
+  const reader = body.getReader();
+  let aborted = signal.aborted;
+  const abort = (): void => {
+    aborted = true;
+    void reader.cancel().catch(() => {});
+  };
+  signal.addEventListener("abort", abort, { once: true });
+  if (aborted) abort();
+
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const parser = new IncrementalSseParser(onEvent);
+  try {
+    while (!aborted) {
+      let result;
+      try {
+        result = await reader.read();
+      } catch (error) {
+        if (aborted || signal.aborted) return;
+        throw new StreamProtocolError(
+          `stream read failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (aborted || signal.aborted) return;
+      if (result.done) break;
+      if (!(result.value instanceof Uint8Array)) {
+        throw new StreamProtocolError("stream yielded a non-byte chunk");
+      }
+      try {
+        parser.feed(decoder.decode(result.value, { stream: true }));
+      } catch (error) {
+        if (error instanceof StreamProtocolError) throw error;
+        throw new StreamProtocolError("stream contained invalid UTF-8");
+      }
+    }
+    if (aborted || signal.aborted) return;
+    try {
+      parser.feed(decoder.decode());
+    } catch (error) {
+      if (error instanceof StreamProtocolError) throw error;
+      throw new StreamProtocolError("stream contained invalid UTF-8");
+    }
+    parser.finish();
+  } catch (error) {
+    if (aborted || signal.aborted) return;
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", abort);
+    reader.releaseLock();
+  }
+}
+
+function renderStreamEvent(
+  event: SseEvent,
+  state: StreamRenderState,
+  output: Writable,
+): void {
+  switch (event.type) {
+    case "accepted":
+    case "progress":
+      streamObject(event);
+      return;
+    case "delta": {
+      const data = streamObject(event);
+      const text = data.text;
+      if (typeof text !== "string" || text.length === 0) {
+        throw new StreamProtocolError("delta event must contain non-empty text");
+      }
+      state.stopSpinner();
+      if (!state.prefixWritten) {
+        output.write("agent> ");
+        state.prefixWritten = true;
+      }
+      output.write(text);
+      state.renderedText += text;
+      return;
+    }
+    case "completed": {
+      const data = streamObject(event);
+      if (typeof data.text !== "string") {
+        throw new StreamProtocolError("completed event must contain text");
+      }
+      state.stopSpinner();
+      if (!state.prefixWritten) {
+        output.write("agent> ");
+        state.prefixWritten = true;
+      }
+      if (data.text.startsWith(state.renderedText)) {
+        const suffix = data.text.slice(state.renderedText.length);
+        if (suffix.length > 0) output.write(suffix);
+      } else {
+        output.write("\n[agent response corrected]\n");
+        output.write(data.text);
+      }
+      output.write("\n\n");
+      state.renderedText = data.text;
+      return;
+    }
+    case "error": {
+      const data = streamObject(event);
+      const message = streamErrorMessage(data);
+      state.stopSpinner();
+      throw new Error(message);
+    }
+    default:
+      throw new StreamProtocolError(`unsupported event "${event.type}"`);
+  }
+}
+
+function streamObject(event: SseEvent): Record<string, unknown> {
+  if (
+    event.data === null ||
+    typeof event.data !== "object" ||
+    Array.isArray(event.data)
+  ) {
+    throw new StreamProtocolError(`${event.type} event data must be an object`);
+  }
+  return event.data as Record<string, unknown>;
+}
+
+function streamErrorMessage(data: Record<string, unknown>): string {
+  if (typeof data.message === "string" && data.message.length > 0) return data.message;
+  if (typeof data.error === "string" && data.error.length > 0) return data.error;
+  if (
+    data.error !== null &&
+    typeof data.error === "object" &&
+    !Array.isArray(data.error) &&
+    typeof (data.error as Record<string, unknown>).message === "string" &&
+    ((data.error as Record<string, unknown>).message as string).length > 0
+  ) {
+    return (data.error as Record<string, unknown>).message as string;
+  }
+  throw new StreamProtocolError("error event must contain a message");
+}
+
+function isEventStream(response: Response): boolean {
+  const contentType = response.headers.get("content-type");
+  return contentType?.split(";", 1)[0].trim().toLowerCase() === "text/event-stream";
+}
+
+function once(action: () => void): () => void {
+  let called = false;
+  return () => {
+    if (called) return;
+    called = true;
+    action();
+  };
 }
 
 function requiredStringOption(args: ParsedArguments, name: string): string | undefined {
