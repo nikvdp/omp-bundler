@@ -254,6 +254,7 @@ if (args[0]?.endsWith("/render-models.ts")) {
           resolveRun({ code, signal, stdout, stderr }),
         );
       });
+      if (result.code === 0) await waitForFile(capturePath);
       const capture = (await exists(capturePath))
         ? JSON.parse(await readFile(capturePath, "utf8"))
         : null;
