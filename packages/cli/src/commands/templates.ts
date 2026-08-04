@@ -65,6 +65,26 @@ export function agentScaffoldFiles(agentId: string): readonly PlannedWrite[] {
       path: "config.yml",
       content: "setupVersion: 1\n\n# Add agent-local OMP settings here.\n",
     },
+    {
+      path: "subagents/example-subagent.md.example",
+      content: exampleSubagentTemplate(),
+    },
+    {
+      path: "commands/example-command.md.example",
+      content: exampleCommandTemplate(),
+    },
+    {
+      path: "extensions/example-extension.ts.example",
+      content: exampleExtensionTemplate(),
+    },
+    {
+      path: "skills/example-skill/SKILL.md.example",
+      content: exampleSkillTemplate(),
+    },
+    {
+      path: "tools/example-tool.ts.example",
+      content: exampleToolTemplate(),
+    },
   ];
 }
 
@@ -105,7 +125,45 @@ export function componentFile(
 }
 
 function bundleReadme(bundleName: string, agentId: string): string {
-  return `# ${bundleName}\n\nThis bundle contains one filesystem-configured OMP agent (${agentId}).\n\n## Development loop\n\n1. Generate or edit components under the bundle root.\n2. Configure the agent with omp-bundler set-model. The default mode opens an editor; add --wizard for guided prompts.\n3. Copy runtime.env.example to the ignored runtime.env file and fill its generated placeholders.\n4. Run omp-bundler check and omp-bundler build, then use omp-bundler run for the foreground process or omp-bundler service start for a detached container. Check, run, and service start select runtime.env automatically.\n5. Chat with the agent by running omp-bundler tui, or send a message to the HTTP adapter at http://localhost:8765/v1/agents/${agentId}/conversations/local/messages.\n\nThe committed runtime.env.example contains placeholders only. Keep deployment values in runtime.env.\n`;
+  return `# ${bundleName}
+
+This bundle contains one filesystem-configured OMP agent (${agentId}).
+
+## Agent source
+
+Agent instructions and every supported component surface live at the bundle root:
+
+\`\`\`text
+AGENTS.md
+config.yml
+subagents/example-subagent.md.example
+commands/example-command.md.example
+extensions/example-extension.ts.example
+skills/example-skill/SKILL.md.example
+tools/example-tool.ts.example
+\`\`\`
+
+The \`.example\` suffix keeps each starter inactive. Use the matching generator
+to create an active component:
+
+\`\`\`bash
+omp-bundler generate subagent researcher
+omp-bundler generate command summarize
+omp-bundler generate extension lifecycle-log
+omp-bundler generate skill meeting-notes
+omp-bundler generate tool read-transcript
+\`\`\`
+
+## Development loop
+
+1. Edit \`AGENTS.md\` and generate or edit components under the bundle root.
+2. Configure the agent with \`omp-bundler set-model\`. The default mode opens an editor; add \`--wizard\` for guided prompts.
+3. Copy \`runtime.env.example\` to the ignored \`runtime.env\` file and fill its generated placeholders.
+4. Run \`omp-bundler check\` and \`omp-bundler build\`, then use \`omp-bundler run\` for the foreground process or \`omp-bundler service start\` for a detached container. Check, run, and service start select \`runtime.env\` automatically.
+5. Chat with the agent by running \`omp-bundler tui\`, or send a message to the HTTP adapter at http://localhost:8765/v1/agents/${agentId}/conversations/local/messages.
+
+The committed \`runtime.env.example\` contains placeholders only. Keep deployment values in \`runtime.env\`.
+`;
 }
 
 function bundleConfig(bundleName: string, agentId: string): string {
