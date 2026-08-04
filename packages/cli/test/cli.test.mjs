@@ -21,6 +21,7 @@ import {
   handlerContext,
   newCommand,
   runCommand,
+  restartCommand,
   statusCommand,
   tuiCommand,
   PACKAGE_ASSET_PATHS,
@@ -426,6 +427,26 @@ test("CLI framework owns command parsing, help, and shell completions", async ()
       options: { foreground: true, "dry-run": true },
     },
     cwd: "/work",
+  }]);
+
+  const startInvocation = [];
+  const startCapture = captureIO();
+  assert.equal(await main(
+    ["start", "/bundle", "--dry-run"],
+    {
+      cwd: "/work",
+      io: startCapture.io,
+      handlers: {
+        start(args) {
+          startInvocation.push(args);
+          return 0;
+        },
+      },
+    },
+  ), 0);
+  assert.deepEqual(startInvocation, [{
+    positionals: ["/bundle"],
+    options: { "dry-run": true },
   }]);
 
   const help = captureIO();
@@ -1026,6 +1047,40 @@ process.exit(1);
         () => invoke(statusCommand, bundle, []),
         /belongs to another bundle.*found \/other-bundle/,
       );
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+});
+
+test("restart starts the service when no container exists", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "runtime.env"), await readFile(join(bundle, "runtime.env.example"), "utf8"));
+    const capturePath = join(parent, "docker-run.json");
+    await writeFile(join(parent, "docker"), `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args[0] === "inspect") {
+  process.stderr.write("No such container");
+  process.exit(1);
+}
+if (args[0] === "run") {
+  fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(args));
+  process.exit(0);
+}
+process.exit(1);
+`, { mode: 0o755 });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      const restarted = await invoke(restartCommand, bundle, []);
+      assert.equal(restarted.result, 0, restarted.stderr);
+      assert.match(restarted.stdout, /Started service bundle-data-service/);
+      assert.equal((await readFile(capturePath, "utf8")).includes("--name"), true);
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
