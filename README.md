@@ -58,7 +58,7 @@ you save and exit with valid YAML, it atomically commits
 guided prompts instead.
 
 Create the local runtime file, fill any generated model placeholders, check,
-build, and run:
+build, and run in the foreground:
 
 ```bash
 cp runtime.env.example runtime.env
@@ -67,6 +67,9 @@ omp-bundler check
 omp-bundler build
 omp-bundler run
 ```
+
+Use `omp-bundler service start` instead of `run` when the validated bundle
+should stay running in a detached container.
 
 Send a turn through the default HTTP adapter:
 
@@ -724,6 +727,10 @@ against the effective agent collection before starting the container, streams
 logs, forwards termination signals, and prints copyable per-agent HTTP and
 `omp-tui` URLs.
 
+`run` owns the foreground process. It gives the container the deterministic
+name `<dataVolume>-service`, so the service lifecycle commands can address the
+same deployment without a PID file.
+
 Run a bundle from another directory:
 
 ```bash
@@ -760,12 +767,35 @@ The equivalent direct Docker shape is:
 
 ```bash
 docker run --rm \
+  --name my-bundle-data-service \
   -p 8787:8787 \
   -p 8765:8765 \
   -v my-bundle-data:/data \
   --env-file runtime.env \
   my-bundle:local
 ```
+
+### Service lifecycle
+
+Start the validated bundle in a detached container:
+
+```bash
+omp-bundler service start
+```
+
+`service start` accepts the same bundle path, `--env-file`, `--image`,
+`--agents`, and `--dry-run` arguments as `run`. Manage that one bundle
+container with:
+
+```bash
+omp-bundler service status
+omp-bundler service restart
+omp-bundler service stop
+```
+
+`status` prints the Docker state and exits nonzero when the named container
+does not exist. `stop` is idempotent. `restart` requires an existing running
+container; if a `--rm` container has exited, use `service start` again.
 
 ### Default HTTP API
 
@@ -913,6 +943,10 @@ omp-bundler agent rename <old-agent-id> <new-agent-id> [--dry-run]
 omp-bundler check [bundle-path] [--env-file <path>]
 omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]
 omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]
+omp-bundler service start [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]
+omp-bundler service stop [bundle-path]
+omp-bundler service status [bundle-path]
+omp-bundler service restart [bundle-path]
 ```
 
 Every command supports `--help`. Generators support `--dry-run` and refuse to
