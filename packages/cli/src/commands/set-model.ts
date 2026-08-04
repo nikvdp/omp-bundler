@@ -8,6 +8,7 @@ import { parseYaml, YamlError } from "../config.ts";
 import { applyFilePlan, createFilePlan } from "../file-plan.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import { executeChild } from "../process.ts";
+import { importOmpModel } from "../omp-model-import.ts";
 import { discoverAgents, loadProject, resolveAgentPath } from "../project.ts";
 import type { CommandContext, CommandHandler, ParsedArguments, PlannedWrite, ProjectContext, YamlValue } from "../types.ts";
 import { assertNoLegacyOmpSource } from "./common.ts";
@@ -28,7 +29,7 @@ import { runtimeEnvExample, updateAgentModelEnvBlock } from "./templates.ts";
 const CLI_FIELDS: readonly CliModelField[] = MODEL_FIELDS.filter((field): field is CliModelField => field.flag !== undefined);
 const DIRECT_FLAGS: readonly string[] = CLI_FIELDS.map((field) => field.flag);
 
-const ALL_ALLOWED_OPTIONS = ["help", "wizard", "print-template", ...DIRECT_FLAGS];
+const ALL_ALLOWED_OPTIONS = ["help", "wizard", "print-template", "from", ...DIRECT_FLAGS];
 
 export const SET_MODEL_HELP = buildHelp();
 
@@ -37,10 +38,15 @@ function buildHelp(): string {
   const lines = [
     "omp-bundler set-model [agent-id]",
     "omp-bundler set-model [agent-id] --wizard",
+    "omp-bundler set-model [agent-id] --model <provider/model> [--from omp]",
     `omp-bundler set-model [agent-id] ${usageFlags}`,
     "omp-bundler set-model [agent-id] --print-template",
     "",
-    "Fields:",
+    "Import:",
+    "  --model <provider/model>  Resolve an exact selector from the local OMP installation.",
+    "  [--from omp]              Source installation; OMP is the default.",
+    "",
+    "Fields for manual configuration:",
     ...CLI_FIELDS.map((field) => `  [--${field.flag} <value>]  ${field.description}${field.required ? " (required when creating)" : ""}`),
   ];
   return lines.join("\n");
@@ -53,13 +59,26 @@ export const setModelCommand: CommandHandler = async (args, context) => {
   }
   rejectUnknownOptions(args, ALL_ALLOWED_OPTIONS);
 
+  const fromPresent = Object.hasOwn(args.options, "from");
+  if (fromPresent && typeof args.options.from !== "string") {
+    throw new Error("--from requires a source name");
+  }
+  const modelSelector = optionString(args, "model");
+  const otherDirectFlags = DIRECT_FLAGS.filter((flag) => flag !== "model");
+  const hasOtherDirectFlags = otherDirectFlags.some((flag) => args.options[flag] !== undefined);
+  const importMode = fromPresent || (modelSelector?.includes("/") === true && !hasOtherDirectFlags);
+  const directMode = DIRECT_FLAGS.some((flag) => args.options[flag] !== undefined) && !importMode;
+  if (importMode && hasOtherDirectFlags) {
+    throw new Error("--from/OMP model import cannot be combined with manual connection flags");
+  }
   const modes = [
     args.options.wizard === true,
     args.options["print-template"] === true,
-    DIRECT_FLAGS.some((flag) => args.options[flag] !== undefined),
+    importMode,
+    directMode,
   ].filter(Boolean);
   if (modes.length > 1) {
-    throw new Error("--wizard, --print-template, and direct flags are mutually exclusive; use one mode at a time");
+    throw new Error("--wizard, --print-template, OMP import, and direct flags are mutually exclusive; use one mode at a time");
   }
 
   const project = await loadProject(undefined, context.cwd);
@@ -81,6 +100,28 @@ export const setModelCommand: CommandHandler = async (args, context) => {
     return runWizard(context, project, agentId, configPath);
   }
 
+  if (importMode) {
+    const source = optionString(args, "from") ?? "omp";
+    if (source !== "omp") throw new Error(`unsupported model source '${source}'; available sources: omp`);
+    if (!modelSelector) throw new Error("--model <provider/model> is required for OMP import");
+    const existingFile = await readOptionalTextFile(configPath, "model config");
+    const imported = await importOmpModel(modelSelector, agentId, context.cwd);
+    validateConfig(imported.config, configPath);
+    const result = await commitConfig(
+      context,
+      project,
+      agentId,
+      configPath,
+      imported.config,
+      existingFile?.content,
+      { credential: imported.credential },
+    );
+    context.io.stdout.write(`imported ${imported.selector} from OMP\n`);
+    if (imported.credential) {
+      context.io.stdout.write(`updated runtime.env credential ${imported.credential.name} (value redacted)\n`);
+    }
+    return result;
+  }
   if (DIRECT_FLAGS.some((flag) => args.options[flag] !== undefined)) {
     return runDirectFlags(args, context, project, agentId, configPath);
   }
@@ -299,6 +340,13 @@ function quoteYaml(value: string): string {
  * direct), it is canonical-rendered. Always checks legacy config.yml
  * modelRoles.default for transactional removal.
  */
+interface CommitConfigOptions {
+  readonly credential?: {
+    readonly name: string;
+    readonly value: string;
+  };
+}
+
 async function commitConfig(
   context: CommandContext,
   project: ProjectContext,
@@ -306,6 +354,7 @@ async function commitConfig(
   configPath: string,
   content: string | ModelConfig,
   existingContent: string | undefined,
+  options: CommitConfigOptions = {},
 ): Promise<number> {
   const yaml = typeof content === "string" ? content : renderModelYaml(content);
   const modelChanged = existingContent !== yaml;
@@ -343,6 +392,34 @@ async function commitConfig(
     envExampleUpdated = true;
   }
 
+  let runtimeUpdated = false;
+  if (options.credential) {
+    if (!envNames.includes(options.credential.name)) {
+      throw new Error(`imported credential name '${options.credential.name}' is not referenced by the model config`);
+    }
+    const gitignoreFile = await readOptionalTextFile(join(project.rootDir, ".gitignore"), "gitignore");
+    const ignoresRuntime = gitignoreFile?.content
+      .split(/\r?\n/)
+      .some((line) => line.trim() === "runtime.env" || line.trim() === "/runtime.env");
+    if (!ignoresRuntime) {
+      throw new Error("refusing to write a credential until .gitignore contains runtime.env");
+    }
+    const runtimePath = join(project.rootDir, "runtime.env");
+    const runtimeFile = await readOptionalTextFile(runtimePath, "runtime env");
+    const runtimeSource = runtimeFile?.content ?? updatedEnvExample;
+    const updatedRuntime = updateRuntimeEnvValue(
+      runtimeSource,
+      options.credential.name,
+      options.credential.value,
+    );
+    writes.push({
+      path: "runtime.env",
+      content: updatedRuntime,
+      overwrite: true,
+      mode: 0o600,
+    });
+    runtimeUpdated = true;
+  }
   if (writes.length === 0) {
     context.io.stdout.write(`unchanged ${relativePlanPath(project.rootDir, configPath)}\n`);
     return 0;
@@ -360,6 +437,9 @@ async function commitConfig(
   }
   if (envExampleUpdated) {
     context.io.stdout.write(`updated runtime.env.example for ${agentId}\n`);
+  }
+  if (runtimeUpdated) {
+    context.io.stdout.write("updated runtime.env with imported credential (value redacted)\n");
   }
   return 0;
 }
@@ -464,6 +544,21 @@ function leadingSpaces(value: string): number {
 function yamlKey(value: string): string | null {
   const match = value.match(/^\s*([^:#][^:]*)\s*:/);
   return match?.[1].trim() ?? null;
+}
+
+function updateRuntimeEnvValue(source: string, name: string, value: string): string {
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) throw new Error(`invalid runtime credential name '${name}'`);
+  if (!/^[\x21-\x7e]+$/.test(value)) {
+    throw new Error(`credential '${name}' cannot be represented in a Docker env file`);
+  }
+  const pattern = new RegExp(`^\\s*${name}\\s*=.*$`, "gm");
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length > 1) {
+    throw new Error(`runtime.env declares ${name} more than once`);
+  }
+  const assignment = `${name}=${value}`;
+  if (matches.length === 1) return source.replace(pattern, () => assignment);
+  return `${source.trimEnd()}\n${assignment}\n`;
 }
 
 function rejectUnknownOptions(args: ParsedArguments, allowed: readonly string[]): void {
