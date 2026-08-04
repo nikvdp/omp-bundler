@@ -36,6 +36,10 @@
  *       persistence and MAY drop or coalesce progress events under load. A
  *       dropped `turn.progress` creates a `sequence` gap; the adapter MUST
  *       tolerate gaps in `sequence` and MUST NOT treat a gap as an error.
+ *   - `turn.delta`: Best-effort append-only output. Each event carries one
+ *       exact, non-empty text chunk. The core MAY drop delta events under load;
+ *       a dropped `turn.delta` creates a `sequence` gap. Deltas are never
+ *       terminal, durable, persisted, or replayed.
  *
  * Reconstruction of completion
  * ----------------------------
@@ -85,6 +89,7 @@ export const OUTBOUND_EVENT_TYPE_HEADER = "X-OMP-Bundler-Event" as const;
 export type OutboundEventType =
   | "turn.started"
   | "turn.progress"
+  | "turn.delta"
   | "turn.reply"
   | "presence.changed"
   | "turn.error";
@@ -119,7 +124,7 @@ export interface OutboundEventBase {
   /**
    * Positive integer, monotonically increasing per `correlationId`.
    * The adapter orders by this within a correlation; gaps may occur from
-   * dropped best-effort `turn.progress` events.
+   * dropped best-effort `turn.progress` or `turn.delta` events.
    */
   sequence: number;
   /** UTC ISO 8601 timestamp ending in `Z`, marking event generation. Advisory. */
@@ -144,6 +149,18 @@ export interface TurnProgressEvent extends OutboundEventBase {
   type: "turn.progress";
   /** Human-readable progress text, suitable for direct display. */
   message: string;
+}
+
+/**
+ * Best-effort append-only output carrying one exact, non-empty text chunk.
+ * The adapter MUST append the chunk as received when it consumes deltas;
+ * dropped deltas create `sequence` gaps that the adapter MUST tolerate.
+ * Never terminal, durable, persisted, or replayed.
+ */
+export interface TurnDeltaEvent extends OutboundEventBase {
+  type: "turn.delta";
+  /** Exact append-only text chunk; never empty. */
+  text: string;
 }
 
 /**
@@ -222,6 +239,7 @@ export interface TurnErrorEvent extends OutboundEventBase {
 export type OutboundEvent =
   | TurnStartedEvent
   | TurnProgressEvent
+  | TurnDeltaEvent
   | TurnReplyEvent
   | PresenceChangedEvent
   | TurnErrorEvent;

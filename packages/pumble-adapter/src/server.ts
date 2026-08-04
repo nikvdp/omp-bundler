@@ -675,6 +675,7 @@ function validateOutboundEvent(
   const validTypes: Record<string, true> = {
     "turn.started": true,
     "turn.progress": true,
+    "turn.delta": true,
     "turn.reply": true,
     "presence.changed": true,
     "turn.error": true,
@@ -706,6 +707,12 @@ function validateOutboundEvent(
     (typeof payload.message !== "string" || !payload.message)
   ) {
     return "turn.progress requires a non-empty message";
+  }
+  if (
+    type === "turn.delta" &&
+    (typeof payload.text !== "string" || payload.text.length === 0)
+  ) {
+    return "turn.delta requires a non-empty text";
   }
   if (type === "turn.reply") {
     if (typeof payload.text !== "string") {

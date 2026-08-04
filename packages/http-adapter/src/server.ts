@@ -598,6 +598,9 @@ function parseOutboundEvent(rawBody: Buffer): OutboundEvent | null {
     case "turn.progress":
       if (typeof event.message !== "string") return null;
       break;
+    case "turn.delta":
+      if (typeof event.text !== "string" || event.text.length === 0) return null;
+      break;
     case "turn.reply":
       if (
         typeof event.text !== "string" ||

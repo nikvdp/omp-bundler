@@ -133,6 +133,36 @@
       }
     },
     {
+      "title": "turn.delta",
+      "description": "Best-effort append-only output carrying one exact, non-empty text chunk. The core may drop deltas, so sequence gaps are legal. Never terminal, durable, persisted, or replayed.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "type",
+        "eventId",
+        "conversationKey",
+        "correlationId",
+        "sequence",
+        "occurredAt",
+        "text"
+      ],
+      "properties": {
+        "version": { "$ref": "#/$defs/adapterApiVersion" },
+        "type": { "const": "turn.delta" },
+        "eventId": { "$ref": "#/$defs/opaqueId" },
+        "conversationKey": { "$ref": "#/$defs/opaqueId" },
+        "correlationId": { "$ref": "#/$defs/opaqueId" },
+        "sequence": { "$ref": "#/$defs/sequence" },
+        "occurredAt": { "$ref": "#/$defs/occurredAt" },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact append-only text chunk; never empty."
+        }
+      }
+    },
+    {
       "title": "turn.reply",
       "description": "Terminal event carrying the completed turn reply. Delivered at-least-once. Attachments are workspace-relative POSIX paths; bytes are never inlined. Its arrival closes the turn regardless of dropped progress. Both text and attachments are always present; the pair (empty text, empty attachments) is invalid.",
       "type": "object",

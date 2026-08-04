@@ -29,6 +29,9 @@ import type { PumbleApi } from "./pumble-api.js";
  *                      interim message in place. There is no timer: the
  *                      renderer reacts to events at emitter thresholds.
  *                      Progress is best-effort and never terminal.
+ *   - turn.delta     : intentionally no-op. The adapter validates, deduplicates,
+ *                      and acknowledges the event without posting, editing, or
+ *                      finalizing any Pumble message.
  *   - turn.reply     : posts the final message, threaded when needed. Confirmed
  *                      text and attachment effects are checkpointed before the
  *                      whole event is completed. Output attachments are
@@ -245,6 +248,9 @@ export class PumbleRenderer {
         return;
       case "turn.progress":
         await this.onProgress(event, state, checkpoints);
+        return;
+      case "turn.delta":
+        // Deltas are acknowledged without any Pumble platform action.
         return;
       case "turn.reply":
         await this.onReply(event, state, checkpoints);
