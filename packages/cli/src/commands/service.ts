@@ -2,7 +2,7 @@ import { executeChild } from "../process.ts";
 import { loadProject } from "../project.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 import { assertAllowedOptions } from "./common.ts";
-import { resolveRunSettings, runBundle } from "./run.ts";
+import { inspectBundleServiceContainer, resolveRunSettings, runBundle } from "./run.ts";
 
 export const SERVICE_HELP = [
   "omp-bundler service start [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]",
@@ -44,23 +44,10 @@ async function serviceLifecycleAction(
     throw new Error(`usage: omp-bundler service ${action} [bundle-path]`);
   }
   const project = await loadProject(args.positionals[1], context.cwd);
-  const { containerName } = resolveRunSettings({ project });
-  const dockerArgs = action === "status"
-    ? ["inspect", "--type", "container", "--format", "{{.State.Status}}", containerName]
-    : [action, containerName];
-  const result = await executeChild("docker", dockerArgs, {
-    stdio: "pipe",
-    forwardSignals: false,
-  });
-
-  if (result.exitCode === 0) {
-    const state = action === "status"
-      ? result.stdout.trim() || "unknown"
-      : action === "stop" ? "stopped" : "restarted";
-    context.io.stdout.write(`Service ${containerName}: ${state}\n`);
-    return 0;
-  }
-  if (isMissingContainer(result.stderr)) {
+  const settings = resolveRunSettings({ project });
+  const { containerName } = settings;
+  const state = await inspectBundleServiceContainer(settings);
+  if (state === undefined) {
     if (action === "stop") {
       context.io.stdout.write(`Service ${containerName}: stopped\n`);
       return 0;
@@ -72,7 +59,19 @@ async function serviceLifecycleAction(
     context.io.stderr.write(`Service ${containerName} does not exist; run 'omp-bundler service start'.\n`);
     return 1;
   }
+  if (action === "status") {
+    context.io.stdout.write(`Service ${containerName}: ${state}\n`);
+    return 0;
+  }
 
+  const result = await executeChild("docker", [action, containerName], {
+    stdio: "pipe",
+    forwardSignals: false,
+  });
+  if (result.exitCode === 0) {
+    context.io.stdout.write(`Service ${containerName}: ${action === "stop" ? "stopped" : "restarted"}\n`);
+    return 0;
+  }
   context.io.stderr.write(result.stderr || `docker ${action} failed with exit code ${result.exitCode}\n`);
   return result.exitCode;
 }
@@ -80,8 +79,4 @@ async function serviceLifecycleAction(
 function serviceActionHelp(action: string): string {
   const line = SERVICE_HELP.split("\n").find((candidate) => candidate.startsWith(`omp-bundler service ${action} `));
   return line ?? SERVICE_HELP;
-}
-
-function isMissingContainer(stderr: string): boolean {
-  return /no such (?:object|container)/i.test(stderr);
 }

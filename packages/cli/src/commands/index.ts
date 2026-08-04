@@ -17,6 +17,7 @@ export {
 } from "./docker.ts";
 export {
   discoverPublishedAdapterPort,
+  inspectBundleServiceContainer,
   resolveAvailableRunSettings,
   resolveRunSettings,
   runBundle,

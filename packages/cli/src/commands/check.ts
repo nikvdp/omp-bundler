@@ -1092,26 +1092,28 @@ function validateRuntimeEnv(
     errors.push(issue(envPath, "PUMBLE_AGENT_ID", "is unsupported; the project agent.id is registered automatically"));
   }
   const adapters = env.get("OMP_ADAPTERS");
-  if (adapterMode === "http") {
-    if (adapters && adapters.value.trim()) {
+  if (adapters !== undefined) {
+    if (!adapters.value.trim()) {
+      errors.push(issue(envPath, "OMP_ADAPTERS", "must not be empty when explicitly set"));
+    } else {
       const adapterLineCount = source.split(/\r?\n/).filter((line) => /^\s*OMP_ADAPTERS\s*=/.test(line)).length;
       if (adapters.quoted || adapterLineCount !== 1) {
         errors.push(issue(envPath, "OMP_ADAPTERS", "must be one unquoted JSON array on exactly one env-file line"));
       }
-      validateAdaptersJson(adapters.value, envPath, agents, errors);
+      validateAdaptersJson(
+        adapters.value,
+        envPath,
+        agents,
+        adapterMode,
+        adapterMode === "pumble" ? value("PUMBLE_ADAPTER_ID") ?? "pumble" : undefined,
+        errors,
+      );
     }
-    return;
   }
+  if (adapterMode === "http") return;
 
   for (const required of PUMBLE_REQUIRED) {
     if (!value(required)) errors.push(issue(envPath, required, "is required for bundled Pumble startup; fill runtime.env from the adapter template"));
-  }
-  if (adapters && adapters.value.trim()) {
-    const adapterLineCount = source.split(/\r?\n/).filter((line) => /^\s*OMP_ADAPTERS\s*=/.test(line)).length;
-    if (adapters.quoted || adapterLineCount !== 1) {
-      errors.push(issue(envPath, "OMP_ADAPTERS", "must be one unquoted JSON array on exactly one env-file line"));
-    }
-    validateAdaptersJson(adapters.value, envPath, agents, errors);
   }
   validateOptionalPumbleValues(env, envPath, errors);
 }
@@ -1125,7 +1127,14 @@ function validateOptionalPumbleValues(env: EnvMap, envPath: string, errors: Vali
   }
 }
 
-function validateAdaptersJson(raw: string, envPath: string, agents: readonly AgentDirectory[], errors: ValidationIssue[]): void {
+function validateAdaptersJson(
+  raw: string,
+  envPath: string,
+  agents: readonly AgentDirectory[],
+  adapterMode: "http" | "pumble",
+  expectedAdapterId: string | undefined,
+  errors: ValidationIssue[],
+): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -1156,7 +1165,24 @@ function validateAdaptersJson(raw: string, envPath: string, agents: readonly Age
     const adapterId = typeof value.adapterId === "string" ? value.adapterId : "";
     if (adapterId && seen.has(adapterId)) errors.push(issue(envPath, `${field}.adapterId`, "must be unique"));
     if (adapterId) seen.add(adapterId);
-    if (typeof value.callbackUrl === "string" && value.callbackUrl.trim()) validateUrl(envPath, `${field}.callbackUrl`, value.callbackUrl.trim(), errors, false);
+    if (expectedAdapterId !== undefined && adapterId && adapterId !== expectedAdapterId) {
+      errors.push(issue(
+        envPath,
+        `${field}.adapterId`,
+        `must match PUMBLE_ADAPTER_ID '${expectedAdapterId}' for the pumble adapter`,
+      ));
+    }
+    if (typeof value.callbackUrl === "string" && value.callbackUrl.trim()) {
+      const callbackUrl = validateUrl(envPath, `${field}.callbackUrl`, value.callbackUrl.trim(), errors, false);
+      if (callbackUrl !== undefined) {
+        const expectedPath = adapterMode === "http"
+          ? `/core/events/${expectedAgentId ?? "<missing>"}`
+          : "/core/events";
+        if (callbackUrl.pathname !== expectedPath) {
+          errors.push(issue(envPath, `${field}.callbackUrl`, `must target '${expectedPath}' for the ${adapterMode} adapter`));
+        }
+      }
+    }
     if (typeof value.agentId !== "string" || !value.agentId.trim()) {
       errors.push(issue(envPath, `${field}.agentId`, "is required and must be a non-empty safe agent id"));
     } else if (!isSafeIdentifier(value.agentId)) {
@@ -1167,16 +1193,28 @@ function validateAdaptersJson(raw: string, envPath: string, agents: readonly Age
   });
 }
 
-function validateUrl(path: string, field: string, raw: string, errors: ValidationIssue[], secureOutsideLoopback: boolean): void {
+function validateUrl(
+  path: string,
+  field: string,
+  raw: string,
+  errors: ValidationIssue[],
+  secureOutsideLoopback: boolean,
+): URL | undefined {
   let parsed: URL;
   try {
     parsed = new URL(raw);
   } catch {
     errors.push(issue(path, field, "must be an absolute HTTP(S) URL"));
-    return;
+    return undefined;
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") errors.push(issue(path, field, "must use HTTP or HTTPS"));
-  if (secureOutsideLoopback && parsed.protocol !== "https:" && !isLoopback(parsed.hostname)) errors.push(issue(path, field, "must use HTTPS outside localhost"));
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    errors.push(issue(path, field, "must use HTTP or HTTPS"));
+    return undefined;
+  }
+  if (secureOutsideLoopback && parsed.protocol !== "https:" && !isLoopback(parsed.hostname)) {
+    errors.push(issue(path, field, "must use HTTPS outside localhost"));
+  }
+  return parsed;
 }
 
 function isLoopback(hostname: string): boolean {

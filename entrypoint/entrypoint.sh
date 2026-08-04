@@ -227,7 +227,9 @@ case "$ADAPTER_MODE" in
 http)
 	ADAPTER_SERVER="$HTTP_SERVER"
 	ADAPTER_LABEL="http"
-	if [ -z "${OMP_ADAPTERS:-}" ]; then
+	if [ "${OMP_ADAPTERS+x}" = x ]; then
+		[ -n "$OMP_ADAPTERS" ] || die "OMP_ADAPTERS must not be empty when explicitly set"
+	else
 		# shellcheck disable=SC2016
 		OMP_ADAPTERS="$(
 			bun -e '
@@ -252,7 +254,23 @@ http)
 pumble)
 	ADAPTER_SERVER="$PUMBLE_SERVER"
 	ADAPTER_LABEL="pumble"
-	if [ -z "${OMP_ADAPTERS:-}" ]; then
+	if [ "${OMP_ADAPTERS+x}" = x ]; then
+		[ -n "$OMP_ADAPTERS" ] || die "OMP_ADAPTERS must not be empty when explicitly set"
+		if ! bun -e '
+      let entries;
+      try {
+        entries = JSON.parse(process.env.OMP_ADAPTERS);
+      } catch {
+        process.exit(1);
+      }
+      const expected = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
+      if (!Array.isArray(entries) || entries.length !== 1 || entries[0]?.adapterId !== expected) {
+        process.exit(1);
+      }
+    '; then
+			die "Pumble OMP_ADAPTERS must contain one registration whose adapterId matches PUMBLE_ADAPTER_ID"
+		fi
+	else
 		[ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
 		# shellcheck disable=SC2016
 		OMP_ADAPTERS="$(

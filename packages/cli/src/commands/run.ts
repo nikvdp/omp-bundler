@@ -119,7 +119,7 @@ export async function runBundle(
   }
 
   if (detached) {
-    const existingState = await inspectServiceContainer(configuredSettings.containerName);
+    const existingState = await inspectBundleServiceContainer(configuredSettings);
     if (existingState === "running") {
       context.io.stdout.write(`Service ${configuredSettings.containerName}: already running\n`);
       const livePort = await inspectPublishedPort(configuredSettings.containerName, 8765)
@@ -138,40 +138,52 @@ export async function runBundle(
       }
     }
   } else {
-    const conflictResult = await resolveServiceConflict(context, configuredSettings.containerName);
+    const conflictResult = await resolveServiceConflict(context, configuredSettings);
     if (conflictResult !== undefined) return conflictResult;
   }
 
-  const settings = await resolveAvailableRunSettings(configuredSettings);
-  printPortSelection(context, configuredSettings, settings);
-  const { containerName, ...containerSettings } = settings;
-  const dockerArgs = runDockerArgs({
-    ...containerSettings,
-    envFile: result.envFile,
-    ...(detached ? { detached: true, containerName } : {}),
-  });
-
-  if (detached) {
-    const docker = await executeChild("docker", dockerArgs, {
-      stdio: "pipe",
-      forwardSignals: false,
+  let preferredSettings = configuredSettings;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const settings = await resolveAvailableRunSettings(preferredSettings);
+    printPortSelection(context, preferredSettings, settings);
+    const { containerName, ...containerSettings } = settings;
+    const dockerArgs = runDockerArgs({
+      ...containerSettings,
+      envFile: result.envFile,
+      ...(detached ? { detached: true, containerName } : {}),
     });
-    if (docker.exitCode !== 0) {
-      context.io.stderr.write(docker.stderr || `docker run failed with exit code ${docker.exitCode}\n`);
+
+    if (!detached) printAgentEndpoints(context, result, settings, undefined, true);
+    const docker = await executeChild("docker", dockerArgs, detached
+      ? { stdio: "pipe", forwardSignals: false }
+      : {
+        stdio: "inherit",
+        forwardSignals: true,
+        signalMap: { SIGTERM: "SIGINT" },
+      });
+    if (docker.exitCode === 0) {
+      if (detached) {
+        context.io.stdout.write(`Started service ${containerName}.\n`);
+        printAgentEndpoints(context, result, settings);
+      }
+      return 0;
+    }
+
+    const retrySettings = await resolveAvailableRunSettings(settings);
+    const portChanged = retrySettings.adapterPort !== settings.adapterPort
+      || retrySettings.corePort !== settings.corePort;
+    if (!portChanged || attempt === 5) {
+      if (detached) {
+        context.io.stderr.write(docker.stderr || `docker run failed with exit code ${docker.exitCode}\n`);
+      }
       return docker.exitCode;
     }
-    context.io.stdout.write(`Started service ${containerName}.\n`);
-    printAgentEndpoints(context, result, settings);
-    return 0;
-  }
 
-  printAgentEndpoints(context, result, settings);
-  const docker = await executeChild("docker", dockerArgs, {
-    stdio: "inherit",
-    forwardSignals: true,
-    signalMap: { SIGTERM: "SIGINT" },
-  });
-  return docker.exitCode;
+    context.io.stderr.write("A selected host port became busy during Docker startup; retrying with free ports.\n");
+    printPortSelection(context, settings, retrySettings);
+    preferredSettings = retrySettings;
+  }
+  return 1;
 }
 
 export function resolveRunSettings(
@@ -227,10 +239,13 @@ export async function discoverPublishedAdapterPort(
   bundleRoot: string,
   containerName: string,
 ): Promise<number | undefined> {
-  const namedPort = await inspectPublishedPort(containerName, 8765);
-  if (namedPort !== undefined) return namedPort;
-
   try {
+    const named = await inspectContainerIdentity(containerName);
+    if (named?.status === "running" && named.bundleRoot === bundleRoot) {
+      const namedPort = await inspectPublishedPort(containerName, 8765);
+      if (namedPort !== undefined) return namedPort;
+    }
+
     const containers = await executeChild(
       "docker",
       ["ps", "--filter", `label=${BUNDLE_ROOT_LABEL}=${bundleRoot}`, "--format", "{{.ID}}"],
@@ -238,6 +253,8 @@ export async function discoverPublishedAdapterPort(
     );
     if (containers.exitCode !== 0) return undefined;
     for (const id of containers.stdout.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)) {
+      const identity = await inspectContainerIdentity(id);
+      if (identity?.status !== "running" || identity.bundleRoot !== bundleRoot) continue;
       const port = await inspectPublishedPort(id, 8765);
       if (port !== undefined) return port;
     }
@@ -291,9 +308,10 @@ export function runPreviewCommand(
 
 async function resolveServiceConflict(
   context: CommandContext,
-  containerName: string,
+  settings: RunSettings,
 ): Promise<number | undefined> {
-  if (await inspectServiceContainer(containerName) !== "running") return undefined;
+  const { containerName } = settings;
+  if (await inspectBundleServiceContainer(settings) !== "running") return undefined;
 
   context.io.stdout.write(`Service ${containerName} is already running.\n`);
   if (!("isTTY" in context.io.stdin) || context.io.stdin.isTTY !== true) {
@@ -349,13 +367,50 @@ async function resolveServiceConflict(
   return undefined;
 }
 
-async function inspectServiceContainer(containerName: string): Promise<string | undefined> {
+interface ContainerIdentity {
+  readonly status: string;
+  readonly bundleRoot?: string;
+}
+
+export async function inspectBundleServiceContainer(
+  settings: Pick<RunSettings, "containerName" | "bundleRoot">,
+): Promise<string | undefined> {
+  const identity = await inspectContainerIdentity(settings.containerName);
+  if (identity === undefined) return undefined;
+  if (identity.bundleRoot !== settings.bundleRoot) {
+    throw new Error(
+      `service container '${settings.containerName}' belongs to another bundle `
+      + `(expected label ${BUNDLE_ROOT_LABEL}=${settings.bundleRoot}, found ${identity.bundleRoot ?? "<unlabeled>"})`,
+    );
+  }
+  return identity.status;
+}
+
+async function inspectContainerIdentity(containerName: string): Promise<ContainerIdentity | undefined> {
+  const format = `{{json .State.Status}}\n{{json (index .Config.Labels "${BUNDLE_ROOT_LABEL}")}}`;
   const result = await executeChild(
     "docker",
-    ["inspect", "--type", "container", "--format", "{{.State.Status}}", containerName],
+    ["inspect", "--type", "container", "--format", format, containerName],
     { stdio: "pipe", forwardSignals: false },
   );
-  if (result.exitCode === 0) return result.stdout.trim() || "unknown";
+  if (result.exitCode === 0) {
+    const [rawStatus, rawBundleRoot] = result.stdout.trim().split(/\r?\n/, 2);
+    let status: unknown;
+    let bundleRoot: unknown;
+    try {
+      status = JSON.parse(rawStatus ?? "");
+      bundleRoot = JSON.parse(rawBundleRoot ?? "null");
+    } catch {
+      throw new Error(`docker inspect returned an invalid identity for service container '${containerName}'`);
+    }
+    if (typeof status !== "string" || !status) {
+      throw new Error(`docker inspect returned no status for service container '${containerName}'`);
+    }
+    return {
+      status,
+      ...(typeof bundleRoot === "string" && bundleRoot ? { bundleRoot } : {}),
+    };
+  }
   if (/no such (?:object|container)/i.test(result.stderr)) return undefined;
   throw new Error(result.stderr.trim() || `docker inspect failed with exit code ${result.exitCode}`);
 }
@@ -401,12 +456,16 @@ function printAgentEndpoints(
   result: CheckResult,
   settings: RunSettings,
   adapterPort = settings.adapterPort,
+  pending = false,
 ): void {
   const directoryFlag = resolve(context.cwd) === result.project.rootDir
     ? ""
     : ` --dir ${shellQuote(result.project.rootDir)}`;
   const base = `http://localhost:${adapterPort}/v1/agents/${result.agent.id}`;
-  context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
+  const label = pending
+    ? "Agent endpoint if Docker starts"
+    : "Agent endpoint (available once listening; not a readiness check)";
+  context.io.stdout.write(`${label}: ${base}\n`);
   context.io.stdout.write(`TUI: omp-bundler tui${directoryFlag}\n`);
 }
 
