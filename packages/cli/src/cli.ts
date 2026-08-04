@@ -249,15 +249,16 @@ function addBundleCommand(
 
 function completionScript(shell: string): string {
   if (shell === "bash") {
-    return `# bash completion for omp-bundler\n_omp_bundler_completions() {\n  local cur="\${COMP_WORDS[COMP_CWORD]}"\n  mapfile -t COMPREPLY < <(compgen -W "$(omp-bundler --get-yargs-completions "\${COMP_WORDS[@]}")" -- "$cur")\n}\ncomplete -o bashdefault -o default -F _omp_bundler_completions omp-bundler\n`;
+    return `# bash completion for omp-bundler\n_omp_bundler_completions() {\n  local cur="\${COMP_WORDS[COMP_CWORD]}"\n  mapfile -t COMPREPLY < <(compgen -W "$(env SHELL=/bin/bash omp-bundler --get-yargs-completions "\${COMP_WORDS[@]}")" -- "$cur")\n}\ncomplete -o bashdefault -o default -F _omp_bundler_completions omp-bundler\n`;
   }
   if (shell === "zsh") {
-    return `#compdef omp-bundler\n_omp_bundler_completions() {\n  local -a completions\n  completions=("\${(@f)$(omp-bundler --get-yargs-completions "\${words[@]}")}")\n  _describe 'omp-bundler commands and options' completions\n}\ncompdef _omp_bundler_completions omp-bundler\n`;
+    return `#compdef omp-bundler\n_omp_bundler_completions() {\n  local -a completions\n  completions=("\${(@f)$(env SHELL=/bin/zsh omp-bundler --get-yargs-completions "\${words[@]}")}")\n  _describe 'omp-bundler commands and options' completions\n}\ncompdef _omp_bundler_completions omp-bundler\n`;
   }
-  return `function __omp_bundler_completions\n  omp-bundler --get-yargs-completions (commandline -opc)\nend\ncomplete -c omp-bundler -f -a '(__omp_bundler_completions)'\n`;
+  return `function __omp_bundler_completions\n  env SHELL=/bin/bash omp-bundler --get-yargs-completions (commandline -opc)\nend\ncomplete -c omp-bundler -f -a '(__omp_bundler_completions)'\n`;
 }
 
 function isInvokedAsCli(): boolean {
+  if ((import.meta as ImportMeta & { readonly main?: boolean }).main === true) return true;
   const argvEntry = process.argv[1];
   if (!argvEntry) return false;
   try {
