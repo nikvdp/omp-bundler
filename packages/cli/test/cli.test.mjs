@@ -126,6 +126,20 @@ function captureIO() {
   };
 }
 
+async function runChild(command, args, cwd) {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", rejectRun);
+    child.once("close", (code, signal) => resolveRun({ code, signal, stdout, stderr }));
+  });
+}
+
 async function invoke(handler, cwd, positionals, options = {}) {
   const capture = captureIO();
   const result = await handler(
@@ -426,6 +440,21 @@ test("CLI framework owns command parsing, help, and shell completions", async ()
   const legacy = captureIO();
   assert.equal(await main(["service", "status"], { cwd: "/work", io: legacy.io }), 1);
   assert.match(legacy.stderr(), /Unknown command: service/);
+});
+
+test("compiled standalone invokes the CLI main module", async () => {
+  await withTempDirectory(async (root) => {
+    const executable = join(root, "omp-bundler");
+    const built = await runChild(
+      "bun",
+      ["build", "--compile", join(REPO_ROOT, "packages", "cli", "src", "cli.ts"), "--outfile", executable],
+      REPO_ROOT,
+    );
+    assert.equal(built.code, 0, built.stderr);
+    const version = await runChild(executable, ["--version"], REPO_ROOT);
+    assert.equal(version.code, 0, version.stderr);
+    assert.equal(version.stdout.trim(), "0.1.0");
+  });
 });
 
 test("entrypoint refreshes only singular .omp, preserves workspace, and registers one HTTP adapter", async () => {
