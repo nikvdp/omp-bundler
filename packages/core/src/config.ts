@@ -24,7 +24,7 @@ export interface AdapterConfigEntry {
   adapterId: string;
   callbackUrl: string;
   sharedSecret: string;
-  /** Optional agent id; resolves to a subdirectory under OMP_AGENTS_ROOT. */
+  /** Optional id binding this adapter to the configured singular agent. */
   agentId?: string;
 }
 
@@ -67,8 +67,10 @@ export interface CoreConfig {
   retryDelaysMs: number[];
   /** Declarative adapter registrations. */
   adapters: AdapterRegistration[];
-  /** Root directory holding per-agent workspaces (OMP_AGENTS_ROOT), null when unset. */
-  agentsRootDir: string | null;
+  /** Configured singular agent id (OMP_AGENT_ID), null when unset. */
+  agentId: string | null;
+  /** Root holding the singular agent definition and workspace (OMP_AGENT_ROOT). */
+  agentRootDir: string | null;
 }
 
 export interface CoreConfigEnv {
@@ -109,8 +111,14 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
   );
   const retryDelaysMs = parseRetryDelays(env.OMP_RETRY_DELAYS_MS);
 
-  const agentsRootDir = env.OMP_AGENTS_ROOT?.trim() || null;
-  const adapters = parseAdapters(env.OMP_ADAPTERS, agentsRootDir);
+  const agentId = env.OMP_AGENT_ID?.trim() || null;
+  if (agentId !== null && !AGENT_ID_RE.test(agentId)) {
+    throw new Error(
+      `OMP_AGENT_ID "${agentId}" must match /^[a-z0-9][a-z0-9_-]{0,63}$/`,
+    );
+  }
+  const agentRootDir = env.OMP_AGENT_ROOT?.trim() || null;
+  const adapters = parseAdapters(env.OMP_ADAPTERS, agentId, agentRootDir);
 
   return {
     host,
@@ -131,7 +139,8 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
     progressThresholdMs,
     retryDelaysMs,
     adapters,
-    agentsRootDir,
+    agentId,
+    agentRootDir,
   };
 }
 
@@ -167,7 +176,8 @@ export function safeDescribe(config: CoreConfig): Record<string, unknown> {
       callbackUrl: a.callbackUrl,
       agentId: a.agentId ?? null,
     })),
-    agentsRootDir: config.agentsRootDir,
+    agentId: config.agentId,
+    agentRootDir: config.agentRootDir,
   };
 }
 
@@ -250,12 +260,13 @@ function parseRetryDelays(raw: string | undefined): number[] {
  * Parse the declarative adapter registrations from a JSON env var.
  * The JSON must be an array of {adapterId, callbackUrl, sharedSecret, agentId?}.
  * Secrets are validated for non-emptiness but never logged. When an entry has
- * `agentId`, it must match the agent id regex and `agentsRootDir` must be
- * non-null, else an Error naming OMP_ADAPTERS and OMP_AGENTS_ROOT is thrown.
+ * `agentId`, it must match the configured `OMP_AGENT_ID`, and
+ * `OMP_AGENT_ROOT` must be set.
  */
 function parseAdapters(
   raw: string | undefined,
-  agentsRootDir: string | null,
+  configuredAgentId: string | null,
+  agentRootDir: string | null,
 ): AdapterRegistration[] {
   const trimmed = raw?.trim();
   if (!trimmed) {
@@ -303,9 +314,19 @@ function parseAdapters(
           `OMP_ADAPTERS[${i}].agentId "${agentId}" must match /^[a-z0-9][a-z0-9_-]{0,63}$/`,
         );
       }
-      if (agentsRootDir === null) {
+      if (agentRootDir === null) {
         throw new Error(
-          `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENTS_ROOT to be set`,
+          `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENT_ROOT to be set`,
+        );
+      }
+      if (configuredAgentId === null) {
+        throw new Error(
+          `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENT_ID to be set`,
+        );
+      }
+      if (agentId !== configuredAgentId) {
+        throw new Error(
+          `OMP_ADAPTERS[${i}].agentId "${agentId}" does not match OMP_AGENT_ID "${configuredAgentId}"`,
         );
       }
       registration.agentId = agentId;
@@ -364,7 +385,8 @@ export function testConfig(overrides: Partial<CoreConfig> = {}): CoreConfig {
         sharedSecret: randomUUID(),
       },
     ],
-    agentsRootDir: null,
+    agentId: null,
+    agentRootDir: null,
   };
   return { ...base, ...overrides };
 }

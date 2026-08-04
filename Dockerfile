@@ -38,13 +38,11 @@ COPY entrypoint/       ./entrypoint/
 # location to keep every discovery surface on one root.
 COPY template/         "${HOME}/.omp/agent/"
 
-# Bake per-agent personalities at /agents/<agentId>/.omp/. The build
-# script always stages an agents/ directory (empty when --agents is
-# absent), so this COPY is unconditional. At boot the entrypoint seeds
-# each /agents/<agentId>/.omp to /data/agents/<agentId>/.omp and
-# children spawn with cwd=/data/agents/<agentId> so OMP's project-level
-# .omp discovery gives each adapter its own agent personality.
-COPY agents/          /agents/
+# Bake the single staged agent definition. The image-side source is
+# immutable; the entrypoint refreshes only its .omp tree onto the durable
+# volume and leaves the persistent workspace untouched.
+COPY agent/id       /agent/id
+COPY agent/.omp/    /agent/.omp/
 
 # ── production dependency install ─────────────────────────────────────
 # Install production dependencies for each package from its lock file.
@@ -59,8 +57,8 @@ RUN cd packages/contracts && bun install --frozen-lockfile --production \
  && cd /app/packages/pumble-adapter && bun install --frozen-lockfile --production
 
 # ── /data mount ──────────────────────────────────────────────────────
-# A single shared volume covers sessions, workspace, artifacts, and
-# adapter-specific persistent state.
+# A single shared volume covers sessions, the legacy unbound workspace,
+# the bound agent workspace, artifacts, and adapter-specific persistent state.
 # OMP's default agent dir is $HOME/.omp/agent; session data lives at
 # $HOME/.omp/agent/sessions and artifacts at .../artifacts. To keep
 # these on the durable volume instead of the ephemeral layer:
@@ -68,14 +66,14 @@ RUN cd packages/contracts && bun install --frozen-lockfile --production \
 #     OMP env var).
 #   - The entrypoint symlinks sessions -> /data/sessions (no dedicated
 #     OMP env var relocates session data).
-#   - /data/workspace is the shared agent cwd; the Pumble adapter stores
-#     downloaded attachments beneath it when that adapter is selected.
+#   - /data/workspace remains the cwd for explicitly unbound adapters.
+#   - /data/agent/workspace is the sole bound agent cwd.
 ENV OMP_DATA_DIR=/data
 ENV OMP_SESSIONS_DIR=/data/sessions
 ENV OMP_WORKSPACE_DIR=/data/workspace
 ENV OMP_ARTIFACTS_DIR=/data/artifacts
 ENV PI_ARTIFACTS_DIR=/data/artifacts
-ENV OMP_AGENTS_ROOT=/data/agents
+ENV OMP_AGENT_ROOT=/data/agent
 
 # Core runtime invariants. Paths and internal service addresses belong to
 # this image; credentials and adapter registrations remain runtime inputs.
@@ -131,8 +129,8 @@ EXPOSE 8765
 # OMP_HTTP_TURN_TIMEOUT_MS optional synchronous turn timeout
 #
 # PUMBLE_CORE_URL        core base URL for posting inbound messages
-# PUMBLE_ADAPTER_ID      adapter id (schema default: pumble)
-# PUMBLE_AGENT_ID        filesystem agent id for the synthesized registration
+# PUMBLE_ADAPTER_ID  adapter id (schema default: pumble)
+# OMP_AGENT_ID       is read from the baked /agent/id file
 # PUMBLE_CORE_SHARED_SECRET  shared secret for inbound auth + outbound HMAC
 # PUMBLE_PUBLIC_BASE_URL public base URL for attachment links
 # PUMBLE_CORE_CALLBACK_URL optional core-to-adapter callback override

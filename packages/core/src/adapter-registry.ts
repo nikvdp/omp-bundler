@@ -73,7 +73,7 @@ export { OUTBOUND_EVENT_SIGNATURE_HEADER };
 /**
  * A single declarative adapter registration supplied to the registry
  * constructor. adapterId/callbackUrl/sharedSecret are required and validated;
- * agentId is optional and, when present, binds the adapter to an agent folder under OMP_AGENTS_ROOT.
+ * agentId optionally binds the adapter to the agent under OMP_AGENT_ROOT.
  */
 export interface AdapterRegistration {
   /** Non-empty, unique adapter id (route scoped). */

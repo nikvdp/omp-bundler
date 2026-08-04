@@ -27,9 +27,14 @@ MODELS_OUT="${AGENT_DIR}/models.yml"
 # Explicit /data mount paths shared by core and the selected adapter.
 DATA_DIR="${OMP_DATA_DIR:-/data}"
 SESSIONS_DIR="${DATA_DIR}/sessions"
-WORKSPACE_DIR="${DATA_DIR}/workspace"
+WORKSPACE_DIR="${OMP_WORKSPACE_DIR:-${DATA_DIR}/workspace}"
 ARTIFACTS_DIR="${DATA_DIR}/artifacts"
-DURABLE_AGENTS_DIR="${DATA_DIR}/agents"
+AGENT_SRC="${AGENT_SRC:-/agent}"
+DURABLE_AGENT_DIR="${DATA_DIR}/agent"
+DURABLE_WORKSPACE_DIR="${DURABLE_AGENT_DIR}/workspace"
+DURABLE_OMP_DIR="${DURABLE_AGENT_DIR}/.omp"
+export OMP_AGENT_ROOT="$DURABLE_AGENT_DIR"
+export OMP_WORKSPACE_DIR="$WORKSPACE_DIR"
 
 # Child registry: the orphan sweep and the core server both read and
 # write this JSON file to track live RPC child process groups. It
@@ -53,13 +58,80 @@ die() {
 	exit 1
 }
 
-# -- 0. /data mount paths ----------------------------------------------
-# Ensure the shared volume subdirectories exist. Artifacts are
-# relocated by PI_ARTIFACTS_DIR=/data/artifacts (set in the Dockerfile),
-# so no symlink is needed. Sessions have no dedicated OMP env var, so
-# symlink $HOME/.omp/agent/sessions -> /data/sessions to keep session
-# data on the durable volume instead of the ephemeral image layer.
-mkdir -p "$SESSIONS_DIR" "$WORKSPACE_DIR" "$ARTIFACTS_DIR"
+# -- 0. validate the staged agent --------------------------------------
+# The image must contain exactly one explicit identity and definition tree.
+# Validate every source path before touching the durable agent directory.
+if [ -L "$AGENT_SRC" ]; then
+	die "${AGENT_SRC} must not be a symlink"
+fi
+if [ ! -d "$AGENT_SRC" ]; then
+	die "${AGENT_SRC} must be a directory"
+fi
+
+AGENT_ID_PATH="${AGENT_SRC}/id"
+if [ -L "$AGENT_ID_PATH" ]; then
+	die "${AGENT_ID_PATH} must not be a symlink"
+fi
+if [ ! -f "$AGENT_ID_PATH" ]; then
+	die "${AGENT_ID_PATH} must be a regular file"
+fi
+OMP_AGENT_ID="$(<"$AGENT_ID_PATH")"
+if [[ ! "$OMP_AGENT_ID" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+	die "${AGENT_ID_PATH} must contain an agent id matching ^[a-z0-9][a-z0-9_-]{0,63}$"
+fi
+export OMP_AGENT_ID
+
+SOURCE_OMP_DIR="${AGENT_SRC}/.omp"
+if [ -L "$SOURCE_OMP_DIR" ]; then
+	die "${SOURCE_OMP_DIR} must not be a symlink"
+fi
+if [ ! -d "$SOURCE_OMP_DIR" ]; then
+	die "${SOURCE_OMP_DIR} must be a directory"
+fi
+for _required in AGENTS.md config.yml; do
+	_required_path="${SOURCE_OMP_DIR}/${_required}"
+	if [ -L "$_required_path" ]; then
+		die "${_required_path} must not be a symlink"
+	fi
+	if [ ! -f "$_required_path" ]; then
+		die "${_required_path} must be a regular file"
+	fi
+done
+
+# OMP walks upward from /data/agent/workspace. Refuse a higher-level .omp
+# tree that could merge into or override the staged definition.
+if [ -L "${DATA_DIR}/.omp" ] || [ -d "${DATA_DIR}/.omp" ]; then
+	die "${DATA_DIR}/.omp must not exist: project-level config discovery walks up from the agent workspace"
+fi
+
+# The durable root, refreshed definition, and persistent workspace are
+# operator state. Never follow symlinks while preparing them.
+if [ -L "$DURABLE_AGENT_DIR" ]; then
+	die "${DURABLE_AGENT_DIR} must not be a symlink"
+fi
+if [ -e "$DURABLE_AGENT_DIR" ] && [ ! -d "$DURABLE_AGENT_DIR" ]; then
+	die "${DURABLE_AGENT_DIR} must be a directory"
+fi
+if [ -L "$DURABLE_OMP_DIR" ]; then
+	die "${DURABLE_OMP_DIR} must not be a symlink"
+fi
+if [ -e "$DURABLE_OMP_DIR" ] && [ ! -d "$DURABLE_OMP_DIR" ]; then
+	die "${DURABLE_OMP_DIR} must be a directory"
+fi
+if [ -L "$DURABLE_WORKSPACE_DIR" ]; then
+	die "${DURABLE_WORKSPACE_DIR} must not be a symlink"
+fi
+if [ -e "$DURABLE_WORKSPACE_DIR" ] && [ ! -d "$DURABLE_WORKSPACE_DIR" ]; then
+	die "${DURABLE_WORKSPACE_DIR} must be a directory"
+fi
+
+# Keep legacy unbound cwd behavior while creating the bound workspace once.
+mkdir -p \
+	"$SESSIONS_DIR" \
+	"$WORKSPACE_DIR" \
+	"$ARTIFACTS_DIR" \
+	"$DURABLE_AGENT_DIR" \
+	"$DURABLE_WORKSPACE_DIR"
 
 link_into_data() {
 	local target="$1" expected="$2"
@@ -81,143 +153,42 @@ link_into_data() {
 }
 link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
 
-# Seed per-agent .omp configuration onto the durable /data volume.
-# Image layout is /agents/<agentId>/.omp; the data layout becomes
-# /data/agents/<agentId>/.omp. Each spawned agent runs with its cwd
-# set to /data/agents/<agentId>, so OMP's project-level .omp config
-# discovery picks up that agent's personality. The image is
-# authoritative: the .omp tree is reseeded at every boot. Sibling
-# working files under /data/agents/<agentId> are left untouched.
-#
-# Durable agent directories from an older image are retained for their
-# sibling workspace files, but their stale .omp trees are removed before
-# current baked agents are seeded.
-
-# Source root for baked agent identities. Overridable for local
-# development; defaults to the image /agents mount.
-AGENTS_SRC="${AGENTS_SRC:-/agents}"
-
-# Expand the baked agent identities first. When no agent is baked
-# (the source directory is absent or empty), boot continues without
-# seeding and without enforcing the leak guards below: an agentless
-# image must start cleanly even if a stale /data/.omp exists, since
-# no agent cwd will ever walk up into it.
-if [ -L "$AGENTS_SRC" ]; then
-	die "${AGENTS_SRC} must not be a symlink"
+# -- 1. refresh the durable agent definition ---------------------------
+# Stage the image-owned tree beside the destination, then swap it into place.
+# Only /data/agent/.omp is refreshed; /data/agent/workspace and every other
+# durable path are preserved.
+_omp_stage="${DURABLE_AGENT_DIR}/.omp.stage.$$"
+_omp_backup="${DURABLE_AGENT_DIR}/.omp.backup.$$"
+if [ -e "$_omp_stage" ] || [ -L "$_omp_stage" ]; then
+	die "${_omp_stage} already exists"
 fi
-if [ -d "$AGENTS_SRC" ]; then
-	shopt -s nullglob dotglob
-	set -- "$AGENTS_SRC"/*
-	shopt -u nullglob dotglob
-else
-	set --
+if [ -e "$_omp_backup" ] || [ -L "$_omp_backup" ]; then
+	die "${_omp_backup} already exists"
+fi
+if ! cp -R "$SOURCE_OMP_DIR" "$_omp_stage"; then
+	rm -rf "$_omp_stage"
+	die "failed to stage ${SOURCE_OMP_DIR}"
 fi
 
-# Dotglob exposes the .gitkeep placeholder shipped in agentless
-# images (an /agents directory containing only .gitkeep). It is a
-# regular file, not an agent entry, so drop it from the positional
-# args before the entry-count decision below. An /agents holding
-# only .gitkeep then counts as zero baked agents and boots without
-# seeding or leak guards, matching the agentless-image contract.
-_filtered=()
-for _entry in "$@"; do
-	if [ "$(basename "$_entry")" = ".gitkeep" ] && [ -f "$_entry" ] && [ ! -L "$_entry" ]; then
-		continue
+_had_previous_omp=0
+if [ -e "$DURABLE_OMP_DIR" ]; then
+	mv "$DURABLE_OMP_DIR" "$_omp_backup"
+	_had_previous_omp=1
+fi
+if ! mv "$_omp_stage" "$DURABLE_OMP_DIR"; then
+	rm -rf "$_omp_stage"
+	if [ "$_had_previous_omp" -eq 1 ]; then
+		mv "$_omp_backup" "$DURABLE_OMP_DIR" ||
+			die "failed to restore ${DURABLE_OMP_DIR} after refresh failure"
 	fi
-	_filtered+=("$_entry")
-done
-set -- "${_filtered[@]}"
-
-_baked_ids=()
-if [ "$#" -gt 0 ]; then
-	# OMP's project-level config discovery walks up from the cwd, so a
-	# /data/.omp or /data/agents/.omp directory would leak config into
-	# every agent and corrupt isolation. Refuse to boot before any
-	# seeding mutates the data volume.
-	if [ -d "${DATA_DIR}/.omp" ]; then
-		die "${DATA_DIR}/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/.omp would leak config into every agent"
-	fi
-	if [ -d "${DURABLE_AGENTS_DIR}/.omp" ]; then
-		die "${DURABLE_AGENTS_DIR}/.omp must not exist: project-level config discovery walks up from each agent cwd and /data/agents/.omp would leak config into every agent"
-	fi
-
-	# Validate the image-side paths before any durable state is changed.
-	for _agent_src in "$@"; do
-		_agent_id="$(basename "$_agent_src")"
-		if [ -L "$_agent_src" ]; then
-			die "${AGENTS_SRC}/${_agent_id} must not be a symlink"
-		fi
-		if [ ! -d "$_agent_src" ]; then
-			die "${AGENTS_SRC}/${_agent_id} is not a directory (bake validation should make this unreachable; failing loudly anyway)"
-		fi
-		if [ -L "${_agent_src}/.omp" ]; then
-			die "${AGENTS_SRC}/${_agent_id}/.omp must not be a symlink"
-		fi
-		if [ ! -d "${_agent_src}/.omp" ]; then
-			die "${AGENTS_SRC}/${_agent_id} has no .omp directory (bake validation should make this unreachable; failing loudly anyway)"
-		fi
-		_baked_ids+=("$_agent_id")
-	done
+	die "failed to refresh ${DURABLE_OMP_DIR}"
 fi
-
-# The durable agent root and each agent directory are operator state. Never
-# follow a symlink at either level while reconciling image-owned .omp trees.
-if [ -L "$DURABLE_AGENTS_DIR" ]; then
-	die "${DURABLE_AGENTS_DIR} must not be a symlink"
+if [ "$_had_previous_omp" -eq 1 ]; then
+	rm -rf "$_omp_backup"
 fi
-if [ -e "$DURABLE_AGENTS_DIR" ] && [ ! -d "$DURABLE_AGENTS_DIR" ]; then
-	die "${DURABLE_AGENTS_DIR} must be a directory"
-fi
+log "refreshed agent ${OMP_AGENT_ID}"
 
-_durable_agents=()
-if [ -d "$DURABLE_AGENTS_DIR" ]; then
-	shopt -s nullglob dotglob
-	_durable_agents=("$DURABLE_AGENTS_DIR"/*)
-	shopt -u nullglob dotglob
-
-	# Preflight every durable path before removing any stale tree.
-	for _durable_agent in "${_durable_agents[@]}"; do
-		_agent_id="$(basename "$_durable_agent")"
-		if [ -L "$_durable_agent" ]; then
-			die "${DURABLE_AGENTS_DIR}/${_agent_id} must not be a symlink"
-		fi
-		if [ ! -d "$_durable_agent" ]; then
-			die "${DURABLE_AGENTS_DIR}/${_agent_id} must be a directory"
-		fi
-		if [ -L "${_durable_agent}/.omp" ]; then
-			die "${DURABLE_AGENTS_DIR}/${_agent_id}/.omp must not be a symlink"
-		fi
-	done
-
-	# Remove only the image-owned subtree for IDs absent from this image.
-	for _durable_agent in "${_durable_agents[@]}"; do
-		_agent_id="$(basename "$_durable_agent")"
-		_is_baked=0
-		for _baked_id in "${_baked_ids[@]}"; do
-			if [ "$_baked_id" = "$_agent_id" ]; then
-				_is_baked=1
-				break
-			fi
-		done
-		if [ "$_is_baked" -eq 0 ] && [ -e "${_durable_agent}/.omp" ]; then
-			rm -rf "${_durable_agent}/.omp"
-			log "removed stale agent ${_agent_id}"
-		fi
-	done
-fi
-
-if [ "$#" -gt 0 ]; then
-	for _agent_src in "$@"; do
-		_agent_id="$(basename "$_agent_src")"
-		_durable_agent="${DURABLE_AGENTS_DIR}/${_agent_id}"
-		mkdir -p "$_durable_agent"
-		rm -rf "${_durable_agent}/.omp"
-		cp -R "${_agent_src}/.omp" "${_durable_agent}/.omp"
-		log "seeded agent ${_agent_id}"
-	done
-fi
-
-# -- 1. render models --------------------------------------------------
+# -- 2. render models --------------------------------------------------
 # bun build/render-models.ts expands runtime placeholders, omits providers
 # with no configured placeholders, and fails on partial or malformed values.
 log "rendering models.yml from ${MODELS_TMPL}"
@@ -238,49 +209,46 @@ if [ -n "${OMP_AUTH_BROKER_URL:-}" ] || [ -n "${OMP_AUTH_BROKER_TOKEN:-}" ]; the
 	log "configured OMP auth broker"
 fi
 
-# Select one bundled adapter process. HTTP is the default and registers every
-# baked agent. Pumble retains the existing one-agent registration. Callers may
-# still provide OMP_ADAPTERS directly for advanced registration layouts.
+# -- 3. configure the bundled adapter ---------------------------------
+# Select one bundled adapter process and synthesize one registration for the
+# staged agent. Callers may still provide OMP_ADAPTERS directly.
 ADAPTER_MODE="${OMP_BUNDLER_ADAPTER:-http}"
 case "$ADAPTER_MODE" in
 http)
 	ADAPTER_SERVER="$HTTP_SERVER"
 	ADAPTER_LABEL="http"
 	if [ -z "${OMP_ADAPTERS:-}" ]; then
-		OMP_HTTP_AGENT_IDS="$(IFS=,; printf '%s' "${_baked_ids[*]}")"
-		export OMP_HTTP_AGENT_IDS
 		# shellcheck disable=SC2016
 		OMP_ADAPTERS="$(
 			bun -e '
         import { randomBytes } from "node:crypto";
-        const ids = (process.env.OMP_HTTP_AGENT_IDS || "").split(",").filter(Boolean);
+        const agentId = process.env.OMP_AGENT_ID;
         const port = process.env.OMP_HTTP_PORT?.trim() || "8765";
         const secret =
           process.env.OMP_HTTP_CORE_SHARED_SECRET ||
           randomBytes(32).toString("hex");
-        process.stdout.write(JSON.stringify(ids.map((agentId) => ({
+        process.stdout.write(JSON.stringify([{
           adapterId: `http-${agentId}`,
           callbackUrl: `http://127.0.0.1:${port}/core/events/${encodeURIComponent(agentId)}`,
           sharedSecret: secret,
           agentId,
-        }))));
+        }]));
       '
 		)"
 		export OMP_ADAPTERS
-		log "configured bundled HTTP adapter registrations for ${#_baked_ids[@]} agent(s)"
+		log "configured bundled HTTP adapter registration for ${OMP_AGENT_ID}"
 	fi
 	;;
 pumble)
 	ADAPTER_SERVER="$PUMBLE_SERVER"
 	ADAPTER_LABEL="pumble"
 	if [ -z "${OMP_ADAPTERS:-}" ]; then
-		[ -n "${PUMBLE_AGENT_ID:-}" ] || die "PUMBLE_AGENT_ID is required in pumble mode"
 		[ -n "${PUMBLE_CORE_SHARED_SECRET:-}" ] || die "PUMBLE_CORE_SHARED_SECRET is required"
 		# shellcheck disable=SC2016
 		OMP_ADAPTERS="$(
 			bun -e '
         const adapterId = process.env.PUMBLE_ADAPTER_ID?.trim() || "pumble";
-        const agentId = process.env.PUMBLE_AGENT_ID;
+        const agentId = process.env.OMP_AGENT_ID;
         const port = process.env.PUMBLE_BRIDGE_PORT?.trim() || "8765";
         const callbackUrl =
           process.env.PUMBLE_CORE_CALLBACK_URL?.trim() ||
@@ -294,7 +262,7 @@ pumble)
       '
 		)"
 		export OMP_ADAPTERS
-		log "configured bundled Pumble adapter registration"
+		log "configured bundled Pumble adapter registration for ${OMP_AGENT_ID}"
 	fi
 	;;
 *)
@@ -302,7 +270,7 @@ pumble)
 	;;
 esac
 
-# -- 2. orphan sweep ---------------------------------------------------
+# -- 4. orphan sweep ---------------------------------------------------
 # The orphan sweep is a core module. It MUST run once; we do not
 # silently skip it. If the executable is absent or fails, the
 # container refuses to start; sweep failures are never hidden. The
@@ -313,7 +281,7 @@ log "running orphan sweep: ${ORPHAN_SWEEP}"
 bun "$ORPHAN_SWEEP"
 log "orphan sweep complete"
 
-# -- 3. start core + selected adapter under supervision -----------------
+# -- 5. start core + selected adapter under supervision -----------------
 # This shell remains PID 1, forwards signals, and tears down the sibling
 # when either supervised service exits.
 
