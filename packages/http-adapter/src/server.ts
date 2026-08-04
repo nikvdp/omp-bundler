@@ -450,12 +450,18 @@ export function loadHttpAdapterConfig(
     DEFAULT_TURN_TIMEOUT_MS,
   );
   const apiToken = env.OMP_HTTP_API_TOKEN || undefined;
-  const agents = parseHttpRegistrations(env.OMP_ADAPTERS);
+  const agents = parseHttpRegistrations(env.OMP_ADAPTERS, env.OMP_AGENT_ID);
   return { host, port, coreUrl, maxBodyBytes, turnTimeoutMs, apiToken, agents };
 }
 
-function parseHttpRegistrations(raw: string | undefined): HttpAgentRegistration[] {
+function parseHttpRegistrations(
+  raw: string | undefined,
+  configuredAgentId: string | undefined,
+): HttpAgentRegistration[] {
   if (!raw?.trim()) throw new Error("OMP_ADAPTERS is required");
+  const agentId = configuredAgentId?.trim();
+  if (!agentId) throw new Error("OMP_AGENT_ID is required");
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -465,41 +471,50 @@ function parseHttpRegistrations(raw: string | undefined): HttpAgentRegistration[
     );
   }
   if (!Array.isArray(parsed)) throw new Error("OMP_ADAPTERS must be an array");
-
-  const registrations: HttpAgentRegistration[] = [];
-  for (const value of parsed) {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
-    const entry = value as Record<string, unknown>;
-    if (
-      typeof entry.adapterId !== "string" ||
-      typeof entry.agentId !== "string" ||
-      typeof entry.sharedSecret !== "string" ||
-      typeof entry.callbackUrl !== "string"
-    ) {
-      continue;
-    }
-    let callbackAgentId: string | null = null;
-    try {
-      callbackAgentId = matchCallbackRoute(new URL(entry.callbackUrl).pathname);
-    } catch {
-      continue;
-    }
-    if (callbackAgentId === null) continue;
-    if (callbackAgentId !== entry.agentId) {
-      throw new Error(
-        `HTTP callback agent "${callbackAgentId}" does not match registration agentId "${entry.agentId}"`,
-      );
-    }
-    if (!entry.adapterId || !entry.sharedSecret) {
-      throw new Error(`HTTP registration for "${entry.agentId}" has an empty field`);
-    }
-    registrations.push({
-      agentId: entry.agentId,
-      adapterId: entry.adapterId,
-      sharedSecret: entry.sharedSecret,
-    });
+  if (parsed.length !== 1) {
+    throw new Error("OMP_ADAPTERS must contain exactly one adapter registration");
   }
-  return registrations;
+
+  const value = parsed[0];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("OMP_ADAPTERS[0] must be an object");
+  }
+  const entry = value as Record<string, unknown>;
+  for (const field of ["adapterId", "agentId", "sharedSecret", "callbackUrl"] as const) {
+    if (typeof entry[field] !== "string" || !entry[field].trim()) {
+      throw new Error(`OMP_ADAPTERS[0].${field} must be a non-empty string`);
+    }
+  }
+  if (entry.agentId !== agentId) {
+    throw new Error(
+      `OMP_ADAPTERS[0].agentId "${entry.agentId}" does not match OMP_AGENT_ID "${agentId}"`,
+    );
+  }
+
+  let callbackUrl: URL;
+  try {
+    callbackUrl = new URL(entry.callbackUrl as string);
+  } catch {
+    throw new Error("OMP_ADAPTERS[0].callbackUrl must be an absolute HTTP(S) URL");
+  }
+  if (callbackUrl.protocol !== "http:" && callbackUrl.protocol !== "https:") {
+    throw new Error("OMP_ADAPTERS[0].callbackUrl must be an absolute HTTP(S) URL");
+  }
+  const callbackAgentId = matchCallbackRoute(callbackUrl.pathname);
+  if (callbackAgentId === null) {
+    throw new Error("OMP_ADAPTERS[0].callbackUrl must target /core/events/<agent-id>");
+  }
+  if (callbackAgentId !== agentId) {
+    throw new Error(
+      `HTTP callback agent "${callbackAgentId}" does not match registration agentId "${agentId}"`,
+    );
+  }
+
+  return [{
+    agentId,
+    adapterId: entry.adapterId as string,
+    sharedSecret: entry.sharedSecret as string,
+  }];
 }
 
 function matchMessageRoute(

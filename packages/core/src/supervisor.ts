@@ -1136,30 +1136,21 @@ export interface ChildSpawnPlan {
 }
 
 /**
- * Resolve the cwd, model, and args to use when spawning a child for the
- * adapter described by `registration` (or undefined for the legacy path).
+ * Resolve the cwd, model, and args for one agent-bound adapter.
  *
- * When `registration` is undefined or carries no `agentId`, this returns the
- * legacy values straight from `config` so behavior is unchanged for adapters
- * that are not bound to an agent.
- *
- * When `registration.agentId` is present, the cwd is the persistent
- * `workspace` beneath `config.agentRootDir`. The model and args come straight
- * from the global `config` baseline. The entrypoint points OMP discovery at an
- * ephemeral runtime copy of the sibling `.omp` definition. Missing or
- * mismatched singular agent configuration fails loudly rather than falling
- * back to the legacy shared workspace.
+ * Production registrations are required to carry the configured singular
+ * agent id. Missing or mismatched identity fails loudly; child processes
+ * never fall back to the legacy shared workspace.
  */
 export function resolveChildSpawnPlan(
   config: CoreConfig,
   registration: AdapterRegistration | undefined,
 ): ChildSpawnPlan {
-  if (registration === undefined || registration.agentId === undefined) {
-    return {
-      cwd: config.workspaceDir,
-      model: config.ompModel,
-      args: config.ompArgs,
-    };
+  if (registration === undefined) {
+    throw new Error("cannot spawn a child without an adapter registration");
+  }
+  if (registration.agentId === undefined) {
+    throw new Error(`adapter "${registration.adapterId}" is not bound to OMP_AGENT_ID`);
   }
   if (config.agentRootDir === null) {
     throw new Error(

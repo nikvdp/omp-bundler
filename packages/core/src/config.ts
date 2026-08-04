@@ -24,8 +24,8 @@ export interface AdapterConfigEntry {
   adapterId: string;
   callbackUrl: string;
   sharedSecret: string;
-  /** Optional id binding this adapter to the configured singular agent. */
-  agentId?: string;
+  /** Id binding this adapter to the configured singular agent. */
+  agentId: string;
 }
 
 
@@ -257,11 +257,9 @@ function parseRetryDelays(raw: string | undefined): number[] {
 }
 
 /**
- * Parse the declarative adapter registrations from a JSON env var.
- * The JSON must be an array of {adapterId, callbackUrl, sharedSecret, agentId?}.
- * Secrets are validated for non-emptiness but never logged. When an entry has
- * `agentId`, it must match the configured `OMP_AGENT_ID`, and
- * `OMP_AGENT_ROOT` must be set.
+ * The JSON must contain exactly one
+ * {adapterId, callbackUrl, sharedSecret, agentId}. Every entry must bind to
+ * the configured `OMP_AGENT_ID`, and `OMP_AGENT_ROOT` must be set.
  */
 function parseAdapters(
   raw: string | undefined,
@@ -287,6 +285,9 @@ function parseAdapters(
       "OMP_ADAPTERS must be a JSON array of adapter registrations",
     );
   }
+  if (parsed.length !== 1) {
+    throw new Error("OMP_ADAPTERS must contain exactly one adapter registration");
+  }
   const entries: AdapterRegistration[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i];
@@ -297,40 +298,38 @@ function parseAdapters(
     const adapterId = strField(r, "adapterId", i);
     const callbackUrl = strField(r, "callbackUrl", i);
     const sharedSecret = strField(r, "sharedSecret", i);
+    const agentId = r.agentId;
+    if (typeof agentId !== "string" || agentId.length === 0) {
+      throw new Error(
+        `OMP_ADAPTERS[${i}].agentId must be a non-empty string`,
+      );
+    }
+    if (!AGENT_ID_RE.test(agentId)) {
+      throw new Error(
+        `OMP_ADAPTERS[${i}].agentId "${agentId}" must match /^[a-z0-9][a-z0-9_-]{0,63}$/`,
+      );
+    }
+    if (agentRootDir === null) {
+      throw new Error(
+        `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENT_ROOT to be set`,
+      );
+    }
+    if (configuredAgentId === null) {
+      throw new Error(
+        `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENT_ID to be set`,
+      );
+    }
+    if (agentId !== configuredAgentId) {
+      throw new Error(
+        `OMP_ADAPTERS[${i}].agentId "${agentId}" does not match OMP_AGENT_ID "${configuredAgentId}"`,
+      );
+    }
     const registration: AdapterRegistration = {
       adapterId,
       callbackUrl,
       sharedSecret,
+      agentId,
     };
-    if (r.agentId !== undefined) {
-      const agentId = r.agentId;
-      if (typeof agentId !== "string" || agentId.length === 0) {
-        throw new Error(
-          `OMP_ADAPTERS[${i}].agentId must be a non-empty string`,
-        );
-      }
-      if (!AGENT_ID_RE.test(agentId)) {
-        throw new Error(
-          `OMP_ADAPTERS[${i}].agentId "${agentId}" must match /^[a-z0-9][a-z0-9_-]{0,63}$/`,
-        );
-      }
-      if (agentRootDir === null) {
-        throw new Error(
-          `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENT_ROOT to be set`,
-        );
-      }
-      if (configuredAgentId === null) {
-        throw new Error(
-          `OMP_ADAPTERS[${i}].agentId "${agentId}" requires OMP_AGENT_ID to be set`,
-        );
-      }
-      if (agentId !== configuredAgentId) {
-        throw new Error(
-          `OMP_ADAPTERS[${i}].agentId "${agentId}" does not match OMP_AGENT_ID "${configuredAgentId}"`,
-        );
-      }
-      registration.agentId = agentId;
-    }
     entries.push(registration);
   }
   return entries;

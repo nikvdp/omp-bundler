@@ -1137,6 +1137,11 @@ function validateAdaptersJson(raw: string, envPath: string, agents: readonly Age
     errors.push(issue(envPath, "OMP_ADAPTERS", "must be a JSON array of adapter registrations"));
     return;
   }
+  if (parsed.length !== 1) {
+    errors.push(issue(envPath, "OMP_ADAPTERS", "must contain exactly one adapter registration"));
+    return;
+  }
+  const expectedAgentId = agents[0]?.id;
   const seen = new Set<string>();
   parsed.forEach((entry, index) => {
     const field = `OMP_ADAPTERS[${index}]`;
@@ -1152,14 +1157,12 @@ function validateAdaptersJson(raw: string, envPath: string, agents: readonly Age
     if (adapterId && seen.has(adapterId)) errors.push(issue(envPath, `${field}.adapterId`, "must be unique"));
     if (adapterId) seen.add(adapterId);
     if (typeof value.callbackUrl === "string" && value.callbackUrl.trim()) validateUrl(envPath, `${field}.callbackUrl`, value.callbackUrl.trim(), errors, false);
-    if (value.agentId !== undefined) {
-      if (typeof value.agentId !== "string" || !value.agentId.trim()) {
-        errors.push(issue(envPath, `${field}.agentId`, "must be a non-empty safe agent id when supplied"));
-      } else if (!isSafeIdentifier(value.agentId)) {
-        errors.push(issue(envPath, `${field}.agentId`, "must be a safe agent id"));
-      } else if (!agents.some((agent) => agent.id === value.agentId)) {
-        errors.push(issue(envPath, `${field}.agentId`, `references '${value.agentId}', which is not a direct child of the effective agent collection`));
-      }
+    if (typeof value.agentId !== "string" || !value.agentId.trim()) {
+      errors.push(issue(envPath, `${field}.agentId`, "is required and must be a non-empty safe agent id"));
+    } else if (!isSafeIdentifier(value.agentId)) {
+      errors.push(issue(envPath, `${field}.agentId`, "must be a safe agent id"));
+    } else if (value.agentId !== expectedAgentId) {
+      errors.push(issue(envPath, `${field}.agentId`, `must match the configured root agent '${expectedAgentId ?? "<missing>"}'`));
     }
   });
 }
