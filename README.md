@@ -80,20 +80,8 @@ new -> edit or generate -> set-model -> check -> build -> run
 
 ## Source layout
 
-`omp-bundler new meetings-agent` creates the minimal bundle:
-
-```text
-meetings-agent/
-├── .gitignore
-├── AGENTS.md
-├── README.md
-├── config.yml
-├── omp-bundler.yml
-└── runtime.env.example
-```
-
-After configuring a model and generating some components, the same bundle may
-look like:
+`omp-bundler new meetings-agent` creates the complete discoverable agent
+surface at the bundle root:
 
 ```text
 meetings-agent/
@@ -101,24 +89,32 @@ meetings-agent/
 ├── AGENTS.md
 ├── README.md
 ├── commands/
-│   └── summarize.md
+│   └── example-command.md.example
 ├── config.yml
 ├── extensions/
-│   └── lifecycle-log.ts
-├── model.yml
+│   └── example-extension.ts.example
 ├── omp-bundler.yml
 ├── runtime.env.example
 ├── skills/
-│   └── meeting-notes/
-│       └── SKILL.md
+│   └── example-skill/
+│       └── SKILL.md.example
 ├── subagents/
-│   └── transcript-researcher.md
+│   └── example-subagent.md.example
 └── tools/
-    └── read-transcript.ts
+    └── example-tool.ts.example
 ```
 
-Component directories are optional and are created by their generators. The
-source uses `subagents/`; Docker staging maps it to OMP's internal
+The hierarchy is intentional: a new user can immediately see where every OMP
+extension point belongs. `.example` keeps each complete starter inactive while
+`check` still validates it. Use the matching generator to create an active
+component rather than removing the suffix by hand.
+
+After configuring a model and generating real components, the same root may
+also contain `model.yml`, `commands/summarize.md`,
+`extensions/lifecycle-log.ts`, `skills/meeting-notes/SKILL.md`,
+`subagents/transcript-researcher.md`, and `tools/read-transcript.ts`.
+
+The source uses `subagents/`; Docker staging maps it to OMP's internal
 `.omp/agents/` directory.
 
 The agent ID lives in `omp-bundler.yml`, not in a directory name:
