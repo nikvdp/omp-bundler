@@ -563,25 +563,56 @@ test("entrypoint rejects invalid ids and durable agent symlinks", async () => {
   });
 });
 
-test("new creates the minimal root scaffold and derives or accepts an agent id", async () => {
+test("new creates the full root scaffold and derives or accepts an agent id", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["derived"]);
     const derived = join(parent, "derived");
     assert.deepEqual(
       new Set(await readdir(derived)),
-      new Set([".gitignore", "README.md", "omp-bundler.yml", "runtime.env.example", "AGENTS.md", "config.yml"]),
+      new Set([
+        ".gitignore",
+        "README.md",
+        "omp-bundler.yml",
+        "runtime.env.example",
+        "AGENTS.md",
+        "config.yml",
+        "subagents",
+        "commands",
+        "extensions",
+        "skills",
+        "tools",
+      ]),
     );
-    assert.equal(await exists(join(derived, "subagents")), false);
-    assert.equal(await exists(join(derived, "commands")), false);
+    for (const relativePath of [
+      join("subagents", "example-subagent.md.example"),
+      join("commands", "example-command.md.example"),
+      join("extensions", "example-extension.ts.example"),
+      join("skills", "example-skill", "SKILL.md.example"),
+      join("tools", "example-tool.ts.example"),
+    ]) {
+      assert.equal(await exists(join(derived, relativePath)), true, relativePath);
+    }
     assert.equal(await exists(join(derived, "model.yml")), false);
-    assert.deepEqual(parseYaml(await readFile(join(derived, "omp-bundler.yml"), "utf8")).agent, { id: "derived" });
-    assert.equal(await exists(join(derived, "AGENTS.md")), true);
-    assert.equal(await exists(join(derived, "config.yml")), true);
+    assert.deepEqual(
+      parseYaml(await readFile(join(derived, "omp-bundler.yml"), "utf8"))
+        .agent,
+      { id: "derived" },
+    );
+    const generatedReadme = await readFile(join(derived, "README.md"), "utf8");
+    assert.match(generatedReadme, /\.example.*inactive/);
+    assert.match(generatedReadme, /omp-bundler generate skill meeting-notes/);
 
     await invoke(newCommand, parent, ["custom"], { id: "alpha" });
     const custom = join(parent, "custom");
-    assert.equal(parseYaml(await readFile(join(custom, "omp-bundler.yml"), "utf8")).agent.id, "alpha");
-    await assert.rejects(() => invoke(newCommand, parent, ["bad"], { agent: "alpha" }), /unknown option/);
+    assert.equal(
+      parseYaml(await readFile(join(custom, "omp-bundler.yml"), "utf8")).agent
+        .id,
+      "alpha",
+    );
+    await assert.rejects(
+      () => invoke(newCommand, parent, ["bad"], { agent: "alpha" }),
+      /unknown option/,
+    );
   });
 });
 
