@@ -23,6 +23,16 @@ import {
 } from "./templates.ts";
 import type { ComponentKind } from "./templates.ts";
 
+const GENERATE_HELP = [
+  "omp-bundler generate agent <agent-id> [--dry-run]",
+  "omp-bundler generate skill <agent-id> <name> [--dry-run]",
+  "omp-bundler generate command <agent-id> <name> [--dry-run]",
+  "omp-bundler generate tool <agent-id> <name> [--dry-run]",
+  "omp-bundler generate extension <agent-id> <name> [--dry-run]",
+  "omp-bundler generate subagent <agent-id> <name> [--dry-run]",
+  "omp-bundler generate adapter <adapter-type> --agent <agent-id> [--dry-run]",
+].join("\n");
+
 const COMPONENT_KINDS: Record<string, ComponentKind> = {
   skill: "skill",
   command: "command",
@@ -32,8 +42,12 @@ const COMPONENT_KINDS: Record<string, ComponentKind> = {
 };
 
 export const generateCommand: CommandHandler = async (args, context) => {
-  assertAllowedOptions(args, ["agent", "dry-run"]);
   const kind = args.positionals[0];
+  if (args.options.help === true || kind === undefined) {
+    context.io.stdout.write(`${GENERATE_HELP}\n`);
+    return 0;
+  }
+  assertAllowedOptions(args, ["agent", "dry-run"]);
   const dryRun = args.options["dry-run"] === true;
   if (kind === "adapter") {
     return generateAdapter(args, context, dryRun);

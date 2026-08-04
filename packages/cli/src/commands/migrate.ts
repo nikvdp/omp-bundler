@@ -20,11 +20,11 @@ const MIGRATE_HELP = [
 const LEGACY_OMP = ".omp";
 
 export const migrateCommand: CommandHandler = async (args, context) => {
-  if (args.options.help === true) {
+  const form = args.positionals[0];
+  if (args.options.help === true || form === undefined) {
     context.io.stdout.write(`${MIGRATE_HELP}\n`);
     return 0;
   }
-  const form = args.positionals[0];
   if (form !== "visible-layout") {
     throw new Error(`unknown migrate target '${form ?? ""}'. Run 'omp-bundler migrate --help' for available commands`);
   }

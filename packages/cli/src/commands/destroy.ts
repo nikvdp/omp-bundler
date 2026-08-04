@@ -43,11 +43,11 @@ const COMPONENT_DIRECTORY: Record<string, string> = {
 };
 
 export const destroyCommand: CommandHandler = async (args, context) => {
-  if (args.options.help === true) {
+  const kind = args.positionals[0];
+  if (args.options.help === true || kind === undefined) {
     context.io.stdout.write(`${DESTROY_HELP}\n`);
     return 0;
   }
-  const kind = args.positionals[0];
   if (kind === "agent") return destroyAgent(args, context);
   if (kind && Object.hasOwn(COMPONENT_DIRECTORY, kind)) return destroyComponent(kind, args, context);
   throw new Error(`unknown destroy target '${kind ?? ""}'. Run 'omp-bundler destroy --help' for available commands`);
