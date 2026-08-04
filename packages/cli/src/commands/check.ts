@@ -77,6 +77,7 @@ const OMP_ALLOWED: Record<string, true> = {
 const OMP_REQUIRED_FILES = ["AGENTS.md", "config.yml"] as const;
 const OMP_REQUIRED_DIRS: readonly string[] = [];
 const PROJECT_SOURCE_FILES: Record<string, true> = {
+  ".git": true,
   ".gitignore": true,
   "README.md": true,
   "omp-bundler.yml": true,
