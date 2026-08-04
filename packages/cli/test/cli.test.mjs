@@ -867,6 +867,14 @@ test("check accepts root VCS metadata and Pumble derives the project agent id", 
     const bundle = join(parent, "bundle");
     await mkdir(join(bundle, ".git"), { recursive: true });
     await seedModel(bundle, "alpha");
+    for (const relativePath of [
+      join("skills", "example-skill", "agents", "helper.md"),
+      join("skills", "example-skill", "scripts", "prepare.ts"),
+      join("skills", "example-skill", "references", "usage.md"),
+      join("skills", "example-skill", "resources", "prompt.txt"),
+    ]) {
+      await writeText(join(bundle, relativePath), "skill resource\n");
+    }
     const structural = await validateBundle({ cwd: bundle });
     assert.equal(structural.ok, true, structural.errors.map((entry) => entry.message).join("\n"));
     assert.equal(structural.agent.id, "alpha");
