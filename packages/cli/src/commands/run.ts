@@ -1,4 +1,5 @@
 import { basename, join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { optionBoolean } from "../args.ts";
 import { executeChild } from "../process.ts";
 import { resolveBundleRoot, resolveDefaultEnvFile } from "../project.ts";
@@ -14,11 +15,12 @@ import type { CommandContext, CommandHandler, ParsedArguments } from "../types.t
 
 export const RUN_HELP = `omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]
 
-Validate runtime bindings, then run the configured image with its ports and
-named data volume. --env-file defaults to the bundle's runtime.env; copy
-runtime.env.example to runtime.env to fill deployment values. --agents
-selects the agent collection used to validate adapter bindings without
-changing the image. --dry-run prints the Docker command without executing it.`;
+Validate runtime bindings, then run the configured image in the foreground with
+its ports and named data volume. If the detached service is already running,
+choose whether to follow its logs, replace it with this foreground run, or
+cancel. --env-file defaults to the bundle's runtime.env; --agents selects the
+agent collection used to validate adapter bindings without changing the image.
+--dry-run prints the Docker command without executing it.`;
 
 const SAFE_IMAGE_TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
 const SAFE_VOLUME_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
@@ -116,10 +118,11 @@ export async function runBundle(
   }
 
   const settings = resolveRunSettings(result, imageOverride);
+  const { containerName, ...containerSettings } = settings;
   const dockerArgs = runDockerArgs({
-    ...settings,
+    ...containerSettings,
     envFile: result.envFile,
-    ...(detached ? { detached: true } : {}),
+    ...(detached ? { detached: true, containerName } : {}),
   });
   if (optionBoolean(args, "dry-run")) {
     context.io.stdout.write(`${formatDockerCommand("docker", dockerArgs)}\n`);
@@ -127,6 +130,23 @@ export async function runBundle(
   }
 
   if (detached) {
+    const existingState = await inspectServiceContainer(containerName);
+    if (existingState === "running") {
+      context.io.stdout.write(`Service ${containerName}: already running\n`);
+      printAgentEndpoints(context, result, settings);
+      return 0;
+    }
+    if (existingState !== undefined) {
+      const removal = await executeChild("docker", ["rm", "-f", containerName], {
+        stdio: "pipe",
+        forwardSignals: false,
+      });
+      if (removal.exitCode !== 0) {
+        context.io.stderr.write(removal.stderr || `docker rm failed with exit code ${removal.exitCode}\n`);
+        return removal.exitCode;
+      }
+    }
+
     const docker = await executeChild("docker", dockerArgs, {
       stdio: "pipe",
       forwardSignals: false,
@@ -135,10 +155,13 @@ export async function runBundle(
       context.io.stderr.write(docker.stderr || `docker run failed with exit code ${docker.exitCode}\n`);
       return docker.exitCode;
     }
-    context.io.stdout.write(`Started service ${settings.containerName}.\n`);
+    context.io.stdout.write(`Started service ${containerName}.\n`);
     printAgentEndpoints(context, result, settings);
     return 0;
   }
+
+  const conflictResult = await resolveServiceConflict(context, containerName);
+  if (conflictResult !== undefined) return conflictResult;
 
   printAgentEndpoints(context, result, settings);
   const docker = await executeChild("docker", dockerArgs, {
@@ -182,11 +205,83 @@ export function runPreviewCommand(
   envFile: string,
   detached = false,
 ): string {
+  const { containerName, ...containerSettings } = settings;
   return formatDockerCommand("docker", runDockerArgs({
-    ...settings,
+    ...containerSettings,
     envFile,
-    ...(detached ? { detached: true } : {}),
+    ...(detached ? { detached: true, containerName } : {}),
   }));
+}
+
+async function resolveServiceConflict(
+  context: CommandContext,
+  containerName: string,
+): Promise<number | undefined> {
+  if (await inspectServiceContainer(containerName) !== "running") return undefined;
+
+  context.io.stdout.write(`Service ${containerName} is already running.\n`);
+  if (!("isTTY" in context.io.stdin) || context.io.stdin.isTTY !== true) {
+    context.io.stderr.write(
+      "Run this command in an interactive terminal to choose an action, or stop the service with 'omp-bundler service stop'.\n",
+    );
+    return 1;
+  }
+
+  const readline = createInterface({ input: context.io.stdin, output: context.io.stdout });
+  let choice: string;
+  try {
+    while (true) {
+      choice = (await readline.question(
+        "[f] Follow service logs  [r] Stop service and run in foreground  [c] Cancel (default: f): ",
+      )).trim().toLowerCase();
+      if (choice === "" || choice === "f" || choice === "follow") {
+        choice = "follow";
+        break;
+      }
+      if (choice === "r" || choice === "run" || choice === "replace") {
+        choice = "replace";
+        break;
+      }
+      if (choice === "c" || choice === "cancel") {
+        choice = "cancel";
+        break;
+      }
+      context.io.stdout.write("Choose f, r, or c.\n");
+    }
+  } finally {
+    readline.close();
+  }
+
+  if (choice === "cancel") return 0;
+  if (choice === "follow") {
+    const logs = await executeChild("docker", ["logs", "--follow", containerName], {
+      stdio: "inherit",
+      forwardSignals: true,
+    });
+    return logs.exitCode;
+  }
+
+  const stopped = await executeChild("docker", ["stop", containerName], {
+    stdio: "pipe",
+    forwardSignals: false,
+  });
+  if (stopped.exitCode !== 0) {
+    context.io.stderr.write(stopped.stderr || `docker stop failed with exit code ${stopped.exitCode}\n`);
+    return stopped.exitCode;
+  }
+  context.io.stdout.write(`Stopped service ${containerName}; starting foreground run.\n`);
+  return undefined;
+}
+
+async function inspectServiceContainer(containerName: string): Promise<string | undefined> {
+  const result = await executeChild(
+    "docker",
+    ["inspect", "--type", "container", "--format", "{{.State.Status}}", containerName],
+    { stdio: "pipe", forwardSignals: false },
+  );
+  if (result.exitCode === 0) return result.stdout.trim() || "unknown";
+  if (/no such (?:object|container)/i.test(result.stderr)) return undefined;
+  throw new Error(result.stderr.trim() || `docker inspect failed with exit code ${result.exitCode}`);
 }
 
 function printAgentEndpoints(

@@ -1,12 +1,9 @@
-import { constants } from "node:fs";
-import { access, chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { createInterface } from "node:readline/promises";
+import type { Writable } from "node:stream";
 import { optionString } from "../args.ts";
-import { requirePackagedAsset } from "../assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
-import { executeChild } from "../process.ts";
 import { discoverAgents, loadProject, resolveDefaultEnvFile } from "../project.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 import { getDockerEnvValue } from "./check.ts";
@@ -15,9 +12,9 @@ import { resolveRunSettings } from "./run.ts";
 
 export const TUI_HELP = `omp-bundler tui [--dir <bundle-path>] [--id <agent-id>] [--endpoint <agent-url>]
 
-Open terminal chat for a running bundle. With no flags, use the current bundle
-and infer its only agent. --dir selects another bundle, --id selects one agent,
-and --endpoint bypasses bundle discovery with an exact agent URL.`;
+Open a simple terminal chat for a running bundle. With no flags, use the current
+bundle and infer its only agent. --dir selects another bundle, --id selects one
+agent, and --endpoint bypasses bundle discovery with an exact agent URL.`;
 
 export interface TuiTarget {
   readonly endpoint: string;
@@ -32,13 +29,7 @@ export const tuiCommand: CommandHandler = async (args, context) => {
   assertAllowedOptions(args, ["dir", "id", "endpoint"]);
   if (args.positionals.length > 0) throw new Error(`usage: ${TUI_HELP.split("\n", 1)[0]}`);
 
-  const target = await resolveTuiTarget(args, context.cwd);
-  const executable = await resolveTuiExecutable();
-  const result = await executeChild(executable, [target.endpoint], {
-    stdio: "inherit",
-    ...(target.token === undefined ? {} : { env: { OMP_HTTP_API_TOKEN: target.token } }),
-  });
-  return result.exitCode;
+  return runReadlineChat(await resolveTuiTarget(args, context.cwd), context);
 };
 
 export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Promise<TuiTarget> {
@@ -49,7 +40,11 @@ export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Prom
     if (directory !== undefined || agentId !== undefined) {
       throw new Error("--endpoint cannot be combined with --dir or --id");
     }
-    return { endpoint };
+    const token = process.env.OMP_HTTP_API_TOKEN;
+    return {
+      endpoint: normalizeAgentEndpoint(endpoint),
+      ...(token === undefined ? {} : { token }),
+    };
   }
 
   const project = await loadProject(directory, cwd);
@@ -80,6 +75,70 @@ export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Prom
   };
 }
 
+export async function runReadlineChat(
+  target: TuiTarget,
+  context: CommandContext,
+  request: typeof fetch = fetch,
+): Promise<number> {
+  const endpoint = normalizeAgentEndpoint(target.endpoint);
+  const conversationKey = randomUUID();
+  const readline = createInterface({ input: context.io.stdin, output: context.io.stdout });
+  let activeRequest: AbortController | undefined;
+  let interrupted = false;
+  readline.on("SIGINT", () => {
+    interrupted = true;
+    activeRequest?.abort();
+    readline.close();
+  });
+  context.io.stdout.write(`Chatting with ${endpoint}\nType /quit to exit.\n\n`);
+
+  try {
+    while (!interrupted) {
+      let message: string;
+      try {
+        message = (await readline.question("you> ")).trim();
+      } catch {
+        break;
+      }
+      if (!message) continue;
+      if (/^\/(?:quit|exit)$/i.test(message)) break;
+
+      activeRequest = new AbortController();
+      const stopSpinner = startSpinner(context.io.stderr);
+      try {
+        const response = await request(
+          `${endpoint}/conversations/${encodeURIComponent(conversationKey)}/messages`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...(target.token ? { authorization: `Bearer ${target.token}` } : {}),
+            },
+            body: JSON.stringify({ message }),
+            signal: activeRequest.signal,
+          },
+        );
+        const body = await response.text();
+        if (!response.ok) throw new Error(serverError(response.status, body));
+        const parsed: unknown = JSON.parse(body);
+        const text = responseText(parsed);
+        if (text === undefined) throw new Error("agent response did not contain text");
+        stopSpinner();
+        context.io.stdout.write(`agent> ${text}\n\n`);
+      } catch (error) {
+        stopSpinner();
+        if (interrupted) break;
+        context.io.stderr.write(`Error: ${error instanceof Error ? error.message : String(error)}\n`);
+      } finally {
+        activeRequest = undefined;
+      }
+    }
+  } finally {
+    readline.close();
+  }
+  return 0;
+}
+
 function requiredStringOption(args: ParsedArguments, name: string): string | undefined {
   if (!Object.hasOwn(args.options, name)) return undefined;
   const value = optionString(args, name);
@@ -87,29 +146,64 @@ function requiredStringOption(args: ParsedArguments, name: string): string | und
   return value;
 }
 
-async function resolveTuiExecutable(): Promise<string> {
-  const target = `${process.platform}-${process.arch}`;
-  const encodedPath = await requirePackagedAsset(`tools/omp-tui/${target}.base64`);
-  const encoded = await readFile(encodedPath, "utf8");
-  const digest = createHash("sha256").update(encoded).digest("hex").slice(0, 16);
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  const executable = join(homedir(), ".cache", "omp-bundler", "bin", `omp-tui-${target}-${digest}${suffix}`);
+function normalizeAgentEndpoint(raw: string): string {
+  let endpoint: URL;
   try {
-    await access(executable, constants.X_OK);
-    return executable;
+    endpoint = new URL(raw);
   } catch {
-    // Extract below.
+    throw new Error(`invalid agent endpoint: ${raw}`);
   }
+  if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+    throw new Error("agent endpoint must use http or https");
+  }
+  if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    throw new Error("agent endpoint must not contain credentials, query parameters, or a fragment");
+  }
+  endpoint.pathname = endpoint.pathname.replace(/\/+$/, "");
+  if (!/\/v1\/agents\/[^/]+$/.test(endpoint.pathname)) {
+    throw new Error("agent endpoint must end with /v1/agents/<agent-id>");
+  }
+  return endpoint.toString().replace(/\/$/, "");
+}
 
-  await mkdir(dirname(executable), { recursive: true });
-  const temporary = `${executable}.${process.pid}.tmp`;
-  await writeFile(temporary, Buffer.from(encoded, "base64"), { mode: 0o700 });
-  try {
-    await rename(temporary, executable);
-  } catch (error) {
-    await rm(temporary, { force: true });
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+function startSpinner(output: Writable): () => void {
+  const terminal = "isTTY" in output && output.isTTY === true;
+  if (!terminal) {
+    output.write("Waiting for agent...\n");
+    return () => {};
   }
-  await chmod(executable, 0o700);
-  return executable;
+  const frames = ["|", "/", "-", "\\"];
+  let frame = 0;
+  output.write(`Waiting for agent... ${frames[frame]}`);
+  const timer = setInterval(() => {
+    frame = (frame + 1) % frames.length;
+    output.write(`\rWaiting for agent... ${frames[frame]}`);
+  }, 100);
+  timer.unref();
+  return () => {
+    clearInterval(timer);
+    output.write("\r\u001b[2K");
+  };
+}
+
+function responseText(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || !("text" in value)) return undefined;
+  return typeof value.text === "string" ? value.text : undefined;
+}
+
+function serverError(status: number, body: string): string {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (parsed && typeof parsed === "object" && "error" in parsed) {
+      const error = parsed.error;
+      if (typeof error === "string") return error;
+      if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+        return error.message;
+      }
+    }
+  } catch {
+    // Use the bounded fallback below.
+  }
+  const excerpt = body.replace(/\s+/g, " ").trim().slice(0, 512);
+  return excerpt ? `HTTP ${status}: ${excerpt}` : `HTTP ${status}`;
 }

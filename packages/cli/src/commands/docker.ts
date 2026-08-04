@@ -22,7 +22,7 @@ export interface RunDockerArguments {
   readonly adapterPort: number;
   readonly dataVolume: string;
   readonly envFile: string;
-  readonly containerName: string;
+  readonly containerName?: string;
   readonly detached?: boolean;
 }
 
@@ -45,8 +45,7 @@ export function runDockerArgs(
     "run",
     "--rm",
     ...(options.detached ? ["-d"] : []),
-    "--name",
-    options.containerName,
+    ...(options.containerName === undefined ? [] : ["--name", options.containerName]),
     "-p",
     `${options.corePort}:8787`,
     "-p",
