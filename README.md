@@ -382,15 +382,15 @@ $EDITOR runtime.env
 Start the named background service:
 
 ```bash
-omp-bundler run
+omp-bundler start
 omp-bundler status
 omp-bundler logs --follow
 ```
 
-`run` is background-first. It validates `runtime.env`, resolves busy host ports,
-starts the deterministic `<dataVolume>-service` container, and prints the
-selected endpoint. Repeating `run` while that owned service is running reports
-its existing endpoint without replacing it.
+`start` validates `runtime.env`, resolves busy host ports, starts the
+deterministic `<dataVolume>-service` container, and prints the selected endpoint.
+`run` is the same background start path plus `--foreground` mode. Repeating
+either command while the owned service is running reports its existing endpoint.
 
 Use foreground mode when the process should own the terminal:
 
@@ -405,6 +405,7 @@ temporary container, streams logs, and forwards termination signals.
 Lifecycle commands are flat and bundle-aware:
 
 ```bash
+omp-bundler start [bundle-path]
 omp-bundler status [bundle-path]
 omp-bundler stop [bundle-path]
 omp-bundler restart [bundle-path]
@@ -412,8 +413,9 @@ omp-bundler logs [bundle-path] [--follow] [--tail 100]
 ```
 
 `status` reports the service state, container name, agent ID, and live endpoint.
-`stop` is idempotent. `restart` requires an existing owned container. `logs`
-defaults to the last 100 lines; `--tail all` prints all retained logs.
+`stop` is idempotent. `restart` recreates the service from current bundle
+configuration and starts it when absent. `logs` defaults to the last 100 lines;
+`--tail all` prints all retained logs.
 
 Useful run overrides:
 
@@ -576,6 +578,7 @@ omp-bundler model list
 omp-bundler check [bundle-path] [--env-file <path>]
 omp-bundler build [bundle-path] [--tag <image-tag>]
 omp-bundler run [bundle-path] [--foreground] [--env-file <path>] [--image <tag>] [--dry-run]
+omp-bundler start [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]
 omp-bundler status [bundle-path]
 omp-bundler stop [bundle-path]
 omp-bundler restart [bundle-path]
