@@ -93,7 +93,7 @@ export const setModelCommand: CommandHandler = async (args, context) => {
 
   if (args.options["print-template"] === true) {
     const existingFile = await readOptionalTextFile(configPath, "model config");
-    const existing = existingFile ? parseModelConfig(existingFile.content, configPath) : undefined;
+    const existing = parseExistingModel(existingFile?.content, agentId, configPath);
     context.io.stdout.write(renderModelTemplate(agentId, existing));
     return 0;
   }
@@ -138,8 +138,9 @@ async function runEditor(
   configPath: string,
 ): Promise<number> {
   const existingFile = await readOptionalTextFile(configPath, "model config");
-  const template = existingFile?.content ?? renderModelTemplate(agentId, undefined);
-  const isNewFile = !existingFile;
+  const starter = renderModelTemplate(agentId);
+  const template = existingFile?.content ?? starter;
+  const isNewFile = !existingFile || existingFile.content === starter;
 
   const tempDir = await mkdtemp(join(tmpdir(), "omp-set-model-"));
   const tempPath = join(tempDir, `${agentId}.yml`);
@@ -173,7 +174,7 @@ async function runWizard(
   configPath: string,
 ): Promise<number> {
   const existingFile = await readOptionalTextFile(configPath, "model config");
-  const existing = existingFile ? parseModelConfig(existingFile.content, configPath) : undefined;
+  const existing = parseExistingModel(existingFile?.content, agentId, configPath);
   const hasExisting = existing !== undefined;
   const rl = createInterface({ input: context.io.stdin, output: context.io.stdout });
   try {
@@ -248,6 +249,15 @@ async function runWizard(
     rl.close();
   }
 }
+function parseExistingModel(
+  source: string | undefined,
+  agentId: string,
+  configPath: string,
+): ModelConfig | undefined {
+  if (source === undefined || source === renderModelTemplate(agentId)) return undefined;
+  return parseModelConfig(source, configPath);
+}
+
 
 /** Mute a Writable's write method until restore() is called. */
 function muteWritable(target: Writable): { restore: () => void } {
@@ -264,7 +274,7 @@ async function runDirectFlags(
   configPath: string,
 ): Promise<number> {
   const existingFile = await readOptionalTextFile(configPath, "model config");
-  const existing = existingFile ? parseModelConfig(existingFile.content, configPath) : undefined;
+  const existing = parseExistingModel(existingFile?.content, agentId, configPath);
   const isCreating = !existing;
 
   const baseUrl = optionString(args, "base-url") ?? existing?.baseUrl;

@@ -59,7 +59,7 @@ export const MODEL_FIELDS: readonly ModelField[] = [
     key: "model",
     flag: "model",
     label: "Model name",
-    description: "Provider model identifier, e.g. gpt-5.4 or claude-sonnet-5. Use ${ENV_VAR} for templated values.",
+    description: "Literal provider model identifier, e.g. gpt-5.4 or claude-sonnet-5.",
     required: true,
   },
   {
@@ -120,7 +120,7 @@ export function renderModelTemplate(agentId: string, existing?: ModelConfig): st
   const lines: string[] = [
     `# Model configuration for agent '${agentId}'.`,
     `# Edit directly or regenerate with: omp-bundler set-model`,
-    `# Accept literal values or \${ENV_VAR} templates for baseUrl, model, and apiKey.`,
+    `# Accept literal values or \${ENV_VAR} templates for baseUrl and apiKey.`,
     `# An empty quoted apiKey ("") means no authentication.`,
     "",
   ];
@@ -186,7 +186,7 @@ export function parseModelConfig(source: string, contextLabel: string): ModelCon
 
   const model = record.model;
   if (typeof model !== "string" || !model.trim()) throw new Error(`${contextLabel}: model must be a non-empty string`);
-  if (placeholderShape(model) === undefined) throw new Error(`${contextLabel}: model contains a malformed environment placeholder`);
+  if (model.includes("${")) throw new Error(`${contextLabel}: model must be a literal model ID, not an environment template`);
 
   const apiKey = record.apiKey;
   if (apiKey === undefined || apiKey === null) return { version: 1, baseUrl, dialect, model, apiKey: "" };
@@ -266,8 +266,7 @@ function placeholderNames(value: string, contextLabel: string): readonly string[
 
 /**
  * Derive the model-connection environment variable names referenced by a
- * single agent's parsed config (baseUrl, model, apiKey), sorted and de-duped.
- * Shares the placeholder grammar used by {@link loadBundleModels}.
+ * single agent's parsed config (baseUrl and apiKey), sorted and de-duped.
  */
 export function modelConfigEnvNames(config: ModelConfig, contextLabel: string): readonly string[] {
   return [...new Set([

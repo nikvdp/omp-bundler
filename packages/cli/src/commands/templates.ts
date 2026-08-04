@@ -1,3 +1,4 @@
+import { renderModelTemplate } from "../model-config.ts";
 import type { PlannedWrite } from "../types.ts";
 
 export const AGENT_SURFACE_DIRECTORIES = [
@@ -52,6 +53,7 @@ export function bundleFiles(bundleName: string, agentId: string): readonly Plann
     { path: "README.md", content: bundleReadme(bundleName, agentId) },
     { path: "omp-bundler.yml", content: bundleConfig(bundleName, agentId) },
     { path: "runtime.env.example", content: RUNTIME_ENV_EXAMPLE },
+    { path: "model.yml", content: renderModelTemplate(agentId) },
   ];
 }
 
