@@ -1586,6 +1586,85 @@ writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
   }
 });
 
+test("agent parent prints its available subcommands", async () => {
+  const help = await invoke(agentCommand, process.cwd(), []);
+  assert.equal(help.result, 0);
+  assert.match(help.stdout, /agent rename <old-agent-id> <new-agent-id>/);
+  assert.equal(help.stderr, "");
+});
+
+test("set-model imports an exact OMP model and credential without exposing the token", async () => {
+  await withTempDirectory(async (parent) => {
+    const stateDir = join(parent, "omp-state");
+    await writeText(join(stateDir, "models.yml"), [
+      "providers:",
+      "  deepseek:",
+      "    baseUrl: https://api.deepseek.com",
+      "    api: openai-completions",
+      "    apiKey: ignored-source-value",
+      "    models:",
+      "      - id: deepseek-v4-flash",
+      "        name: DeepSeek V4 Flash",
+      "",
+    ].join("\n"));
+    const importedSecret = "deepseek-import-secret";
+    const omp = join(parent, "omp");
+    await writeFile(omp, `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "models") {
+  console.log(JSON.stringify({ models: [{ provider: "deepseek", id: "deepseek-v4-flash", selector: "deepseek/deepseek-v4-flash" }] }));
+} else if (args[0] === "config") {
+  console.log(${JSON.stringify(stateDir)});
+} else if (args[0] === "token") {
+  console.log(${JSON.stringify(importedSecret)});
+} else {
+  process.exit(2);
+}
+`, { mode: 0o755 });
+
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    await writeText(join(bundle, "agents", "alpha", "config.yml"), "setupVersion: 1\nmodelRoles:\n  default: legacy/provider\n");
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      const imported = await invoke(setModelCommand, bundle, [], { model: "deepseek/deepseek-v4-flash" });
+      assert.equal(imported.result, 0);
+      assert.match(imported.stdout, /imported deepseek\/deepseek-v4-flash from OMP/);
+      assert.doesNotMatch(`${imported.stdout}\n${imported.stderr}`, new RegExp(importedSecret));
+      assert.deepEqual(parseYaml(await readFile(join(bundle, "models", "alpha.yml"), "utf8")), {
+        version: 1,
+        baseUrl: "https://api.deepseek.com",
+        dialect: "openai-completions",
+        model: "deepseek-v4-flash",
+        apiKey: "${OMP_MODEL_ALPHA_API_KEY}",
+      });
+      const example = await readFile(join(bundle, "runtime.env.example"), "utf8");
+      assert.match(example, /OMP_MODEL_ALPHA_API_KEY=/);
+      assert.doesNotMatch(example, new RegExp(importedSecret));
+      const runtimePath = join(bundle, "runtime.env");
+      const runtime = await readFile(runtimePath, "utf8");
+      assert.match(runtime, new RegExp(`OMP_MODEL_ALPHA_API_KEY=${importedSecret}`));
+      assert.equal(runtime.split("OMP_MODEL_ALPHA_API_KEY=").length - 1, 1);
+      assert.equal((await lstat(runtimePath)).mode & 0o777, 0o600);
+      assert.doesNotMatch(await readFile(join(bundle, "agents", "alpha", "config.yml"), "utf8"), /modelRoles/);
+
+      const explicit = await invoke(setModelCommand, bundle, [], {
+        from: "omp",
+        model: "deepseek/deepseek-v4-flash",
+      });
+      assert.equal(explicit.result, 0);
+      assert.doesNotMatch(`${explicit.stdout}\n${explicit.stderr}`, new RegExp(importedSecret));
+      assert.equal((await readFile(runtimePath, "utf8")).split("OMP_MODEL_ALPHA_API_KEY=").length - 1, 1);
+      const checked = await invoke(checkCommand, bundle, []);
+      assert.equal(checked.result, 0, `${checked.stdout}\n${checked.stderr}`);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+});
+
 test("set-model help and agent inference cover zero, single, and multiple agents", async () => {
   const help = await invoke(setModelCommand, process.cwd(), [], { help: true });
   assert.equal(help.result, 0);
