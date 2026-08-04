@@ -104,13 +104,60 @@ test("HTTP adapter returns a completed core turn without Pumble", async (t) => {
         eventId: "event-1",
         conversationKey: inbound.body.conversationKey,
         correlationId,
-        sequence: 1,
+        sequence: 4,
         occurredAt: new Date().toISOString(),
         text: "Meeting summarized.",
         attachments: [],
         usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
       };
       const eventBody = JSON.stringify(event);
+
+      const delta = {
+        version: "v1",
+        type: "turn.delta",
+        eventId: "delta-1",
+        conversationKey: inbound.body.conversationKey,
+        correlationId,
+        sequence: 2,
+        occurredAt: new Date().toISOString(),
+        text: "Meeting ",
+      };
+      const deltaBody = JSON.stringify(delta);
+      const deltaCallback = await fetch(`${adapterBaseUrl}/core/events/meetings-agent`, {
+        method: "POST",
+        headers: signedEventHeaders(deltaBody, delta.type),
+        body: deltaBody,
+      });
+      assert.equal(deltaCallback.status, 200);
+      assert.deepEqual(await deltaCallback.json(), { status: "ok" });
+
+      const duplicateDelta = await fetch(`${adapterBaseUrl}/core/events/meetings-agent`, {
+        method: "POST",
+        headers: signedEventHeaders(deltaBody, delta.type),
+        body: deltaBody,
+      });
+      assert.equal(duplicateDelta.status, 200);
+      assert.deepEqual(await duplicateDelta.json(), { status: "duplicate" });
+
+      const emptyDeltaBody = JSON.stringify({ ...delta, eventId: "delta-empty", text: "" });
+      const emptyDelta = await fetch(`${adapterBaseUrl}/core/events/meetings-agent`, {
+        method: "POST",
+        headers: signedEventHeaders(emptyDeltaBody, delta.type),
+        body: emptyDeltaBody,
+      });
+      assert.equal(emptyDelta.status, 400);
+
+      const nonStringDeltaBody = JSON.stringify({
+        ...delta,
+        eventId: "delta-number",
+        text: 42,
+      });
+      const nonStringDelta = await fetch(`${adapterBaseUrl}/core/events/meetings-agent`, {
+        method: "POST",
+        headers: signedEventHeaders(nonStringDeltaBody, delta.type),
+        body: nonStringDeltaBody,
+      });
+      assert.equal(nonStringDelta.status, 400);
 
       // Deliberately deliver the terminal callback before acceptance to prove
       // the synchronous facade cannot lose a fast core response.

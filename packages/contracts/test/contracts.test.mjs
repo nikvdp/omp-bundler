@@ -70,3 +70,17 @@ test("outbound validates terminal replies and rejects unsafe shape drift", () =>
   assert.equal(outbound({ ...reply, occurredAt: "2026-07-29T09:00:00+08:00" }), false);
   assert.equal(outbound({ ...reply, platformMessageId: "pumble-1" }), false);
 });
+
+test("outbound validates exact non-empty turn.delta chunks", () => {
+  const delta = {
+    ...envelope,
+    type: "turn.delta",
+    sequence: 3,
+    text: "next",
+  };
+
+  assert.equal(outbound(delta), true, JSON.stringify(outbound.errors));
+  assert.equal(outbound({ ...delta, text: " " }), true, JSON.stringify(outbound.errors));
+  assert.equal(outbound({ ...delta, text: "" }), false);
+  assert.equal(outbound({ ...delta, text: 42 }), false);
+});
