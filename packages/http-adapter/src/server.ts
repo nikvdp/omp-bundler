@@ -22,8 +22,17 @@ const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_CONVERSATION_KEY_LENGTH = 512;
 const RECENT_EVENT_LIMIT = 1_000;
+const EARLY_EVENT_LIMIT = 256;
+const EARLY_EVENT_BYTES = 256 * 1024;
+const STREAM_QUEUE_LIMIT = 256;
+const STREAM_QUEUE_BYTES = 256 * 1024;
+const STREAM_HEARTBEAT_MS = 15_000;
 
 type TerminalEvent = TurnReplyEvent | TurnErrorEvent;
+type BufferedEvent = Extract<
+  OutboundEvent,
+  { type: "turn.delta" | "turn.progress" }
+>;
 
 export interface HttpAgentRegistration {
   agentId: string;
@@ -41,17 +50,140 @@ export interface HttpAdapterConfig {
   agents: readonly HttpAgentRegistration[];
 }
 
-interface PendingTurn {
+interface ActiveTurn {
   conversationKey: string;
   resolve: (event: TerminalEvent) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
-  onClose: () => void;
+  lastSequence: number;
+  stream?: SseResponse;
 }
 
-interface BufferedTerminal {
-  event: TerminalEvent;
-  timer: NodeJS.Timeout;
+interface TurnTracker {
+  correlationId: string;
+  conversationKey: string;
+  buffered: BufferedEvent[];
+  bufferedBytes: number;
+  terminal?: TerminalEvent;
+  expiryTimer?: NodeJS.Timeout;
+  active?: ActiveTurn;
+}
+
+class SseResponse {
+  private readonly queue: string[] = [];
+  private queuedBytes = 0;
+  private blocked = false;
+  private closed = false;
+  private heartbeat?: NodeJS.Timeout;
+
+  constructor(
+    private readonly res: http.ServerResponse,
+    private readonly onDetach: () => void,
+  ) {}
+
+  start(correlationId: string): void {
+    if (this.res.destroyed) {
+      this.detach(false);
+      return;
+    }
+    this.res.writeHead(200, {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-store",
+      connection: "keep-alive",
+    });
+    this.res.flushHeaders();
+    this.res.once("close", this.handleClose);
+    this.heartbeat = setInterval(() => {
+      this.push(": heartbeat\n\n");
+    }, STREAM_HEARTBEAT_MS);
+    this.heartbeat.unref();
+    this.push(formatSse("accepted", { correlationId }));
+  }
+
+  push(frame: string): void {
+    if (this.closed) return;
+    if (!this.blocked) {
+      try {
+        if (!this.res.write(frame)) {
+          this.blocked = true;
+          this.res.once("drain", this.handleDrain);
+        }
+      } catch {
+        this.detach(true);
+      }
+      return;
+    }
+
+    const bytes = Buffer.byteLength(frame);
+    if (
+      this.queue.length >= STREAM_QUEUE_LIMIT ||
+      this.queuedBytes + bytes > STREAM_QUEUE_BYTES
+    ) {
+      this.detach(true);
+      return;
+    }
+    this.queue.push(frame);
+    this.queuedBytes += bytes;
+  }
+
+  finish(frame: string): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearResources();
+    const queuedFrames = this.queue.splice(0);
+    this.queuedBytes = 0;
+    try {
+      for (const queued of queuedFrames) this.res.write(queued);
+      this.res.end(frame);
+    } catch {
+      if (!this.res.destroyed) this.res.destroy();
+    }
+    this.onDetach();
+  }
+
+  destroy(): void {
+    this.detach(true);
+  }
+
+  private readonly handleClose = (): void => {
+    this.detach(false);
+  };
+
+  private readonly handleDrain = (): void => {
+    if (this.closed) return;
+    this.blocked = false;
+    while (this.queue.length > 0) {
+      const frame = this.queue.shift()!;
+      this.queuedBytes -= Buffer.byteLength(frame);
+      try {
+        if (!this.res.write(frame)) {
+          this.blocked = true;
+          this.res.once("drain", this.handleDrain);
+          return;
+        }
+      } catch {
+        this.detach(true);
+        return;
+      }
+    }
+  };
+
+  private detach(destroy: boolean): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.clearResources();
+    this.queue.length = 0;
+    this.queuedBytes = 0;
+    if (destroy && !this.res.destroyed) this.res.destroy();
+    this.onDetach();
+  }
+
+  private clearResources(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    this.res.off("drain", this.handleDrain);
+    this.res.off("close", this.handleClose);
+  }
 }
 
 class PublicError extends Error {
@@ -69,11 +201,11 @@ export class HttpAgentAdapter {
   readonly config: HttpAdapterConfig;
   private readonly agents = new Map<string, HttpAgentRegistration>();
   private readonly inFlightConversations = new Set<string>();
-  private readonly pendingTurns = new Map<string, PendingTurn>();
-  private readonly bufferedTerminals = new Map<string, BufferedTerminal>();
+  private readonly trackers = new Map<string, TurnTracker>();
   private readonly recentEventIds = new Set<string>();
   private readonly recentEventOrder: string[] = [];
   private closePromise: Promise<void> | null = null;
+  private closing = false;
 
   constructor(config: HttpAdapterConfig) {
     this.config = config;
@@ -96,13 +228,19 @@ export class HttpAgentAdapter {
 
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    for (const pending of [...this.pendingTurns.values()]) {
-      pending.reject(new PublicError(503, "HTTP adapter is shutting down"));
+    this.closing = true;
+    const shutdownError = new PublicError(503, "HTTP adapter is shutting down");
+    for (const tracker of [...this.trackers.values()]) {
+      if (tracker.active) {
+        this.failTurn(tracker, shutdownError, true);
+      } else {
+        clearTimeout(tracker.expiryTimer);
+      }
     }
-    for (const buffered of this.bufferedTerminals.values()) {
-      clearTimeout(buffered.timer);
-    }
-    this.bufferedTerminals.clear();
+    this.trackers.clear();
+    this.inFlightConversations.clear();
+    this.recentEventIds.clear();
+    this.recentEventOrder.length = 0;
     if (!this.server.listening) return Promise.resolve();
     this.closePromise = new Promise<void>((resolveClose, rejectClose) => {
       this.server.close((error) => (error ? rejectClose(error) : resolveClose()));
@@ -189,6 +327,7 @@ export class HttpAgentAdapter {
       return;
     }
     this.inFlightConversations.add(conversation);
+    const streamRequested = acceptsEventStream(headerValue(req.headers.accept));
 
     try {
       const startedAt = Date.now();
@@ -197,17 +336,22 @@ export class HttpAgentAdapter {
         route.conversationKey,
         message,
       );
+      if (this.closing) {
+        throw new PublicError(503, "HTTP adapter is shutting down");
+      }
       const remainingMs = Math.max(
         1,
         this.config.turnTimeoutMs - (Date.now() - startedAt),
       );
-      const terminal = await this.awaitTerminal(
+      const terminal = await this.beginTurn(
         correlationId,
         route.conversationKey,
         remainingMs,
+        streamRequested,
         res,
       );
 
+      if (streamRequested) return;
       if (terminal.type === "turn.error") {
         sendJson(res, 502, {
           agentId: route.agentId,
@@ -231,7 +375,7 @@ export class HttpAgentAdapter {
         usage: terminal.usage,
       });
     } catch (error) {
-      if (res.destroyed) return;
+      if (res.destroyed || res.headersSent) return;
       const status = error instanceof PublicError ? error.status : 502;
       sendJson(res, status, {
         error: error instanceof Error ? error.message : String(error),
@@ -296,60 +440,67 @@ export class HttpAgentAdapter {
     return accepted.correlationId;
   }
 
-  private awaitTerminal(
+  private beginTurn(
     correlationId: string,
     conversationKey: string,
     timeoutMs: number,
+    streamRequested: boolean,
     res: http.ServerResponse,
   ): Promise<TerminalEvent> {
-    const buffered = this.bufferedTerminals.get(correlationId);
-    if (buffered) {
-      clearTimeout(buffered.timer);
-      this.bufferedTerminals.delete(correlationId);
-      if (buffered.event.conversationKey !== conversationKey) {
-        throw new PublicError(502, "core returned a mismatched conversation");
-      }
-      return Promise.resolve(buffered.event);
+    let tracker = this.trackers.get(correlationId);
+    if (!tracker) {
+      tracker = {
+        correlationId,
+        conversationKey,
+        buffered: [],
+        bufferedBytes: 0,
+      };
+      this.trackers.set(correlationId, tracker);
     }
+    if (tracker.active) {
+      throw new PublicError(502, "core reused an active correlation");
+    }
+    clearTimeout(tracker.expiryTimer);
+    tracker.expiryTimer = undefined;
 
-    return new Promise<TerminalEvent>((resolveTurn, rejectTurn) => {
-      const cleanup = () => {
-        const pending = this.pendingTurns.get(correlationId);
-        if (pending?.onClose === onClose) this.pendingTurns.delete(correlationId);
-        clearTimeout(timer);
-        res.off("close", onClose);
-      };
-      const resolvePending = (event: TerminalEvent) => {
-        cleanup();
-        if (event.conversationKey !== conversationKey) {
-          rejectTurn(new PublicError(502, "core returned a mismatched conversation"));
-        } else {
-          resolveTurn(event);
-        }
-      };
-      const rejectPending = (error: Error) => {
-        cleanup();
-        rejectTurn(error);
-      };
-      const onClose = () => {
-        if (!res.writableEnded) {
-          rejectPending(new PublicError(499, "client disconnected"));
-        }
-      };
+    let active!: ActiveTurn;
+    const completion = new Promise<TerminalEvent>((resolveTurn, rejectTurn) => {
       const timer = setTimeout(
-        () => rejectPending(new PublicError(504, "agent turn timed out")),
+        () => this.failTurn(tracker!, new PublicError(504, "agent turn timed out")),
         timeoutMs,
       );
       timer.unref();
-      this.pendingTurns.set(correlationId, {
+      active = {
         conversationKey,
-        resolve: resolvePending,
-        reject: rejectPending,
+        resolve: resolveTurn,
+        reject: rejectTurn,
         timer,
-        onClose,
-      });
-      res.once("close", onClose);
+        lastSequence: 0,
+      };
+      tracker!.active = active;
     });
+
+    if (streamRequested && !res.destroyed) {
+      const stream = new SseResponse(res, () => {
+        if (tracker?.active === active && active.stream === stream) {
+          active.stream = undefined;
+        }
+      });
+      active.stream = stream;
+      stream.start(correlationId);
+    }
+
+    const replay: OutboundEvent[] = [...tracker.buffered];
+    if (tracker.terminal) replay.push(tracker.terminal);
+    replay.sort((left, right) => left.sequence - right.sequence);
+    tracker.buffered = [];
+    tracker.bufferedBytes = 0;
+    tracker.terminal = undefined;
+    for (const event of replay) {
+      if (!tracker.active) break;
+      this.deliverEvent(tracker, event);
+    }
+    return completion;
   }
 
   private async handleCoreEvent(
@@ -392,26 +543,129 @@ export class HttpAgentAdapter {
       return;
     }
 
-    if (event.type === "turn.reply" || event.type === "turn.error") {
-      const pending = this.pendingTurns.get(event.correlationId);
-      if (pending) {
-        pending.resolve(event);
-      } else {
-        this.bufferTerminal(event);
-      }
-    }
+    this.acceptEvent(event, rawBody.byteLength);
     this.rememberEvent(event.eventId);
     sendJson(res, 200, { status: "ok" });
   }
 
-  private bufferTerminal(event: TerminalEvent): void {
-    const existing = this.bufferedTerminals.get(event.correlationId);
-    if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => {
-      this.bufferedTerminals.delete(event.correlationId);
+  private acceptEvent(event: OutboundEvent, bytes: number): void {
+    const tracker = this.trackers.get(event.correlationId);
+    if (tracker?.active) {
+      this.deliverEvent(tracker, event);
+      return;
+    }
+    if (
+      event.type !== "turn.delta" &&
+      event.type !== "turn.progress" &&
+      event.type !== "turn.reply" &&
+      event.type !== "turn.error"
+    ) {
+      return;
+    }
+
+    const early = tracker ?? this.createEarlyTracker(event);
+    if (event.type === "turn.reply" || event.type === "turn.error") {
+      if (!early.terminal || event.sequence < early.terminal.sequence) {
+        early.terminal = event;
+      }
+      return;
+    }
+    if (
+      early.buffered.length >= EARLY_EVENT_LIMIT ||
+      early.bufferedBytes + bytes > EARLY_EVENT_BYTES
+    ) {
+      return;
+    }
+    early.buffered.push(event);
+    early.bufferedBytes += bytes;
+  }
+
+  private createEarlyTracker(event: OutboundEvent): TurnTracker {
+    const tracker: TurnTracker = {
+      correlationId: event.correlationId,
+      conversationKey: event.conversationKey,
+      buffered: [],
+      bufferedBytes: 0,
+    };
+    const expiryTimer = setTimeout(() => {
+      if (this.trackers.get(event.correlationId) === tracker && !tracker.active) {
+        this.trackers.delete(event.correlationId);
+      }
     }, this.config.turnTimeoutMs);
-    timer.unref();
-    this.bufferedTerminals.set(event.correlationId, { event, timer });
+    expiryTimer.unref();
+    tracker.expiryTimer = expiryTimer;
+    this.trackers.set(event.correlationId, tracker);
+    return tracker;
+  }
+
+  private deliverEvent(tracker: TurnTracker, event: OutboundEvent): void {
+    const active = tracker.active;
+    if (!active) return;
+    if (event.conversationKey !== active.conversationKey) {
+      this.failTurn(tracker, new PublicError(502, "core returned a mismatched conversation"));
+      return;
+    }
+    if (event.sequence <= active.lastSequence) {
+      if (event.type === "turn.reply" || event.type === "turn.error") {
+        this.completeTurn(tracker, event);
+      }
+      return;
+    }
+    active.lastSequence = event.sequence;
+
+    if (event.type === "turn.delta") {
+      active.stream?.push(formatSse("delta", event, event.sequence));
+    } else if (event.type === "turn.progress") {
+      active.stream?.push(formatSse("progress", event, event.sequence));
+    } else if (event.type === "turn.reply" || event.type === "turn.error") {
+      this.completeTurn(tracker, event);
+    }
+  }
+
+  private completeTurn(tracker: TurnTracker, event: TerminalEvent): void {
+    const active = tracker.active;
+    if (!active) return;
+    clearTimeout(active.timer);
+    clearTimeout(tracker.expiryTimer);
+    tracker.active = undefined;
+    tracker.buffered = [];
+    tracker.bufferedBytes = 0;
+    tracker.terminal = undefined;
+    if (this.trackers.get(tracker.correlationId) === tracker) {
+      this.trackers.delete(tracker.correlationId);
+    }
+    const stream = active.stream;
+    active.stream = undefined;
+    stream?.finish(
+      formatSse(event.type === "turn.reply" ? "completed" : "error", event, event.sequence),
+    );
+    active.resolve(event);
+  }
+
+  private failTurn(
+    tracker: TurnTracker,
+    error: Error,
+    destroyStream = false,
+  ): void {
+    const active = tracker.active;
+    if (!active) return;
+    clearTimeout(active.timer);
+    clearTimeout(tracker.expiryTimer);
+    tracker.active = undefined;
+    tracker.buffered = [];
+    tracker.bufferedBytes = 0;
+    tracker.terminal = undefined;
+    if (this.trackers.get(tracker.correlationId) === tracker) {
+      this.trackers.delete(tracker.correlationId);
+    }
+    const stream = active.stream;
+    active.stream = undefined;
+    if (destroyStream) {
+      stream?.destroy();
+    } else {
+      stream?.finish(formatSse("error", { error: error.message }));
+    }
+    active.reject(error);
   }
 
   private rememberEvent(eventId: string): void {
@@ -672,7 +926,7 @@ function sendJson(
   status: number,
   body: Record<string, unknown>,
 ): void {
-  if (res.writableEnded || res.destroyed) return;
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -688,6 +942,22 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 
 function isJsonContentType(value: string | undefined): boolean {
   return value?.split(";", 1)[0].trim().toLowerCase() === "application/json";
+}
+
+function acceptsEventStream(value: string | undefined): boolean {
+  return value?.split(",").some((entry) => {
+    const [mediaType, ...parameters] = entry.split(";").map((part) => part.trim());
+    if (mediaType.toLowerCase() !== "text/event-stream") return false;
+    const quality = parameters.find((parameter) => /^q=/i.test(parameter));
+    if (!quality) return true;
+    const parsed = Number(quality.slice(2));
+    return Number.isFinite(parsed) && parsed > 0;
+  }) ?? false;
+}
+
+function formatSse(event: string, data: unknown, id?: number): string {
+  const idLine = id === undefined ? "" : `id: ${id}\n`;
+  return `${idLine}event: ${event}\ndata: ${JSON.stringify(data) ?? "null"}\n\n`;
 }
 
 function decodePart(value: string): string | null {
