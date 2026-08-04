@@ -6,12 +6,10 @@ import type { Writable } from "node:stream";
 import { optionString } from "../args.ts";
 import { parseYaml, YamlError } from "../config.ts";
 import { applyFilePlan, createFilePlan } from "../file-plan.ts";
-import { assertSafeIdentifier } from "../identifiers.ts";
 import { executeChild } from "../process.ts";
 import { importOmpModel } from "../omp-model-import.ts";
-import { discoverAgents, loadProject, resolveAgentPath } from "../project.ts";
+import { loadProject } from "../project.ts";
 import type { CommandContext, CommandHandler, ParsedArguments, PlannedWrite, ProjectContext, YamlValue } from "../types.ts";
-import { assertNoLegacyOmpSource } from "./common.ts";
 import { assertNoSymlinkComponents, readOptionalTextFile, relativePlanPath } from "./support.ts";
 import {
   MODEL_FIELDS,
@@ -36,15 +34,15 @@ export const SET_MODEL_HELP = buildHelp();
 function buildHelp(): string {
   const usageFlags = CLI_FIELDS.map((field) => `[--${field.flag} <value>]`).join(" ");
   const lines = [
-    "omp-bundler set-model [agent-id]",
-    "omp-bundler set-model [agent-id] --wizard",
-    "omp-bundler set-model [agent-id] --model <provider/model> [--from omp]",
-    `omp-bundler set-model [agent-id] ${usageFlags}`,
-    "omp-bundler set-model [agent-id] --print-template",
+    "omp-bundler set-model [provider/model]",
+    "omp-bundler set-model [provider/model] --wizard",
+    "omp-bundler set-model [provider/model] [--from omp]",
+    `omp-bundler set-model ${usageFlags}`,
+    "omp-bundler set-model --print-template",
     "",
     "Import:",
-    "  --model <provider/model>  Resolve an exact selector from the local OMP installation.",
-    "  [--from omp]              Source installation; OMP is the default.",
+    "  [provider/model]  Resolve an exact selector from the local OMP installation.",
+    "  [--from omp]      Source installation; OMP is the default.",
     "",
     "Fields for manual configuration:",
     ...CLI_FIELDS.map((field) => `  [--${field.flag} <value>]  ${field.description}${field.required ? " (required when creating)" : ""}`),
@@ -63,13 +61,19 @@ export const setModelCommand: CommandHandler = async (args, context) => {
   if (fromPresent && typeof args.options.from !== "string") {
     throw new Error("--from requires a source name");
   }
-  const modelSelector = optionString(args, "model");
+  if (args.positionals.length > 1) throw new Error("usage: omp-bundler set-model [provider/model]");
+  const positionalSelector = args.positionals[0];
+  const modelFlag = optionString(args, "model");
+  if (positionalSelector !== undefined && modelFlag !== undefined) {
+    throw new Error("provider/model positional cannot be combined with --model");
+  }
   const otherDirectFlags = DIRECT_FLAGS.filter((flag) => flag !== "model");
   const hasOtherDirectFlags = otherDirectFlags.some((flag) => args.options[flag] !== undefined);
-  const importMode = fromPresent || (modelSelector?.includes("/") === true && !hasOtherDirectFlags);
+  const modelSelector = positionalSelector ?? (modelFlag?.includes("/") && !hasOtherDirectFlags ? modelFlag : undefined);
+  const importMode = fromPresent || modelSelector !== undefined;
   const directMode = DIRECT_FLAGS.some((flag) => args.options[flag] !== undefined) && !importMode;
   if (importMode && hasOtherDirectFlags) {
-    throw new Error("--from/OMP model import cannot be combined with manual connection flags");
+    throw new Error("model import cannot be combined with manual connection flags");
   }
   const modes = [
     args.options.wizard === true,
@@ -78,16 +82,14 @@ export const setModelCommand: CommandHandler = async (args, context) => {
     directMode,
   ].filter(Boolean);
   if (modes.length > 1) {
-    throw new Error("--wizard, --print-template, OMP import, and direct flags are mutually exclusive; use one mode at a time");
+    throw new Error("--wizard, --print-template, model import, and direct flags are mutually exclusive; use one mode at a time");
   }
 
   const project = await loadProject(undefined, context.cwd);
-  await assertNoSymlinkComponents(project.rootDir, project.agentsDir, "agents directory");
+  await assertNoSymlinkComponents(project.rootDir, project.agent.path, "agent source");
 
-  const agentId = await resolveAgentId(args, project);
-  await assertAgentExists(project, agentId);
-
-  const configPath = modelConfigPath(project, agentId);
+  const agentId = project.agent.id;
+  const configPath = modelConfigPath(project);
 
   if (args.options["print-template"] === true) {
     const existingFile = await readOptionalTextFile(configPath, "model config");
@@ -103,7 +105,7 @@ export const setModelCommand: CommandHandler = async (args, context) => {
   if (importMode) {
     const source = optionString(args, "from") ?? "omp";
     if (source !== "omp") throw new Error(`unsupported model source '${source}'; available sources: omp`);
-    if (!modelSelector) throw new Error("--model <provider/model> is required for OMP import");
+    if (!modelSelector) throw new Error("provider/model is required for OMP import");
     const existingFile = await readOptionalTextFile(configPath, "model config");
     const imported = await importOmpModel(modelSelector, agentId, context.cwd);
     validateConfig(imported.config, configPath);
@@ -128,32 +130,6 @@ export const setModelCommand: CommandHandler = async (args, context) => {
 
   return runEditor(context, project, agentId, configPath);
 };
-
-async function resolveAgentId(args: ParsedArguments, project: ProjectContext): Promise<string> {
-  if (args.positionals.length > 1) {
-    throw new Error("usage: omp-bundler set-model [agent-id]");
-  }
-  if (args.positionals.length === 1) {
-    return assertSafeIdentifier(args.positionals[0], "agent id");
-  }
-  const agents = await discoverAgents(project.agentsDir);
-  if (agents.length === 0) throw new Error("no agents found; create one with 'omp-bundler new'");
-  if (agents.length > 1) {
-    const ids = agents.map((agent) => agent.id).join(", ");
-    throw new Error(`multiple agents found (${ids}); specify the agent id explicitly`);
-  }
-  return agents[0].id;
-}
-
-async function assertAgentExists(project: ProjectContext, agentId: string): Promise<void> {
-  const agentPath = resolveAgentPath(project, agentId);
-  const info = await lstat(agentPath).catch(() => null);
-  if (!info) throw new Error(`agent '${agentId}' does not exist: ${agentPath}`);
-  if (info.isSymbolicLink()) throw new Error(`agent path must not be a symlink: ${agentPath}`);
-  if (!info.isDirectory()) throw new Error(`agent path is not a directory: ${agentPath}`);
-  await assertNoLegacyOmpSource(agentPath, agentId);
-  await assertNoSymlinkComponents(project.agentsDir, agentPath, "agent path");
-}
 
 async function runEditor(
   context: CommandContext,
@@ -369,8 +345,7 @@ async function commitConfig(
     writes.push({ path: relativePlanPath(project.rootDir, configPath), content: yaml, overwrite: true });
   }
 
-  const agentPath = resolveAgentPath(project, agentId);
-  const configYmlPath = join(agentPath, "config.yml");
+  const configYmlPath = join(project.rootDir, "config.yml");
   const configYmlFile = await readOptionalTextFile(configYmlPath, "agent config");
   let legacyRemoved = false;
   if (configYmlFile) {

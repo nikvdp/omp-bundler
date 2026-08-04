@@ -88,8 +88,8 @@ export function resolveDefaultValue(field: ModelField, agentId: string): string 
   return field.default;
 }
 
-export function modelConfigPath(project: ProjectContext, agentId: string): string {
-  return resolveInside(project.rootDir, join("models", `${agentId}.yml`));
+export function modelConfigPath(project: ProjectContext): string {
+  return resolveInside(project.rootDir, "model.yml");
 }
 
 export function defaultApiKeyPlaceholder(agentId: string): string {
@@ -119,7 +119,7 @@ export function renderModelTemplate(agentId: string, existing?: ModelConfig): st
   };
   const lines: string[] = [
     `# Model configuration for agent '${agentId}'.`,
-    `# Edit directly or regenerate with: omp-bundler set-model ${agentId}`,
+    `# Edit directly or regenerate with: omp-bundler set-model`,
     `# Accept literal values or \${ENV_VAR} templates for baseUrl, model, and apiKey.`,
     `# An empty quoted apiKey ("") means no authentication.`,
     "",
@@ -278,40 +278,26 @@ export function modelConfigEnvNames(config: ModelConfig, contextLabel: string): 
 }
 
 export async function loadBundleModels(rootDir: string, agents: readonly AgentDirectory[]): Promise<LoadedModelBundle> {
-  const modelsDir = resolveInside(rootDir, "models");
-  const directory = await lstat(modelsDir).catch(() => null);
-  if (!directory) {
-    if (agents.length === 0) return { connections: [], metadata: [], envNames: [] };
-    throw new Error(`${modelsDir}: model directory is missing`);
+  if (agents.length !== 1) {
+    throw new Error(`${rootDir}: exactly one root agent is required`);
   }
-  if (directory.isSymbolicLink()) throw new Error(`${modelsDir}: model directory must not be a symlink`);
-  if (!directory.isDirectory()) throw new Error(`${modelsDir}: model path must be a directory`);
-
-  const expected = new Set(agents.map((agent) => `${agent.id}.yml`));
-  const entries = await readdir(modelsDir, { withFileTypes: true });
-  for (const entry of entries) {
-    const path = join(modelsDir, entry.name);
-    if (!expected.has(entry.name)) throw new Error(`${path}: unknown model filename; expected one <agent-id>.yml per effective agent`);
-    const info = await lstat(path);
-    if (info.isSymbolicLink()) throw new Error(`${path}: model file must not be a symlink`);
-    if (!info.isFile()) throw new Error(`${path}: model file must be a regular file`);
-  }
-  const connections: ValidatedModelConnection[] = [];
-  const metadata: ModelMetadata[] = [];
-  const envNames = new Set<string>();
-  for (const agent of [...agents].sort((left, right) => left.id.localeCompare(right.id))) {
-    const path = join(modelsDir, `${agent.id}.yml`);
-    const source = await readFile(path, "utf8").catch((error: unknown) => {
-      throw new Error(`${path}: cannot read model file: ${error instanceof Error ? error.message : String(error)}`);
-    });
-    const config = parseModelConfig(source, path);
-    const names = modelConfigEnvNames(config, path);
-    for (const name of names) envNames.add(name);
-    const providerId = providerIdForAgent(agent.id);
-    connections.push({ agentId: agent.id, providerId, config });
-    metadata.push({ agentId: agent.id, dialect: config.dialect, model: config.model, envNames: names });
-  }
-  return { connections, metadata, envNames: [...envNames].sort((left, right) => left.localeCompare(right)) };
+  const agent = agents[0];
+  const path = resolveInside(rootDir, "model.yml");
+  const info = await lstat(path).catch(() => null);
+  if (!info) throw new Error(`${path}: model file is missing`);
+  if (info.isSymbolicLink()) throw new Error(`${path}: model file must not be a symlink`);
+  if (!info.isFile()) throw new Error(`${path}: model path must be a regular file`);
+  const source = await readFile(path, "utf8").catch((error: unknown) => {
+    throw new Error(`${path}: cannot read model file: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  const config = parseModelConfig(source, path);
+  const names = modelConfigEnvNames(config, path);
+  const providerId = providerIdForAgent(agent.id);
+  return {
+    connections: [{ agentId: agent.id, providerId, config }],
+    metadata: [{ agentId: agent.id, dialect: config.dialect, model: config.model, envNames: names }],
+    envNames: names,
+  };
 }
 
 export function renderModelCatalog(connections: readonly ValidatedModelConnection[]): string {

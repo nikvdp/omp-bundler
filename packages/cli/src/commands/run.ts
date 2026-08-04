@@ -13,13 +13,12 @@ import {
 import type { CheckResult } from "./check.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 
-export const RUN_HELP = `omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]
+export const RUN_HELP = `omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]
 
 Validate runtime bindings, then run the configured image in the foreground with
 its ports and named data volume. If the detached service is already running,
 choose whether to follow its logs, replace it with this foreground run, or
-cancel. --env-file defaults to the bundle's runtime.env; --agents selects the
-agent collection used to validate adapter bindings without changing the image.
+cancel. --env-file defaults to the bundle's runtime.env.
 --dry-run prints the Docker command without executing it.`;
 
 const SAFE_IMAGE_TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
@@ -53,7 +52,7 @@ export async function runBundle(
   }
 
   try {
-    assertAllowedOptions(args, ["env-file", "image", "agents", "dry-run"]);
+    assertAllowedOptions(args, ["env-file", "image", "dry-run"]);
   } catch (error) {
     return usageError(context, error instanceof Error ? error.message : String(error));
   }
@@ -94,20 +93,10 @@ export async function runBundle(
     }
   }
 
-  let agentsOverride: string | undefined;
-  if (args.options.agents !== undefined) {
-    try {
-      agentsOverride = requiredOptionString(args, "agents");
-    } catch (error) {
-      return usageError(context, error instanceof Error ? error.message : String(error));
-    }
-  }
-
   const result = await validateBundle({
     cwd: context.cwd,
     ...(args.positionals[0] === undefined ? {} : { bundlePath: args.positionals[0] }),
     envFile,
-    ...(agentsOverride === undefined ? {} : { agentsDirOverride: agentsOverride }),
   });
   if (!result.ok) {
     writeValidationErrors(context, result);
@@ -292,12 +281,9 @@ function printAgentEndpoints(
   const directoryFlag = resolve(context.cwd) === result.project.rootDir
     ? ""
     : ` --dir ${shellQuote(result.project.rootDir)}`;
-  for (const agent of result.agents) {
-    const base = `http://localhost:${settings.adapterPort}/v1/agents/${agent.id}`;
-    const idFlag = result.agents.length === 1 ? "" : ` --id ${shellQuote(agent.id)}`;
-    context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
-    context.io.stdout.write(`TUI: omp-bundler tui${directoryFlag}${idFlag}\n`);
-  }
+  const base = `http://localhost:${settings.adapterPort}/v1/agents/${result.agent.id}`;
+  context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
+  context.io.stdout.write(`TUI: omp-bundler tui${directoryFlag}\n`);
 }
 
 function isSafeImageTag(tag: string): boolean {

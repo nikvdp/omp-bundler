@@ -14,7 +14,7 @@ import {
 import type { CheckResult } from "./check.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 
-export const BUILD_HELP = `omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]
+export const BUILD_HELP = `omp-bundler build [bundle-path] [--tag <image-tag>]
 
 Validate the bundle without runtime configuration, stage the packaged runtime,
 and build its Docker image.`;
@@ -34,7 +34,7 @@ export const buildCommand: CommandHandler = async (
   }
 
   try {
-    assertAllowedOptions(args, ["tag", "agents"]);
+    assertAllowedOptions(args, ["tag"]);
   } catch (error) {
     return usageError(context, error instanceof Error ? error.message : String(error));
   }
@@ -43,12 +43,9 @@ export const buildCommand: CommandHandler = async (
   }
 
   const tagOption = args.options.tag;
-  const agentsOption = args.options.agents;
   let tagOverride: string | undefined;
-  let agentsOverride: string | undefined;
   try {
     if (tagOption !== undefined) tagOverride = requiredOptionString(args, "tag");
-    if (agentsOption !== undefined) agentsOverride = requiredOptionString(args, "agents");
   } catch (error) {
     return usageError(context, error instanceof Error ? error.message : String(error));
   }
@@ -59,7 +56,6 @@ export const buildCommand: CommandHandler = async (
   const validation = await validateBundleForBuild({
     cwd: context.cwd,
     ...(args.positionals[0] === undefined ? {} : { bundlePath: args.positionals[0] }),
-    ...(agentsOverride === undefined ? {} : { agentsDirOverride: agentsOverride }),
   });
   const { result } = validation;
   if (!result.ok) {
@@ -88,9 +84,7 @@ export const buildCommand: CommandHandler = async (
   }
 
   context.io.stdout.write(`Built image: ${tag}\n`);
-  context.io.stdout.write(
-    `Included agents: ${result.agents.length > 0 ? result.agents.map((agent) => agent.id).sort((left, right) => left.localeCompare(right)).join(", ") : "(none)"}\n`,
-  );
+  context.io.stdout.write(`Included agent: ${result.agent.id}\n`);
   return 0;
 };
 

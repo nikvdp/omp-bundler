@@ -39,15 +39,14 @@ export interface ValidationIssue {
 export interface CheckOptions {
   readonly cwd: string;
   readonly bundlePath?: string;
-  readonly agentsDirOverride?: string;
   readonly envFile?: string;
 }
 
 export interface CheckResult {
   readonly ok: boolean;
   readonly project: ProjectContext;
-  readonly agentsDir: string;
-  readonly agents: readonly AgentDirectory[];
+  readonly agent: AgentDirectory;
+  readonly agents: readonly [AgentDirectory];
   readonly models: readonly ModelMetadata[];
   readonly errors: readonly ValidationIssue[];
   readonly warnings: readonly ValidationIssue[];
@@ -61,21 +60,30 @@ export interface BuildValidation {
 }
 
 
-const PROJECT_KEYS: Record<string, true> = { version: true, agentsDir: true, image: true, run: true };
+const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: true, run: true };
+const AGENT_KEYS: Record<string, true> = { id: true };
 const IMAGE_KEYS: Record<string, true> = { tag: true };
 const RUN_KEYS: Record<string, true> = { dataVolume: true, corePort: true, adapterPort: true };
 const OMP_ALLOWED: Record<string, true> = {
   "AGENTS.md": true,
   "config.yml": true,
   "settings.json": true,
-  agents: true,
+  subagents: true,
   commands: true,
   extensions: true,
   skills: true,
   tools: true,
 };
 const OMP_REQUIRED_FILES = ["AGENTS.md", "config.yml"] as const;
-const OMP_REQUIRED_DIRS = ["agents", "commands", "extensions", "skills", "tools"] as const;
+const OMP_REQUIRED_DIRS: readonly string[] = [];
+const PROJECT_SOURCE_FILES: Record<string, true> = {
+  ".gitignore": true,
+  "README.md": true,
+  "omp-bundler.yml": true,
+  "runtime.env": true,
+  "runtime.env.example": true,
+  "model.yml": true,
+};
 const GLOBAL_STATE_NAMES = /^(?:models\.ya?ml(?:\.tmpl)?|sessions?|(?:\.?cache|caches?)(?:[.-].*)?|agent\.db(?:[.-].*)?|runtime(?:[._-].*)?|\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?)$/i;
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
 const SECRET_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/;
@@ -153,7 +161,7 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   if (configStat?.isSymbolicLink()) {
     errors.push(issue(configPath, undefined, "must not be a symlink; keep project configuration in the bundle"));
   } else if (!configStat) {
-    errors.push(issue(configPath, undefined, "is missing; create omp-bundler.yml with version: 1 and agentsDir"));
+    errors.push(issue(configPath, undefined, "is missing; create omp-bundler.yml with version: 1 and agent.id"));
   } else if (!configStat.isFile()) {
     errors.push(issue(configPath, undefined, "must be a regular file"));
   } else {
@@ -165,9 +173,8 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   }
 
   const projectInfo = buildProjectContext(rootDir, configPath, parsedConfig, errors);
-  const effectiveAgentsDir = resolveEffectiveAgentsDir(options, projectInfo.project, rootDir, errors);
-  const agents = await validateAgentCollection(effectiveAgentsDir, errors);
-  for (const agent of agents) await validateAgent(agent, errors);
+  const agents = [projectInfo.project.agent] as [AgentDirectory];
+  await validateAgent(projectInfo.project.agent, errors);
 
   let modelBundle: LoadedModelBundle = { connections: [], metadata: [], envNames: [] };
   try {
@@ -180,20 +187,6 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
       undefined,
       separator >= 0 ? message.slice(separator + 2) : message,
     ));
-  }
-
-  for (const agent of agents) {
-    const agentConfigPath = join(agent.path, "config.yml");
-    const source = await readFile(agentConfigPath, "utf8").catch(() => null);
-    if (source === null) continue;
-    try {
-      const parsed = parseYaml(source);
-      if (isRecord(parsed) && isRecord(parsed.modelRoles) && parsed.modelRoles.default !== undefined) {
-        errors.push(issue(agentConfigPath, "modelRoles.default", "is legacy model ownership; remove it and use models/<agent-id>.yml"));
-      }
-    } catch {
-      // validateAgent already reports malformed config.yml.
-    }
   }
 
   let resolvedEnvFile: string | undefined;
@@ -246,7 +239,7 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
     result: {
       ok: errors.length === 0,
       project: projectInfo.project,
-      agentsDir: effectiveAgentsDir,
+      agent: projectInfo.project.agent,
       agents,
       models: modelBundle.metadata,
       errors,
@@ -300,8 +293,7 @@ export const checkCommand: CommandHandler = async (
   });
   const output = context.io.stdout;
   output.write(`Bundle: ${result.project.rootDir}\n`);
-  output.write(`Agent collection: ${result.agentsDir}\n`);
-  output.write(`Agents: ${result.agents.length > 0 ? result.agents.map((agent) => agent.id).join(", ") : "(none)"}\n`);
+  output.write(`Agent: ${result.agent.id}\n`);
   output.write(`Credential names present: ${result.credentialNames.length > 0 ? result.credentialNames.join(", ") : "(none)"}\n`);
   for (const warning of result.warnings) output.write(`Warning: ${formatIssue(warning)}\n`);
   if (result.errors.length > 0) {
@@ -319,7 +311,11 @@ function buildProjectContext(
   parsed: YamlValue | undefined,
   errors: ValidationIssue[],
 ): { project: ProjectContext; config: RecordValue | undefined } {
-  const fallbackConfig: ProjectConfig = { version: 1, agentsDir: "agents" };
+  const fallbackAgent: AgentDirectory = { id: "invalid", path: rootDir };
+  const fallbackConfig: ProjectConfig = {
+    version: 1,
+    agent: { id: fallbackAgent.id },
+  };
   if (!isRecord(parsed)) {
     if (parsed !== undefined) errors.push(issue(configPath, undefined, "must contain a YAML mapping"));
     return {
@@ -327,23 +323,23 @@ function buildProjectContext(
         rootDir,
         configPath,
         config: fallbackConfig,
-        agentsDir: join(rootDir, "agents"),
+        agent: fallbackAgent,
       },
       config: undefined,
     };
   }
   validateProjectConfig(parsed, configPath, rootDir, errors);
-  const agentsRel = typeof parsed.agentsDir === "string" && parsed.agentsDir.trim()
-    ? parsed.agentsDir
-    : "agents";
-  let agentsDir: string;
-  try {
-    agentsDir = resolveInside(rootDir, agentsRel);
-  } catch {
-    agentsDir = join(rootDir, "agents");
-  }
+  const agentRecord = isRecord(parsed.agent) ? parsed.agent : undefined;
+  const agentId = typeof agentRecord?.id === "string" && agentRecord.id.trim()
+    ? agentRecord.id
+    : fallbackAgent.id;
   return {
-    project: { rootDir, configPath, config: parsed as ProjectConfig, agentsDir },
+    project: {
+      rootDir,
+      configPath,
+      config: parsed as unknown as ProjectConfig,
+      agent: { id: agentId, path: rootDir },
+    },
     config: parsed,
   };
 }
@@ -357,17 +353,15 @@ function validateProjectConfig(
   for (const key of Object.keys(value)) {
     if (!(key in PROJECT_KEYS)) errors.push(issue(path, key, "is not a supported bundle configuration field"));
   }
-  if (value.version !== 1) {
-    errors.push(issue(path, "version", "must be the number 1"));
-  }
-  if (typeof value.agentsDir !== "string" || !value.agentsDir.trim()) {
-    errors.push(issue(path, "agentsDir", "must be a non-empty relative path"));
+  if (value.version !== 1) errors.push(issue(path, "version", "must be the number 1"));
+  if (!isRecord(value.agent)) {
+    errors.push(issue(path, "agent", "must be a mapping with an id"));
   } else {
-    try {
-      assertSafeRelativePath(value.agentsDir, "agentsDir");
-      resolveInside(rootDir, value.agentsDir);
-    } catch {
-      errors.push(issue(path, "agentsDir", "must be a safe relative path inside the bundle"));
+    validateMapping(value.agent, path, "agent", AGENT_KEYS, errors);
+    if (typeof value.agent.id !== "string" || !value.agent.id.trim()) {
+      errors.push(issue(path, "agent.id", "must be a non-empty safe identifier"));
+    } else if (!COMPONENT_ID.test(value.agent.id)) {
+      errors.push(issue(path, "agent.id", "must use 1-64 lowercase letters, numbers, '-' or '_' and start with a letter or number"));
     }
   }
   if (value.image !== undefined) validateMapping(value.image, path, "image", IMAGE_KEYS, errors);
@@ -384,11 +378,7 @@ function validateProjectConfig(
           errors.push(issue(path, `run.${field}`, "must be an integer from 1 through 65535"));
         }
       }
-      if (
-        validPort(value.run.corePort) &&
-        validPort(value.run.adapterPort) &&
-        value.run.corePort === value.run.adapterPort
-      ) {
+      if (validPort(value.run.corePort) && validPort(value.run.adapterPort) && value.run.corePort === value.run.adapterPort) {
         errors.push(issue(path, "run.corePort/run.adapterPort", "must be distinct host ports"));
       }
     }
@@ -416,127 +406,35 @@ function validateMapping(
   }
 }
 
-function resolveEffectiveAgentsDir(
-  options: CheckOptions,
-  project: ProjectContext,
-  rootDir: string,
-  errors: ValidationIssue[],
-): string {
-  if (options.agentsDirOverride === undefined) return project.agentsDir;
-  if (!options.agentsDirOverride.trim()) {
-    errors.push(issue("--agents", undefined, "must be a non-empty agent collection path"));
-    return project.agentsDir;
-  }
-  const resolved = resolveCommandPath(options.agentsDirOverride, options.cwd);
-  if (isAbsolute(options.agentsDirOverride)) return resolved;
-  // Command-line paths intentionally resolve from the shell cwd. They may
-  // point outside the bundle, but lexical traversal in a project config may not.
-  if (resolved === rootDir) {
-    errors.push(issue(options.agentsDirOverride, undefined, "must point to an agent collection, not the bundle root"));
-  }
-  return resolved;
-}
-
-async function validateAgentCollection(
-  agentsDir: string,
-  errors: ValidationIssue[],
-): Promise<AgentDirectory[]> {
-  const collectionInfo = await lstat(agentsDir).catch(() => null);
-  if (!collectionInfo) {
-    errors.push(issue(agentsDir, undefined, "agent collection is missing; create the directory or fix agentsDir"));
-    return [];
-  }
-  if (collectionInfo.isSymbolicLink()) {
-    errors.push(issue(agentsDir, undefined, "agent collection must not be a symlink"));
-    return [];
-  }
-  if (!collectionInfo.isDirectory()) {
-    errors.push(issue(agentsDir, undefined, "agent collection must be a directory"));
-    return [];
-  }
-
-  let names: string[];
-  try {
-    names = await readdir(agentsDir);
-  } catch {
-    errors.push(issue(agentsDir, undefined, "agent collection cannot be read; check permissions"));
-    return [];
-  }
-  const agents: AgentDirectory[] = [];
-  for (const name of names.sort((left, right) => left.localeCompare(right))) {
-    const entryPath = join(agentsDir, name);
-    if (name === ".gitkeep") {
-      const placeholder = await lstat(entryPath).catch(() => null);
-      if (placeholder?.isSymbolicLink()) errors.push(issue(entryPath, undefined, "placeholder must not be a symlink"));
-      else if (placeholder && !placeholder.isFile()) errors.push(issue(entryPath, undefined, "placeholder must be a regular file"));
-      continue;
-    }
-    const info = await lstat(entryPath).catch(() => null);
-    if (!info) {
-      errors.push(issue(entryPath, undefined, "agent entry disappeared while checking; retry the command"));
-      continue;
-    }
-    if (info.isSymbolicLink()) {
-      errors.push(issue(entryPath, undefined, "agent directory must not be a symlink"));
-      continue;
-    }
-    if (!info.isDirectory()) {
-      errors.push(issue(entryPath, undefined, "every direct child of agentsDir must be an agent directory; only .gitkeep may be a file"));
-      continue;
-    }
-    if (!COMPONENT_ID.test(name)) {
-      errors.push(issue(entryPath, "agent id", "must use 1-64 lowercase letters, numbers, '-' or '_' and start with a letter or number"));
-      continue;
-    }
-    const legacyOmpPath = join(entryPath, ".omp");
-    const legacyOmpInfo = await lstat(legacyOmpPath).catch(() => null);
-    if (legacyOmpInfo) {
-      errors.push(issue(legacyOmpPath, undefined, "must not be a nested .omp directory; agent source lives directly in the agent root"));
-      continue;
-    }
-    agents.push({ id: name, path: entryPath });
-  }
-  return agents;
-}
 
 async function validateAgent(
   agent: AgentDirectory,
   errors: ValidationIssue[],
 ): Promise<void> {
-  await scanTree(agent.path, errors);
+  await scanTree(agent.path, errors, true);
   const entries = await readdir(agent.path).catch(() => [] as string[]);
   for (const required of OMP_REQUIRED_FILES) {
     const path = join(agent.path, required);
     const info = await lstat(path).catch(() => null);
     if (!info) {
-      errors.push(issue(path, undefined, "is required in every agent scaffold"));
+      errors.push(issue(path, undefined, "is required in the root agent scaffold"));
     } else if (info.isSymbolicLink()) {
       errors.push(issue(path, undefined, "must not be a symlink"));
     } else if (!info.isFile()) {
       errors.push(issue(path, undefined, "must be a regular file"));
     }
   }
-  for (const required of OMP_REQUIRED_DIRS) {
-    const path = join(agent.path, required);
-    const info = await lstat(path).catch(() => null);
-    if (!info) {
-      errors.push(issue(path, undefined, "is required in every agent scaffold"));
-    } else if (info.isSymbolicLink()) {
-      errors.push(issue(path, undefined, "must not be a symlink"));
-    } else if (!info.isDirectory()) {
-      errors.push(issue(path, undefined, "must be a directory"));
-    }
-  }
   for (const entry of entries) {
+    if (entry in PROJECT_SOURCE_FILES) continue;
     const path = join(agent.path, entry);
     const info = await lstat(path).catch(() => null);
     if (!info) continue;
     if (GLOBAL_STATE_NAMES.test(entry) || /^agent\.db/i.test(entry)) continue;
     if (!(entry in OMP_ALLOWED)) {
-      errors.push(issue(path, undefined, "is not an allowed agent surface; use AGENTS.md, config.yml, settings.json, agents, commands, extensions, skills, or tools"));
+      errors.push(issue(path, undefined, "is not an allowed agent surface; use AGENTS.md, config.yml, settings.json, subagents, commands, extensions, skills, or tools"));
       continue;
     }
-    const expectsDirectory = (OMP_REQUIRED_DIRS as readonly string[]).includes(entry);
+    const expectsDirectory = entry !== "AGENTS.md" && entry !== "config.yml" && entry !== "settings.json";
     if (expectsDirectory && !info.isDirectory()) errors.push(issue(path, undefined, "must be a directory"));
     if (!expectsDirectory && !info.isFile()) errors.push(issue(path, undefined, "must be a regular file"));
   }
@@ -554,9 +452,11 @@ async function validateAgent(
 async function scanTree(
   current: string,
   errors: ValidationIssue[],
+  rootSource = false,
 ): Promise<void> {
   const entries = await readdir(current).catch(() => [] as string[]);
   for (const name of entries) {
+    if (rootSource && name in PROJECT_SOURCE_FILES && name !== "model.yml") continue;
     const path = join(current, name);
     const info = await lstat(path).catch(() => null);
     if (!info) continue;
@@ -583,7 +483,7 @@ async function scanTree(
 }
 
 async function validateComponents(agent: AgentDirectory, errors: ValidationIssue[]): Promise<void> {
-  await validateMarkdownDirectory(join(agent.path, "agents"), "agents", errors);
+  await validateMarkdownDirectory(join(agent.path, "subagents"), "subagents", errors);
   await validateMarkdownDirectory(join(agent.path, "commands"), "commands", errors);
   await validateTypeScriptDirectory(join(agent.path, "extensions"), "extension", errors);
   await validateTypeScriptDirectory(join(agent.path, "tools"), "tool", errors);
@@ -592,7 +492,7 @@ async function validateComponents(agent: AgentDirectory, errors: ValidationIssue
 
 async function validateMarkdownDirectory(
   directory: string,
-  kind: "agents" | "commands",
+  kind: "subagents" | "commands",
   errors: ValidationIssue[],
 ): Promise<void> {
   const info = await lstat(directory).catch(() => null);
@@ -624,7 +524,7 @@ async function validateMarkdownDirectory(
       errors.push(issue(path, undefined, "cannot be read; check permissions"));
       continue;
     }
-    validateFrontmatter(path, source, kind === "agents" ? "subagent" : "command", parsed.id, errors);
+    validateFrontmatter(path, source, kind === "subagents" ? "subagent" : "command", parsed.id, errors);
     scanCredentialAssignments(source, path, errors);
   }
 }
@@ -845,6 +745,9 @@ async function validateJsonFile(path: string, errors: ValidationIssue[]): Promis
 function validateAgentConfig(value: RecordValue, path: string, errors: ValidationIssue[]): void {
   if (value.setupVersion !== 1) errors.push(issue(path, "setupVersion", "must be the number 1"));
   if (value.modelRoles !== undefined) {
+    if (isRecord(value.modelRoles) && value.modelRoles.default !== undefined) {
+      errors.push(issue(path, "modelRoles.default", "is legacy model ownership; use model.yml"));
+    }
     if (!isRecord(value.modelRoles)) {
       errors.push(issue(path, "modelRoles", "must be a mapping of role names to model names"));
     } else {
@@ -1181,6 +1084,9 @@ function validateRuntimeEnv(
     }
   }
 
+  if (env.has("PUMBLE_AGENT_ID")) {
+    errors.push(issue(envPath, "PUMBLE_AGENT_ID", "is unsupported; the project agent.id is registered automatically"));
+  }
   const adapters = env.get("OMP_ADAPTERS");
   if (adapterMode === "http") {
     if (adapters && adapters.value.trim()) {
@@ -1193,7 +1099,6 @@ function validateRuntimeEnv(
     return;
   }
 
-  const pumbleAgent = value("PUMBLE_AGENT_ID");
   for (const required of PUMBLE_REQUIRED) {
     if (!value(required)) errors.push(issue(envPath, required, "is required for bundled Pumble startup; fill runtime.env from the adapter template"));
   }
@@ -1202,16 +1107,7 @@ function validateRuntimeEnv(
     if (adapters.quoted || adapterLineCount !== 1) {
       errors.push(issue(envPath, "OMP_ADAPTERS", "must be one unquoted JSON array on exactly one env-file line"));
     }
-    if (pumbleAgent) errors.push(issue(envPath, "PUMBLE_AGENT_ID", "conflicts with OMP_ADAPTERS; choose one adapter registration mode"));
     validateAdaptersJson(adapters.value, envPath, agents, errors);
-    validateOptionalPumbleValues(env, envPath, errors);
-    return;
-  }
-
-  if (!pumbleAgent) errors.push(issue(envPath, "PUMBLE_AGENT_ID", "is required when OMP_ADAPTERS is unset; fill runtime.env from the adapter template"));
-  if (pumbleAgent && !isSafeIdentifier(pumbleAgent)) errors.push(issue(envPath, "PUMBLE_AGENT_ID", "must be a safe agent id"));
-  if (pumbleAgent && !agents.some((agent) => agent.id === pumbleAgent)) {
-    errors.push(issue(envPath, "PUMBLE_AGENT_ID", `references '${pumbleAgent}', which is not a direct child of the effective agent collection`));
   }
   validateOptionalPumbleValues(env, envPath, errors);
 }

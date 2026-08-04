@@ -72,10 +72,9 @@ export function formatDockerCommand(
 }
 
 /**
- * Stage a fresh context from packaged assets and validated agent source
- * trees. Each agent's visible root is wrapped under agents/<id>/.omp in the
- * context; the root template catalog and staged agent configs bind models.
- * Every source entry is lstat-checked, so no symlink is ever copied.
+ * Stage a fresh context from packaged assets and the single root agent.
+ * Runtime consumes agent/id and agent/.omp; source subagents are translated
+ * to the OMP-native agents directory inside .omp.
  */
 export async function stageDockerContext(
   agents: readonly AgentDirectory[],
@@ -88,40 +87,25 @@ export async function stageDockerContext(
   try {
     const sourceRoot = resolve(sourceAssetsRoot ?? await packagedAssetsRoot());
     for (const assetPath of CANONICAL_ASSET_PATHS) {
-      await copyTreeNoSymlinks(
-        join(sourceRoot, assetPath),
-        join(contextPath, assetPath),
-        true,
-      );
+      await copyTreeNoSymlinks(join(sourceRoot, assetPath), join(contextPath, assetPath), true);
     }
+    if (agents.length !== 1) throw new Error("exactly one root agent is required");
+    const agent = agents[0];
+    assertSafeIdentifier(agent.id, "agent id");
+    const stagedAgent = join(contextPath, "agent");
+    const stagedOmp = join(stagedAgent, ".omp");
+    await mkdir(stagedAgent, { recursive: true });
+    await writeFile(join(stagedAgent, "id"), `${agent.id}\n`, "utf8");
+    await copyAgentSourceNoSymlinks(agent.path, stagedOmp);
+
     if (models !== undefined) {
       await writeFile(join(contextPath, "template", "models.yml.tmpl"), renderModelCatalog(models.connections), "utf8");
-    }
-
-    const stagedAgents = join(contextPath, "agents");
-    await mkdir(stagedAgents, { recursive: true });
-    const ids = new Set<string>();
-    for (const agent of [...agents].sort((left, right) => left.id.localeCompare(right.id))) {
-      assertSafeIdentifier(agent.id, "agent id");
-      if (ids.has(agent.id)) throw new Error(`duplicate agent id: ${agent.id}`);
-      ids.add(agent.id);
-      await copyTreeNoSymlinks(
-        agent.path,
-        join(stagedAgents, agent.id, ".omp"),
-        false,
-      );
-      if (models === undefined) continue;
       const connection = models.connections.find((entry) => entry.agentId === agent.id);
       if (!connection) throw new Error(`missing validated model connection for agent '${agent.id}'`);
       const configPath = join(agent.path, "config.yml");
       const source = await readFile(configPath, "utf8");
-      const stagedConfig = stageAgentModelBinding(
-        source,
-        connection.providerId,
-        connection.config.model,
-        configPath,
-      );
-      await writeFile(join(stagedAgents, agent.id, ".omp", "config.yml"), stagedConfig, "utf8");
+      const stagedConfig = stageAgentModelBinding(source, connection.providerId, connection.config.model, configPath);
+      await writeFile(join(stagedOmp, "config.yml"), stagedConfig, "utf8");
     }
     return contextPath;
   } catch (error) {
@@ -129,6 +113,33 @@ export async function stageDockerContext(
     throw error;
   }
 }
+const ROOT_AGENT_SURFACES: Record<string, true> = {
+  "AGENTS.md": true,
+  "config.yml": true,
+  "settings.json": true,
+  subagents: true,
+  commands: true,
+  extensions: true,
+  skills: true,
+  tools: true,
+};
+
+async function copyAgentSourceNoSymlinks(sourcePath: string, destinationPath: string): Promise<void> {
+  const sourceInfo = await lstat(sourcePath);
+  if (!sourceInfo.isDirectory()) throw new Error(`agent source must be a directory: ${sourcePath}`);
+  await mkdir(destinationPath, { recursive: true });
+  const entries = await readdir(sourcePath, { withFileTypes: true });
+  for (const entry of entries.sort((left: { readonly name: string }, right: { readonly name: string }) => left.name.localeCompare(right.name))) {
+    const sourceEntry = join(sourcePath, entry.name);
+    const entryInfo = await lstat(sourceEntry);
+    if (entryInfo.isSymbolicLink()) throw new Error(`refusing to stage symlink: ${sourceEntry}`);
+    if (entry.name === ".omp") throw new Error(`agent source must not contain a nested .omp directory: ${sourceEntry}`);
+    if (!(entry.name in ROOT_AGENT_SURFACES)) continue;
+    const destinationName = entry.name === "subagents" ? "agents" : entry.name;
+    await copyTreeNoSymlinks(sourceEntry, join(destinationPath, destinationName), false);
+  }
+}
+
 
 export async function removeDockerContext(contextPath: string): Promise<void> {
   await rm(contextPath, { recursive: true, force: true });

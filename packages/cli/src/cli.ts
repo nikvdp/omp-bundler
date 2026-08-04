@@ -33,7 +33,6 @@ Commands:
 
   ${COMMAND_HELP.destroy.replaceAll("\n", "\n  ")}
 
-  ${COMMAND_HELP.agent.replaceAll("\n", "\n  ")}
   ${COMMAND_HELP["set-model"].replaceAll("\n", "\n  ")}
 
   ${COMMAND_HELP.check}
@@ -41,8 +40,6 @@ Commands:
   ${COMMAND_HELP.run}
   ${COMMAND_HELP.service.replaceAll("\n", "\n  ")}
   ${COMMAND_HELP.tui.replaceAll("\n", "\n  ")}
-  ${COMMAND_HELP.migrate}
-
 Options:
   -h, --help       Show help for a command
   -v, --version    Show the installed version`;

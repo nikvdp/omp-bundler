@@ -1,7 +1,7 @@
 import type { PlannedWrite } from "../types.ts";
 
 export const AGENT_SURFACE_DIRECTORIES = [
-  "agents",
+  "subagents",
   "commands",
   "extensions",
   "skills",
@@ -37,7 +37,7 @@ export function runtimeEnvExample(): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** Comment heading that marks a generated per-agent model-connection block. */
+/** Comment heading that marks a generated model-connection block. */
 export function agentModelEnvHeading(agentId: string): string {
   return `# Model connection for ${agentId}. Copy this file to runtime.env and fill these values.`;
 }
@@ -46,11 +46,11 @@ export function agentModelEnvHeading(agentId: string): string {
 export const PUMBLE_ENV_HEADING =
   "# Pumble adapter. Fill these values from the Pumble app dashboard, then run the bundle.";
 
-export function bundleFiles(bundleName: string): readonly PlannedWrite[] {
+export function bundleFiles(bundleName: string, agentId: string): readonly PlannedWrite[] {
   return [
     { path: ".gitignore", content: "runtime.env\n" },
-    { path: "README.md", content: bundleReadme(bundleName) },
-    { path: "omp-bundler.yml", content: bundleConfig(bundleName) },
+    { path: "README.md", content: bundleReadme(bundleName, agentId) },
+    { path: "omp-bundler.yml", content: bundleConfig(bundleName, agentId) },
     { path: "runtime.env.example", content: RUNTIME_ENV_EXAMPLE },
   ];
 }
@@ -63,27 +63,7 @@ export function agentScaffoldFiles(agentId: string): readonly PlannedWrite[] {
     },
     {
       path: "config.yml",
-      content: "setupVersion: 1\n\n# Add agent-local OMP settings here. Shared model selection is inherited.\n# modelRoles:\n#   default: provider/model\n",
-    },
-    {
-      path: "agents/example-subagent.md.example",
-      content: exampleSubagentTemplate(),
-    },
-    {
-      path: "commands/example-command.md.example",
-      content: exampleCommandTemplate(),
-    },
-    {
-      path: "extensions/example-extension.ts.example",
-      content: exampleExtensionTemplate(),
-    },
-    {
-      path: "skills/example-skill/SKILL.md.example",
-      content: exampleSkillTemplate(),
-    },
-    {
-      path: "tools/example-tool.ts.example",
-      content: exampleToolTemplate(),
+      content: "setupVersion: 1\n\n# Add agent-local OMP settings here.\n",
     },
   ];
 }
@@ -119,17 +99,17 @@ export function componentFile(
     };
   }
   return {
-    path: `agents/${name}.md`,
+    path: `subagents/${name}.md`,
     content: subagentTemplate(name),
   };
 }
 
-function bundleReadme(bundleName: string): string {
-  return `# ${bundleName}\n\nThis bundle contains filesystem-configured OMP agents.\n\n## Development loop\n\n1. Generate or edit an agent and its components.\n2. Configure each agent with omp-bundler set-model <agent-id>. The default mode opens an editor; add --wizard for guided prompts.\n3. Copy runtime.env.example to the ignored runtime.env file and fill its generated placeholders.\n4. Run omp-bundler check and omp-bundler build, then use omp-bundler run for the foreground process or omp-bundler service start for a detached container. Check, run, and service start select runtime.env automatically.\n5. Chat with the only agent by running omp-bundler tui, or send a message to the HTTP adapter:\n\n   curl -X POST http://localhost:8765/v1/agents/<agent-id>/conversations/local/messages \\\\\n     -H 'content-type: application/json' \\\\\n     -d '{\"message\":\"Hello\"}'\n\nThe request waits for the completed turn and returns its text, attachments, and usage as JSON. Set OMP_HTTP_API_TOKEN in runtime.env to require a Bearer token. For Pumble, run omp-bundler generate adapter pumble --agent <agent-id> before copying the example.\n\nUse omp-bundler service status, service restart, and service stop to manage the detached bundle container. The committed runtime.env.example contains placeholders only. Keep deployment values in runtime.env.\n`;
+function bundleReadme(bundleName: string, agentId: string): string {
+  return `# ${bundleName}\n\nThis bundle contains one filesystem-configured OMP agent (${agentId}).\n\n## Development loop\n\n1. Generate or edit components under the bundle root.\n2. Configure the agent with omp-bundler set-model. The default mode opens an editor; add --wizard for guided prompts.\n3. Copy runtime.env.example to the ignored runtime.env file and fill its generated placeholders.\n4. Run omp-bundler check and omp-bundler build, then use omp-bundler run for the foreground process or omp-bundler service start for a detached container. Check, run, and service start select runtime.env automatically.\n5. Chat with the agent by running omp-bundler tui, or send a message to the HTTP adapter at http://localhost:8765/v1/agents/${agentId}/conversations/local/messages.\n\nThe committed runtime.env.example contains placeholders only. Keep deployment values in runtime.env.\n`;
 }
 
-function bundleConfig(bundleName: string): string {
-  return `version: 1\nagentsDir: ./agents\n\nimage:\n  tag: ${bundleName}:local\n\nrun:\n  dataVolume: ${bundleName}-data\n  corePort: 8787\n  adapterPort: 8765\n`;
+function bundleConfig(bundleName: string, agentId: string): string {
+  return `version: 1\nagent:\n  id: ${agentId}\n\nimage:\n  tag: ${bundleName}:local\n\nrun:\n  dataVolume: ${bundleName}-data\n  corePort: 8787\n  adapterPort: 8765\n`;
 }
 
 function exampleSkillTemplate(): string {
@@ -241,8 +221,8 @@ export function updateAgentModelEnvBlock(
   return updateManagedEnvBlock(source, agentModelEnvHeading(agentId), assignments);
 }
 
-/** The seven canonical Pumble adapter assignments, in declaration order. */
-const PUMBLE_BLOCK_FIELDS = [...PUMBLE_RUNTIME_FIELDS, "PUMBLE_AGENT_ID"] as const;
+/** Canonical Pumble adapter assignments, in declaration order. */
+const PUMBLE_BLOCK_FIELDS = PUMBLE_RUNTIME_FIELDS;
 const MODEL_ENV_HEADING_RE =
   /^# Model connection for [a-z0-9][a-z0-9_-]{0,63}\. Copy this file to runtime\.env and fill these values\.$/;
 const ENV_ASSIGNMENT_RE = /^\s*[A-Z_][A-Z0-9_]*\s*=/;
@@ -259,34 +239,12 @@ function managedModelBlockLines(lines: readonly string[]): ReadonlySet<number> {
   return protectedLines;
 }
 
-
-/**
- * Switch the runtime to the Pumble adapter and ensure one managed Pumble
- * block bound to `agentId`. Migrates any prior unheaded canonical PUMBLE_*
- * assignments (only the seven known names) into the block, preserving their
- * non-empty values. Rejects a conflicting PUMBLE_AGENT_ID binding. Idempotent.
- */
-export function updatePumbleBlock(source: string, agentId: string): string {
-  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(agentId)) throw new Error(`invalid agent id: ${agentId}`);
+/** Switch to Pumble and maintain a generated block without deployed-agent ids. */
+export function updatePumbleBlock(source: string): string {
   const eol = detectEol(source);
   const lines = source.split(/\r?\n/);
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   const protectedModelLines = managedModelBlockLines(lines);
-
-  // Conflict-check every PUMBLE_AGENT_ID assignment before mutating.
-  for (let index = 0; index < lines.length; index += 1) {
-    if (protectedModelLines.has(index)) continue;
-    const line = lines[index];
-    if (!/^\s*PUMBLE_AGENT_ID\s*=/.test(line)) continue;
-    const value = line.slice(line.indexOf("=") + 1).trim();
-    if (value !== "" && value !== agentId) {
-      throw new Error(
-        `runtime.env.example already binds PUMBLE_AGENT_ID to '${value}'; change or remove that binding explicitly`,
-      );
-    }
-  }
-
-  // Migrate the prior generator's unheaded canonical assignments, first non-empty wins.
   const knownValues = new Map<string, string>();
   for (const field of PUMBLE_BLOCK_FIELDS) {
     for (let index = 0; index < lines.length; index += 1) {
@@ -299,7 +257,6 @@ export function updatePumbleBlock(source: string, agentId: string): string {
     }
   }
 
-  // Remove unheaded canonical PUMBLE_* assignments outside a managed block.
   const blockStart = lines.indexOf(PUMBLE_ENV_HEADING);
   let blockEnd = blockStart;
   if (blockStart >= 0) {
@@ -313,11 +270,7 @@ export function updatePumbleBlock(source: string, agentId: string): string {
   }
   const filtered: string[] = [];
   for (let index = 0; index < lines.length; index += 1) {
-    if (protectedModelLines.has(index)) {
-      filtered.push(lines[index]);
-      continue;
-    }
-    if (index >= blockStart && index < blockEnd) {
+    if (protectedModelLines.has(index) || (index >= blockStart && index < blockEnd)) {
       filtered.push(lines[index]);
       continue;
     }
@@ -329,27 +282,18 @@ export function updatePumbleBlock(source: string, agentId: string): string {
   }
 
   const filteredModelLines = managedModelBlockLines(filtered);
-  // Set every unprotected OMP_BUNDLER_ADAPTER assignment to pumble (add one if absent).
   let adapterFound = false;
   for (let index = 0; index < filtered.length; index += 1) {
     if (filteredModelLines.has(index) || !/^\s*OMP_BUNDLER_ADAPTER\s*=/.test(filtered[index])) continue;
     adapterFound = true;
-    if (filtered[index].slice(filtered[index].indexOf("=") + 1).trim() !== "pumble") {
-      filtered[index] = `${filtered[index].slice(0, filtered[index].indexOf("=") + 1)}pumble`;
-    }
+    filtered[index] = `${filtered[index].slice(0, filtered[index].indexOf("=") + 1)}pumble`;
   }
-  if (!adapterFound) {
-    filtered.unshift("OMP_BUNDLER_ADAPTER=pumble");
-  }
+  if (!adapterFound) filtered.unshift("OMP_BUNDLER_ADAPTER=pumble");
 
-  // Build the managed Pumble block body.
   const block = [
     PUMBLE_ENV_HEADING,
     ...PUMBLE_RUNTIME_FIELDS.map((field) => `${field}=${knownValues.get(field) ?? ""}`),
-    `PUMBLE_AGENT_ID=${agentId}`,
   ];
-
-  // Replace the existing managed block, or append a new one.
   const headingIndex = filtered.indexOf(PUMBLE_ENV_HEADING);
   if (headingIndex >= 0) {
     let existingEnd = headingIndex + 1;
@@ -364,35 +308,8 @@ export function updatePumbleBlock(source: string, agentId: string): string {
     if (filtered.length > 0 && filtered[filtered.length - 1].trim() !== "") filtered.push("");
     filtered.push(...block);
   }
-
   const result = filtered.length > 0 ? `${filtered.join(eol)}${eol}` : "";
   return result === source ? source : result;
-}
-
-/**
- * Remove the generated Pumble block only when it is bound to `agentId`.
- * Handwritten or differently bound Pumble sections remain untouched.
- */
-export function removePumbleBlock(source: string, agentId: string): string {
-  const lines = source.split(/\r?\n/);
-  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  const blockStart = lines.indexOf(PUMBLE_ENV_HEADING);
-  if (blockStart < 0) return source;
-  let blockEnd = blockStart + 1;
-  while (blockEnd < lines.length) {
-    const body = lines[blockEnd];
-    if (body.trim() === "" || body.trimStart().startsWith("#")) break;
-    if (!/^\s*(?:OMP_BUNDLER_ADAPTER|PUMBLE_[A-Z0-9_]*)\s*=/.test(body)) break;
-    blockEnd += 1;
-  }
-  const binding = lines
-    .slice(blockStart + 1, blockEnd)
-    .find((line) => /^\s*PUMBLE_AGENT_ID\s*=/.test(line));
-  const bindingValue = binding?.slice(binding.indexOf("=") + 1) ?? "";
-  const commentStart = bindingValue.search(/(?:^|\s)#/);
-  const boundAgent = (commentStart < 0 ? bindingValue : bindingValue.slice(0, commentStart)).trim();
-  if (boundAgent !== agentId) return source;
-  return updateManagedEnvBlock(source, PUMBLE_ENV_HEADING, []);
 }
 
 /** Set the generated bundled-adapter selection without touching model blocks. */

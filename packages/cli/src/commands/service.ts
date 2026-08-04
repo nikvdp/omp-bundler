@@ -5,7 +5,7 @@ import { assertAllowedOptions } from "./common.ts";
 import { resolveRunSettings, runBundle } from "./run.ts";
 
 export const SERVICE_HELP = [
-  "omp-bundler service start [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]",
+  "omp-bundler service start [bundle-path] [--env-file <path>] [--image <tag>] [--dry-run]",
   "omp-bundler service stop [bundle-path]",
   "omp-bundler service status [bundle-path]",
   "omp-bundler service restart [bundle-path]",

@@ -4,9 +4,7 @@ export type Scalar = string | number | boolean | null;
 export type YamlValue = Scalar | YamlValue[] | { [key: string]: YamlValue };
 
 export interface ParsedArguments {
-  /** Positional arguments after the top-level command. */
   readonly positionals: string[];
-  /** Canonical option names without their leading dashes. */
   readonly options: Record<string, string | boolean>;
 }
 
@@ -31,19 +29,20 @@ export interface CommandHandlerRegistry {
   readonly new?: CommandHandler;
   readonly generate?: CommandHandler;
   readonly destroy?: CommandHandler;
-  readonly agent?: CommandHandler;
   readonly check?: CommandHandler;
   readonly build?: CommandHandler;
   readonly run?: CommandHandler;
   readonly service?: CommandHandler;
   readonly tui?: CommandHandler;
-  readonly migrate?: CommandHandler;
   readonly "set-model"?: CommandHandler;
 }
 
-export type ProjectConfig = Record<string, YamlValue> & {
+export interface ProjectConfig {
   readonly version: number;
-  readonly agentsDir: string;
+  readonly agent: {
+    readonly id: string;
+    readonly [key: string]: YamlValue | undefined;
+  };
   readonly image?: {
     readonly tag?: string;
     readonly [key: string]: YamlValue | undefined;
@@ -54,20 +53,18 @@ export type ProjectConfig = Record<string, YamlValue> & {
     readonly adapterPort?: number;
     readonly [key: string]: YamlValue | undefined;
   };
-};
+}
 
 export interface ProjectContext {
   readonly rootDir: string;
   readonly configPath: string;
   readonly config: ProjectConfig;
-  readonly agentsDir: string;
+  readonly agent: AgentDirectory;
 }
 
 export interface AgentDirectory {
   readonly id: string;
-  /** Complete visible agent source root; required OMP files and component
-   *  directories are direct children. The image build wraps this root under
-   *  .omp separately. */
+  /** Complete visible agent source root. */
   readonly path: string;
 }
 

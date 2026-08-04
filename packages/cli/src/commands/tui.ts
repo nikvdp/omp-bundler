@@ -3,18 +3,17 @@ import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import type { Writable } from "node:stream";
 import { optionString } from "../args.ts";
-import { assertSafeIdentifier } from "../identifiers.ts";
-import { discoverAgents, loadProject, resolveDefaultEnvFile } from "../project.ts";
+import { loadProject, resolveDefaultEnvFile } from "../project.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
 import { getDockerEnvValue } from "./check.ts";
 import { assertAllowedOptions } from "./common.ts";
 import { resolveRunSettings } from "./run.ts";
 
-export const TUI_HELP = `omp-bundler tui [--dir <bundle-path>] [--id <agent-id>] [--endpoint <agent-url>]
+export const TUI_HELP = `omp-bundler tui [--dir <bundle-path>] [--endpoint <agent-url>]
 
 Open a simple terminal chat for a running bundle. With no flags, use the current
-bundle and infer its only agent. --dir selects another bundle, --id selects one
-agent, and --endpoint bypasses bundle discovery with an exact agent URL.`;
+bundle's root agent. --dir selects another bundle, and --endpoint bypasses
+bundle discovery with an exact agent URL.`;
 
 export interface TuiTarget {
   readonly endpoint: string;
@@ -26,7 +25,7 @@ export const tuiCommand: CommandHandler = async (args, context) => {
     context.io.stdout.write(`${TUI_HELP}\n`);
     return 0;
   }
-  assertAllowedOptions(args, ["dir", "id", "endpoint"]);
+  assertAllowedOptions(args, ["dir", "endpoint"]);
   if (args.positionals.length > 0) throw new Error(`usage: ${TUI_HELP.split("\n", 1)[0]}`);
 
   return runReadlineChat(await resolveTuiTarget(args, context.cwd), context);
@@ -34,12 +33,9 @@ export const tuiCommand: CommandHandler = async (args, context) => {
 
 export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Promise<TuiTarget> {
   const directory = requiredStringOption(args, "dir");
-  const agentId = requiredStringOption(args, "id");
   const endpoint = requiredStringOption(args, "endpoint");
   if (endpoint !== undefined) {
-    if (directory !== undefined || agentId !== undefined) {
-      throw new Error("--endpoint cannot be combined with --dir or --id");
-    }
+    if (directory !== undefined) throw new Error("--endpoint cannot be combined with --dir");
     const token = process.env.OMP_HTTP_API_TOKEN;
     return {
       endpoint: normalizeAgentEndpoint(endpoint),
@@ -48,21 +44,6 @@ export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Prom
   }
 
   const project = await loadProject(directory, cwd);
-  const agents = await discoverAgents(project.agentsDir);
-  let selectedId = agentId;
-  if (selectedId !== undefined) {
-    assertSafeIdentifier(selectedId, "agent id");
-    if (!agents.some((agent) => agent.id === selectedId)) {
-      throw new Error(`agent '${selectedId}' is not a direct child of ${project.agentsDir}`);
-    }
-  } else if (agents.length === 1) {
-    selectedId = agents[0].id;
-  } else if (agents.length === 0) {
-    throw new Error(`bundle has no agents: ${project.rootDir}`);
-  } else {
-    throw new Error(`bundle has multiple agents (${agents.map((agent) => agent.id).join(", ")}); select one with --id`);
-  }
-
   const { adapterPort } = resolveRunSettings({ project });
   const envFile = await resolveDefaultEnvFile(project.rootDir);
   let token: string | undefined;
@@ -70,7 +51,7 @@ export async function resolveTuiTarget(args: ParsedArguments, cwd: string): Prom
     token = getDockerEnvValue(await readFile(envFile, "utf8"), envFile, "OMP_HTTP_API_TOKEN") ?? "";
   }
   return {
-    endpoint: `http://localhost:${adapterPort}/v1/agents/${encodeURIComponent(selectedId)}`,
+    endpoint: `http://localhost:${adapterPort}/v1/agents/${encodeURIComponent(project.agent.id)}`,
     ...(token === undefined ? {} : { token }),
   };
 }

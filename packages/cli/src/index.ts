@@ -28,9 +28,8 @@ export {
 export type { RootCommand, RootCommandHandlerMap } from "./handlers.ts";
 export { assertSafeIdentifier, assertSafeRelativePath, isSafeIdentifier, resolveInside, SAFE_IDENTIFIER_PATTERN } from "./identifiers.ts";
 export { executeChild } from "./process.ts";
-export { discoverAgents, loadProject, resolveAgentPath, resolveBundleRoot, resolveCommandPath, PROJECT_CONFIG_FILE } from "./project.ts";
+export { loadProject, resolveBundleRoot, resolveCommandPath, PROJECT_CONFIG_FILE, resolveDefaultEnvFile } from "./project.ts";
 export {
-  agentCommand,
   buildCommand,
   checkCommand,
   destroyCommand,

@@ -6,20 +6,12 @@ import type { Readable } from "node:stream";
 import { describeFilePlan } from "../file-plan.ts";
 import type { CommandContext, FilePlan } from "../types.ts";
 
-interface TextLine {
-  readonly body: string;
-  readonly ending: string;
-}
 
 export interface OptionalTextFile {
   readonly path: string;
   readonly content: string;
 }
 
-export interface PumbleBindingChange {
-  readonly content: string;
-  readonly changed: boolean;
-}
 
 export interface ReferenceScanOptions {
   readonly skip?: readonly string[];
@@ -93,38 +85,6 @@ export function relativePlanPath(root: string, path: string): string {
   return value;
 }
 
-export function transformPumbleAgentBinding(
-  source: string,
-  fromAgentId: string,
-  toAgentId: string | null,
-): PumbleBindingChange {
-  const lines = splitTextLines(source);
-  let changed = false;
-  const transformed: TextLine[] = [];
-  for (const line of lines) {
-    const match = line.body.match(/^([ \t]*(?:export[ \t]+)?PUMBLE_AGENT_ID[ \t]*=[ \t]*)(.*)$/);
-    if (!match) {
-      transformed.push(line);
-      continue;
-    }
-    const valueAndComment = match[2];
-    const commentIndex = findCommentStart(valueAndComment);
-    const valuePart = commentIndex < 0 ? valueAndComment : valueAndComment.slice(0, commentIndex);
-    if (valuePart.trim() !== fromAgentId) {
-      transformed.push(line);
-      continue;
-    }
-    changed = true;
-    if (toAgentId === null) continue;
-    const trailingWhitespace = valuePart.slice(valuePart.trimEnd().length);
-    const comment = commentIndex < 0 ? "" : valueAndComment.slice(commentIndex);
-    transformed.push({
-      body: `${match[1]}${toAgentId}${trailingWhitespace}${comment}`,
-      ending: line.ending,
-    });
-  }
-  return { content: joinTextLines(transformed), changed };
-}
 
 export async function findTextReferences(
   root: string,
@@ -207,48 +167,4 @@ async function lstatOrNull(path: string): Promise<Stats | null> {
 
 function isMissingError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-function splitTextLines(source: string): TextLine[] {
-  if (!source) return [];
-  const lines: TextLine[] = [];
-  let start = 0;
-  while (start < source.length) {
-    let end = start;
-    while (end < source.length && source[end] !== "\n" && source[end] !== "\r") end += 1;
-    if (end === source.length) {
-      lines.push({ body: source.slice(start), ending: "" });
-      break;
-    }
-    const ending = source[end] === "\r" && source[end + 1] === "\n" ? "\r\n" : source[end];
-    lines.push({ body: source.slice(start, end), ending });
-    start = end + ending.length;
-  }
-  return lines;
-}
-
-function joinTextLines(lines: readonly TextLine[]): string {
-  return lines.map((line) => `${line.body}${line.ending}`).join("");
-}
-
-function findCommentStart(value: string): number {
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index];
-    if (quote === '"' && escaped) {
-      escaped = false;
-      continue;
-    }
-    if (quote === '"' && character === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (character === "'" || character === '"') {
-      quote = quote === character ? null : quote ?? character;
-      continue;
-    }
-    if (!quote && character === "#" && (index === 0 || /\s/.test(value[index - 1]))) return index;
-  }
-  return -1;
 }
