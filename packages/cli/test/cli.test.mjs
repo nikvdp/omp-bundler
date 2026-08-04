@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import {
+  main,
   buildCommand,
   checkCommand,
   applyFilePlan,
@@ -20,11 +21,11 @@ import {
   handlerContext,
   newCommand,
   runCommand,
-  serviceCommand,
+  statusCommand,
   tuiCommand,
   PACKAGE_ASSET_PATHS,
   removeDockerContext,
-  setModelCommand,
+  modelCommand,
   stageDockerContext,
   stagePackagedAssets,
 } from "../src/index.ts";
@@ -341,18 +342,28 @@ function quoteYamlValue(value) {
   return JSON.stringify(value);
 }
 
-/** Write the root model.yml used by one-agent bundles. */
+/** Write the root models.yml catalog and select its model. */
 async function seedModel(root, _agentId, overrides = {}) {
   const baseUrl = overrides.baseUrl ?? "https://api.test.example/v1";
   const dialect = overrides.dialect ?? "openai-responses";
   const model = overrides.model ?? "gpt-test";
-  const apiKey = overrides.apiKey ?? "";
-  await writeText(join(root, "model.yml"), [
-    "version: 1",
-    `baseUrl: ${quoteYamlValue(baseUrl)}`,
-    `dialect: ${dialect}`,
-    `model: ${quoteYamlValue(model)}`,
-    `apiKey: ${apiKey === "" ? '""' : quoteYamlValue(apiKey)}`,
+  await writeText(join(root, "models.yml"), [
+    "providers:",
+    "  test:",
+    `    baseUrl: ${quoteYamlValue(baseUrl)}`,
+    `    api: ${dialect}`,
+    "    auth: none",
+    "    models:",
+    `      - id: ${quoteYamlValue(model)}`,
+    `        name: ${quoteYamlValue(model)}`,
+    "setupVersion: 1",
+    "",
+  ].join("\n"));
+  await writeText(join(root, "config.yml"), [
+    "setupVersion: 1",
+    "# Add agent-local OMP settings here.",
+    "modelRoles:",
+    `  default: test/${model}`,
     "",
   ].join("\n"));
 }
@@ -377,6 +388,45 @@ async function writeEditorScript(parent, name, body) {
   await writeFile(script, `#!${process.execPath}\n${body}`, { mode: 0o755 });
   return script;
 }
+
+test("CLI framework owns command parsing, help, and shell completions", async () => {
+  const invocation = [];
+  const capture = captureIO();
+  const code = await main(
+    ["run", "/bundle", "--foreground", "--dry-run"],
+    {
+      cwd: "/work",
+      io: capture.io,
+      handlers: {
+        run(args, context) {
+          invocation.push({ args, cwd: context.cwd });
+          return 0;
+        },
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.deepEqual(invocation, [{
+    args: {
+      positionals: ["/bundle"],
+      options: { foreground: true, "dry-run": true },
+    },
+    cwd: "/work",
+  }]);
+
+  const help = captureIO();
+  assert.equal(await main(["run", "--help"], { cwd: "/work", io: help.io }), 0);
+  assert.match(help.stdout(), /Start the bundle as a background service/);
+  assert.match(help.stdout(), /--foreground/);
+
+  const completion = captureIO();
+  assert.equal(await main(["completion", "fish"], { cwd: "/work", io: completion.io }), 0);
+  assert.match(completion.stdout(), /complete -c omp-bundler/);
+
+  const legacy = captureIO();
+  assert.equal(await main(["service", "status"], { cwd: "/work", io: legacy.io }), 1);
+  assert.match(legacy.stderr(), /Unknown command: service/);
+});
 
 test("entrypoint refreshes only singular .omp, preserves workspace, and registers one HTTP adapter", async () => {
   await withTempDirectory(async (root) => {
@@ -610,7 +660,8 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
         "README.md",
         "omp-bundler.yml",
         "runtime.env.example",
-        "model.yml",
+        "models.yml",
+        "Dockerfile",
         "AGENTS.md",
         "config.yml",
         "subagents",
@@ -629,9 +680,9 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
     ]) {
       assert.equal(await exists(join(derived, relativePath)), true, relativePath);
     }
-    const starterModel = await readFile(join(derived, "model.yml"), "utf8");
-    assert.match(starterModel, /# baseUrl: <value>/);
-    assert.match(starterModel, /# model: <value>/);
+    const starterModels = parseYaml(await readFile(join(derived, "models.yml"), "utf8"));
+    assert.deepEqual(starterModels, { providers: {} });
+    assert.match(await readFile(join(derived, "Dockerfile"), "utf8"), /FROM oven\/bun:/);
     assert.deepEqual(
       parseYaml(await readFile(join(derived, "omp-bundler.yml"), "utf8"))
         .agent,
@@ -640,7 +691,7 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
     const generatedReadme = await readFile(join(derived, "README.md"), "utf8");
     assert.match(generatedReadme, /\.example.*inactive/);
     assert.match(generatedReadme, /omp-bundler generate skill meeting-notes/);
-    assert.match(generatedReadme, /generated `model\.yml`/);
+    assert.match(generatedReadme, /model add <provider\/model>/);
     assert.match(generatedReadme, /discovers the live adapter port automatically/);
 
     await invoke(newCommand, parent, ["custom"], { id: "alpha" });
@@ -699,24 +750,25 @@ test("component generators and destroy commands use root paths without deployed 
   });
 });
 
-test("set-model targets root model.yml and accepts a provider/model positional import", async () => {
+test("model catalog adds providers and models without changing the default selection", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
     const bundle = join(parent, "bundle");
-    const direct = await invoke(setModelCommand, bundle, [], {
+    const direct = await invoke(modelCommand, bundle, ["add", "direct/direct-model"], {
       "base-url": "https://direct.example/v1",
-      dialect: "openai-responses",
-      model: "direct-model",
-      "api-key": "",
+      api: "openai-responses",
+      "no-auth": true,
     });
     assert.equal(direct.result, 0, direct.stderr);
-    assert.equal(await exists(join(bundle, "model.yml")), true);
-    assert.equal(await exists(join(bundle, "models")), false);
-    assert.match(await readFile(join(bundle, "model.yml"), "utf8"), /model: direct-model/);
+    let catalog = parseYaml(await readFile(join(bundle, "models.yml"), "utf8"));
+    assert.deepEqual(catalog.providers.direct.models, [{ id: "direct-model", name: "direct-model" }]);
+    assert.doesNotMatch(await readFile(join(bundle, "config.yml"), "utf8"), /modelRoles/);
 
+    await invoke(modelCommand, bundle, ["set-default", "direct/direct-model"]);
+    assert.match(await readFile(join(bundle, "config.yml"), "utf8"), /default: direct\/direct-model/);
     await assert.rejects(
-      () => invoke(setModelCommand, bundle, [], { model: "${RUNTIME_MODEL}" }),
-      /model must be a literal model ID/,
+      () => invoke(modelCommand, bundle, ["set-default", "direct/missing"]),
+      /is not present in models.yml/,
     );
 
     const ompConfig = join(parent, "omp-config");
@@ -728,6 +780,7 @@ test("set-model targets root model.yml and accepts a provider/model positional i
       "    auth: none",
       "    models:",
       "      - id: imported-model",
+      "        name: Imported model",
       "",
     ].join("\n"));
     const omp = join(parent, "omp");
@@ -742,17 +795,19 @@ if (args[0] === "models") {
     const previousPath = process.env.PATH;
     process.env.PATH = `${parent}:${previousPath ?? ""}`;
     try {
-      const imported = await invoke(setModelCommand, bundle, ["openai/imported-model"]);
+      const imported = await invoke(modelCommand, bundle, ["add", "openai/imported-model"], { from: "omp" });
       assert.equal(imported.result, 0, imported.stderr);
-      assert.match(imported.stdout, /imported openai\/imported-model from OMP/);
+      assert.match(imported.stdout, /added openai\/imported-model/);
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
     }
-    const model = await readFile(join(bundle, "model.yml"), "utf8");
-    assert.match(model, /baseUrl: https:\/\/imported\.example\/v1/);
-    assert.match(model, /model: imported-model/);
-    assert.doesNotMatch(model, /direct-model/);
+    catalog = parseYaml(await readFile(join(bundle, "models.yml"), "utf8"));
+    assert.deepEqual(catalog.providers.direct.models, [{ id: "direct-model", name: "direct-model" }]);
+    assert.deepEqual(catalog.providers.openai.models, [{ id: "imported-model", name: "Imported model" }]);
+    const listed = await invoke(modelCommand, bundle, ["list"]);
+    assert.match(listed.stdout, /\* direct\/direct-model/);
+    assert.match(listed.stdout, /  openai\/imported-model/);
   });
 });
 
@@ -872,6 +927,8 @@ test("run settings select the next distinct free ports", async () => {
     runPreviewCommand(selected, "/bundle/runtime.env"),
     /--label io\.omp-bundler\.bundle-root=\/bundle/,
   );
+  assert.match(runPreviewCommand(selected, "/bundle/runtime.env"), /docker run --rm -d /);
+  assert.doesNotMatch(runPreviewCommand(selected, "/bundle/runtime.env", false), /docker run --rm -d /);
 });
 
 test("live adapter discovery follows the labeled foreground container", async () => {
@@ -915,7 +972,7 @@ process.exit(1);
   });
 });
 
-test("run and service reject a same-name container owned by another bundle", async () => {
+test("run and status reject a same-name container owned by another bundle", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
     const bundle = join(parent, "bundle");
@@ -933,11 +990,11 @@ process.exit(1);
     process.env.PATH = `${parent}:${previousPath ?? ""}`;
     try {
       await assert.rejects(
-        () => invoke(serviceCommand, bundle, ["start"]),
+        () => invoke(runCommand, bundle, []),
         /belongs to another bundle.*found \/other-bundle/,
       );
       await assert.rejects(
-        () => invoke(serviceCommand, bundle, ["status"]),
+        () => invoke(statusCommand, bundle, []),
         /belongs to another bundle.*found \/other-bundle/,
       );
     } finally {
@@ -1003,8 +1060,7 @@ process.exit(0);
       const adapterMapping = dockerArgs.find((value) => value.endsWith(":8765"));
       assert(adapterMapping);
       assert.notEqual(Number(adapterMapping.split(":")[0]), racePort);
-      assert.match(run.stdout, new RegExp(`Agent endpoint if Docker starts: http://localhost:${racePort}/`));
-      assert.match(run.stdout, new RegExp(`Agent endpoint if Docker starts: http://localhost:${adapterMapping.split(":")[0]}/`));
+      assert.match(run.stdout, new RegExp(`Agent endpoint \\(available once listening; not a readiness check\\): http://localhost:${adapterMapping.split(":")[0]}/`));
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
@@ -1047,7 +1103,7 @@ if (args[0] === "inspect") {
       assert.equal(run.result, 0, run.stderr);
       const lines = run.stdout.split(/\r?\n/).filter((line) => line.startsWith("Agent endpoint") || line.startsWith("TUI:"));
       assert.deepEqual(lines, [
-        "Agent endpoint if Docker starts: http://localhost:9999/v1/agents/alpha",
+        "Agent endpoint (available once listening; not a readiness check): http://localhost:9999/v1/agents/alpha",
         "TUI: omp-bundler tui",
       ]);
       assert.doesNotMatch(run.stdout, /--id/);
