@@ -26,7 +26,7 @@
  * -------------
  *   turn_start          -> turn.started (durable, first event for a turn)
  *   message_update      -> text deltas accumulate into the eventual reply;
- *                          streamed deltas are progress candidates
+ *                          streamed deltas are emitted best-effort
  *   subagent_*          -> progress candidates
  *   turn_end            -> usage/cost collected (NO terminal reply here)
  *   agent_end           -> exactly ONE terminal turn.reply (durable)
@@ -34,15 +34,15 @@
  *
  * Terminal events are emitted exactly once per correlation: turn.reply at
  * agent_end (not at each internal turn_end), and one curated turn.error for a
- * provider/child failure. Progress is best-effort and unpersisted: it is
- * emitted only after {@link progressThresholdMs} of wall time has elapsed
- * since the last emitted progress, and consecutive candidates are coalesced so
- * at most one progress event per threshold window is delivered.
+ * provider/child failure. Progress and text deltas are best-effort and
+ * unpersisted. Progress is emitted only after {@link progressThresholdMs} of
+ * wall time has elapsed since the last emitted progress, while adjacent text
+ * deltas are briefly coalesced and flushed before any terminal event.
  *
  * Sequence is monotonic per correlationId and persisted with durable events.
- * Progress events share the same monotonic counter but are never persisted,
- * so a dropped progress event creates a sequence gap the adapter MUST tolerate
- * (per contract).
+ * Best-effort events share the same monotonic counter but are never persisted,
+ * so a dropped event creates a sequence gap the adapter MUST tolerate (per
+ * contract).
  */
 
 import { randomUUID } from "node:crypto";
@@ -53,6 +53,7 @@ import type {
   OutboundEvent,
   Presence,
   TurnErrorEvent,
+  TurnDeltaEvent,
   TurnProgressEvent,
   TurnReplyEvent,
   TurnStartedEvent,
@@ -210,6 +211,11 @@ export interface PendingOutboundCorrelation {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+/** Briefly coalesce adjacent assistant text chunks before streaming them. */
+const DELTA_BATCH_INTERVAL_MS = 25;
+
+/** Force a pending streamed text batch onto the delivery chain at this size. */
+const DELTA_MAX_PENDING_CHARS = 4096;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS outbound_outbox (
@@ -333,6 +339,11 @@ export class OutboundEmitter {
 
   /** Accumulated reply text from message_update text deltas. */
   private replyText = "";
+  /** Append-only text waiting to be emitted as one best-effort delta. */
+  private pendingDelta = "";
+
+  /** Timer bounding how long an incomplete delta batch can remain pending. */
+  private deltaTimer: NodeJS.Timeout | null = null;
 
   /** Workspace output files requested by the agent for terminal delivery. */
   private readonly replyAttachments: WorkspaceAttachment[] = [];
@@ -519,9 +530,10 @@ export class OutboundEmitter {
     message: string;
     retryable: boolean;
   }): void {
-    if (this.terminalEmitted) return;
-    this.terminalEmitted = true;
+    if (this.closed || this.terminalEmitted) return;
     this.ensureStarted();
+    this.flushDelta();
+    this.terminalEmitted = true;
     const event: TurnErrorEvent = {
       version: ADAPTER_API_VERSION,
       type: "turn.error",
@@ -568,6 +580,21 @@ export class OutboundEmitter {
       this.pendingProgress = null;
       this.emitProgress(message);
     }
+  }
+  /**
+   * Synchronously move any pending text delta onto the serialized delivery
+   * chain. The HTTP POST itself remains asynchronous and best-effort.
+   */
+  private flushDelta(): void {
+    if (this.closed || this.terminalEmitted) {
+      this.discardPendingDelta();
+      return;
+    }
+    if (this.pendingDelta.length === 0) return;
+
+    const text = this.pendingDelta;
+    this.discardPendingDelta();
+    this.emitDelta(text);
   }
 
   /**
@@ -733,6 +760,7 @@ export class OutboundEmitter {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.discardPendingDelta();
     if (this.ownsDb) {
       this.db.close();
     }
@@ -761,15 +789,17 @@ export class OutboundEmitter {
   }
 
   /**
-   * message_update -> accumulate text deltas; each delta is a progress
-   * candidate.
+   * message_update -> append every non-empty source chunk to the authoritative
+   * reply exactly once, and independently queue it for best-effort streaming.
    */
   private handleMessageUpdate(frame: RpcEventFrame): void {
     const delta = extractTextDelta(frame);
-    if (delta !== null && delta.length > 0) {
-      this.replyText += delta;
-      this.handleProgressCandidate(delta);
-    }
+    if (delta === null || delta.length === 0) return;
+
+    this.replyText += delta;
+    if (this.closed || this.terminalEmitted) return;
+    this.queueDelta(delta);
+    this.handleProgressCandidate(delta);
   }
 
   /** turn_end -> collect usage/cost from the assistant message. NO reply here. */
@@ -782,7 +812,7 @@ export class OutboundEmitter {
 
   /** agent_end -> exactly one curated terminal event (durable). */
   private handleAgentEnd(frame: RpcEventFrame): void {
-    if (this.terminalEmitted) return;
+    if (this.closed || this.terminalEmitted) return;
     if (agentEndHasModelError(frame)) {
       this.emitProviderError({
         code: "model_error",
@@ -799,8 +829,9 @@ export class OutboundEmitter {
       });
       return;
     }
-    this.terminalEmitted = true;
     this.ensureStarted();
+    this.flushDelta();
+    this.terminalEmitted = true;
     // Prefer usage accumulated from turn_end; fall back to agent_end messages.
     let usage = this.replyUsage ?? null;
     if (!usage) {
@@ -873,6 +904,45 @@ export class OutboundEmitter {
   private nextSequence(): number {
     this.sequence += 1;
     return this.sequence;
+  }
+
+  /** Add exact source text to the independent, bounded delta batch. */
+  private queueDelta(delta: string): void {
+    this.pendingDelta += delta;
+    if (this.pendingDelta.length >= DELTA_MAX_PENDING_CHARS) {
+      this.flushDelta();
+      return;
+    }
+    if (this.deltaTimer !== null) return;
+
+    this.deltaTimer = setTimeout(() => {
+      this.deltaTimer = null;
+      this.flushDelta();
+    }, DELTA_BATCH_INTERVAL_MS);
+  }
+
+  /** Cancel the batch timer and forget text that must no longer be emitted. */
+  private discardPendingDelta(): void {
+    if (this.deltaTimer !== null) {
+      clearTimeout(this.deltaTimer);
+      this.deltaTimer = null;
+    }
+    this.pendingDelta = "";
+  }
+
+  /** Emit one exact, non-empty best-effort append-only text chunk. */
+  private emitDelta(text: string): void {
+    const event: TurnDeltaEvent = {
+      version: ADAPTER_API_VERSION,
+      type: "turn.delta",
+      eventId: this.opts.uuid(),
+      conversationKey: this.opts.conversationKey,
+      correlationId: this.opts.correlationId,
+      sequence: this.nextSequence(),
+      occurredAt: toIsoUtc(this.opts.now()),
+      text,
+    };
+    this.deliverBestEffort(event);
   }
 
   /** Emit a best-effort, unpersisted progress event. */
@@ -1157,15 +1227,15 @@ export class OutboundEmitter {
 
   // ---- best-effort delivery ----
 
-  /** Enqueue a single unpersisted POST for a progress event (no retry). */
+  /** Enqueue a single unpersisted POST for a best-effort event (no retry). */
   private deliverBestEffort(event: OutboundEvent): void {
     this.enqueue(() => this.postBestEffort(event));
   }
 
   /**
-   * One best-effort POST for a progress event. No persistence, no retry. A
-   * non-2xx or network error is logged and the progress event is simply
-   * dropped; the adapter tolerates the resulting sequence gap.
+   * One best-effort POST. No persistence or retry. A non-2xx or network error
+   * is logged and the event is dropped; the adapter tolerates the resulting
+   * sequence gap.
    */
   private async postBestEffort(event: OutboundEvent): Promise<void> {
     const target = this.opts.resolveAdapterTarget(this.opts.adapterId);
@@ -1179,14 +1249,14 @@ export class OutboundEmitter {
         event.type,
       );
       if (!ok) {
-        this.opts.logger.warn("best-effort progress delivery non-2xx", {
+        this.opts.logger.warn("best-effort outbound delivery non-2xx", {
           eventId: event.eventId,
           adapterId: this.opts.adapterId,
           status,
         });
       }
     } catch (err) {
-      this.opts.logger.warn("best-effort progress delivery failed", {
+      this.opts.logger.warn("best-effort outbound delivery failed", {
         eventId: event.eventId,
         adapterId: this.opts.adapterId,
         error: err instanceof Error ? err.message : String(err),
