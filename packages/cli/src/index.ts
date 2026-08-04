@@ -38,6 +38,7 @@ export {
   newCommand,
   runCommand,
   serviceCommand,
+  tuiCommand,
   setModelCommand,
 } from "./commands/index.ts";
 export {

@@ -7,6 +7,7 @@ export { migrateCommand } from "./migrate.ts";
 export { newCommand } from "./new.ts";
 export { setModelCommand, SET_MODEL_HELP } from "./set-model.ts";
 export { serviceCommand, SERVICE_HELP } from "./service.ts";
+export { resolveTuiTarget, tuiCommand, TUI_HELP } from "./tui.ts";
 export {
   CANONICAL_ASSET_PATHS,
   formatDockerCommand,

@@ -1062,6 +1062,13 @@ function isCredentialName(name: string): boolean {
   return name in CREDENTIAL_ENV_NAMES || SECRET_ENV_NAME.test(name);
 }
 
+export function getDockerEnvValue(source: string, path: string, name: string): string | undefined {
+  const errors: ValidationIssue[] = [];
+  const value = parseDockerEnv(source, path, errors).get(name)?.value;
+  if (errors.length > 0) throw new Error(`${path}: ${formatIssue(errors[0])}`);
+  return value;
+}
+
 function parseDockerEnv(source: string, path: string, errors: ValidationIssue[]): EnvMap {
   const result: EnvMap = new Map();
   const lines = source.split(/\n/);

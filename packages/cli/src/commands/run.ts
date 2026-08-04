@@ -1,4 +1,4 @@
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { optionBoolean } from "../args.ts";
 import { executeChild } from "../process.ts";
 import { resolveBundleRoot, resolveDefaultEnvFile } from "../project.ts";
@@ -7,6 +7,7 @@ import { assertAllowedOptions, requiredOptionString } from "./common.ts";
 import {
   formatDockerCommand,
   runDockerArgs,
+  shellQuote,
 } from "./docker.ts";
 import type { CheckResult } from "./check.ts";
 import type { CommandContext, CommandHandler, ParsedArguments } from "../types.ts";
@@ -193,10 +194,14 @@ function printAgentEndpoints(
   result: CheckResult,
   settings: RunSettings,
 ): void {
+  const directoryFlag = resolve(context.cwd) === result.project.rootDir
+    ? ""
+    : ` --dir ${shellQuote(result.project.rootDir)}`;
   for (const agent of result.agents) {
     const base = `http://localhost:${settings.adapterPort}/v1/agents/${agent.id}`;
+    const idFlag = result.agents.length === 1 ? "" : ` --id ${shellQuote(agent.id)}`;
     context.io.stdout.write(`Agent endpoint (available once listening; not a readiness check): ${base}\n`);
-    context.io.stdout.write(`TUI: omp-tui ${base}\n`);
+    context.io.stdout.write(`TUI: omp-bundler tui${directoryFlag}${idFlag}\n`);
   }
 }
 

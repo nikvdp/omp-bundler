@@ -17,6 +17,8 @@ import {
   serviceCommand,
   SERVICE_HELP,
   setModelCommand,
+  tuiCommand,
+  TUI_HELP,
   SET_MODEL_HELP,
 } from "./commands/index.ts";
 
@@ -32,6 +34,7 @@ export const ROOT_COMMANDS = [
   "build",
   "run",
   "service",
+  "tui",
   "migrate",
 ] as const;
 
@@ -62,6 +65,7 @@ export const COMMAND_HELP: Record<RootCommand, string> = {
   build: "omp-bundler build [bundle-path] [--tag <image-tag>] [--agents <path>]",
   run: "omp-bundler run [bundle-path] [--env-file <path>] [--image <tag>] [--agents <path>] [--dry-run]",
   service: SERVICE_HELP,
+  tui: TUI_HELP,
   migrate: "omp-bundler migrate visible-layout [bundle-path] [--dry-run] [--yes]",
 };
 
@@ -79,6 +83,7 @@ export const ROOT_HANDLERS: RootCommandHandlerMap = {
   build: buildCommand,
   run: runCommand,
   service: serviceCommand,
+  tui: tuiCommand,
   migrate: migrateCommand,
 };
 
