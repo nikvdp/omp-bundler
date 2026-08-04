@@ -167,7 +167,7 @@ async function createEntrypointHarness(root) {
   await writeFile(
     join(binDir, "bun"),
     `#!${process.execPath}
-const { copyFileSync, mkdirSync, writeFileSync } = require("node:fs");
+const { copyFileSync, mkdirSync, renameSync, writeFileSync } = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const { dirname } = require("node:path");
 const args = process.argv.slice(2);
@@ -183,12 +183,15 @@ if (args[0]?.endsWith("/render-models.ts")) {
   });
   process.exit(result.status ?? 1);
 } else if (process.env.ENTRYPOINT_CAPTURE_PATH && args[0] === process.env.OMP_CORE_SERVER) {
-  writeFileSync(process.env.ENTRYPOINT_CAPTURE_PATH, JSON.stringify({
+  const capture = JSON.stringify({
     OMP_ADAPTERS: process.env.OMP_ADAPTERS,
     OMP_AGENT_ID: process.env.OMP_AGENT_ID,
     OMP_AGENT_ROOT: process.env.OMP_AGENT_ROOT,
     OMP_WORKSPACE_DIR: process.env.OMP_WORKSPACE_DIR,
-  }));
+    OMP_AGENT_DIR: process.env.OMP_AGENT_DIR,
+  });
+  writeFileSync(process.env.ENTRYPOINT_CAPTURE_PATH + ".tmp", capture);
+  renameSync(process.env.ENTRYPOINT_CAPTURE_PATH + ".tmp", process.env.ENTRYPOINT_CAPTURE_PATH);
 }
 `,
     { encoding: "utf8", mode: 0o755 },
@@ -220,6 +223,7 @@ if (args[0]?.endsWith("/render-models.ts")) {
         "OMP_AGENT_ID",
         "OMP_AGENT_ROOT",
         "OMP_WORKSPACE_DIR",
+        "OMP_AGENT_DIR",
         "PUMBLE_AGENT_ID",
         "PUMBLE_CORE_SHARED_SECRET",
       ]) {
@@ -369,6 +373,21 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
     );
     const first = await harness.run(imageV1, dataDir);
     assert.equal(first.code, 0, first.stderr);
+    assert.deepEqual(
+      await readdir(join(dataDir, "agent", "workspace")),
+      [],
+      "the persistent agent workspace starts empty",
+    );
+    const runtimeAgentDir = join(
+      root,
+      "entrypoint-home",
+      ".omp",
+      "runtime-agent",
+    );
+    await writeText(
+      join(runtimeAgentDir, "stale-runtime.txt"),
+      "remove stale runtime copy\n",
+    );
 
     const workspaceFile = join(dataDir, "agent", "workspace", "notes.txt");
     const siblingFile = join(dataDir, "agent", "operator.txt");
@@ -393,6 +412,10 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
       "alpha",
       "image-v2\n",
     );
+    await writeText(
+      join(imageV2, ".omp", "skills", "meeting-notes", "SKILL.md"),
+      "# Meeting notes\n",
+    );
     const second = await harness.run(imageV2, dataDir);
     assert.equal(second.code, 0, second.stderr);
     assert.equal(
@@ -409,6 +432,43 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
     assert.equal(second.capture.OMP_AGENT_ID, "alpha");
     assert.equal(second.capture.OMP_AGENT_ROOT, join(dataDir, "agent"));
     assert.equal(second.capture.OMP_WORKSPACE_DIR, join(dataDir, "workspace"));
+    assert.equal(second.capture.OMP_AGENT_DIR, runtimeAgentDir);
+    assert.equal(
+      await readFile(join(runtimeAgentDir, "config.yml"), "utf8"),
+      "image-v2\n",
+    );
+    assert.equal(
+      await readFile(join(runtimeAgentDir, "AGENTS.md"), "utf8"),
+      "# alpha\n\nStaged instructions.\n",
+    );
+    assert.equal(
+      await readFile(
+        join(runtimeAgentDir, "skills", "meeting-notes", "SKILL.md"),
+        "utf8",
+      ),
+      "# Meeting notes\n",
+    );
+    assert.equal(
+      await exists(join(runtimeAgentDir, "stale-runtime.txt")),
+      false,
+    );
+    assert.equal(
+      await readFile(join(runtimeAgentDir, "models.yml"), "utf8"),
+      "{}\n",
+    );
+    assert.equal(
+      (await lstat(join(runtimeAgentDir, "sessions"))).isSymbolicLink(),
+      true,
+    );
+    assert.equal(
+      await realpath(join(runtimeAgentDir, "sessions")),
+      await realpath(join(dataDir, "sessions")),
+    );
+    assert.equal(
+      await exists(join(dataDir, "agent", ".omp", "models.yml")),
+      false,
+      "the secret-bearing rendered model catalog must stay off the data volume",
+    );
     assert.deepEqual(JSON.parse(second.capture.OMP_ADAPTERS), [
       {
         adapterId: "http-alpha",
