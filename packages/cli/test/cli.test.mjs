@@ -22,6 +22,7 @@ import {
   newCommand,
   runCommand,
   serviceCommand,
+  tuiCommand,
   PACKAGE_ASSET_PATHS,
   removeDockerContext,
   setModelCommand,
@@ -32,6 +33,7 @@ import {
   buildPreviewCommand,
   resolveBuildTag,
   migrateCommand,
+  resolveTuiTarget,
   resolveRunSettings,
   runPreviewCommand,
   validateBundle,
@@ -1667,6 +1669,45 @@ test("parent command groups print their available subcommands", async () => {
   }
 });
 
+test("tui resolves current bundle, directory, agent id, and endpoint selectors", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
+    const bundle = join(parent, "bundle");
+    const configPath = join(bundle, "omp-bundler.yml");
+    await writeText(configPath, (await readFile(configPath, "utf8")).replace("adapterPort: 8765", "adapterPort: 9999"));
+    await writeText(join(bundle, "runtime.env"), "OMP_HTTP_API_TOKEN='bundle-token'\n");
+
+    assert.deepEqual(await resolveTuiTarget(commandArgs([], {}), bundle), {
+      endpoint: "http://localhost:9999/v1/agents/alpha",
+      token: "bundle-token",
+    });
+    assert.deepEqual(await resolveTuiTarget(commandArgs([], { dir: "bundle" }), parent), {
+      endpoint: "http://localhost:9999/v1/agents/alpha",
+      token: "bundle-token",
+    });
+
+    await invoke(generateCommand, bundle, ["agent", "beta"]);
+    await assert.rejects(
+      () => resolveTuiTarget(commandArgs([], {}), bundle),
+      /multiple agents.*select one with --id/,
+    );
+    assert.deepEqual(await resolveTuiTarget(commandArgs([], { id: "beta" }), bundle), {
+      endpoint: "http://localhost:9999/v1/agents/beta",
+      token: "bundle-token",
+    });
+
+    const endpoint = "https://agents.example.test/v1/agents/remote";
+    assert.deepEqual(await resolveTuiTarget(commandArgs([], { endpoint }), bundle), { endpoint });
+    await assert.rejects(
+      () => resolveTuiTarget(commandArgs([], { endpoint, id: "alpha" }), bundle),
+      /--endpoint cannot be combined/,
+    );
+    const help = await invoke(tuiCommand, bundle, [], { help: true });
+    assert.equal(help.result, 0);
+    assert.match(help.stdout, /--dir <bundle-path>.*--id <agent-id>.*--endpoint <agent-url>/);
+  });
+});
+
 test("set-model imports an exact OMP model and credential without exposing the token", async () => {
   await withTempDirectory(async (parent) => {
     const stateDir = join(parent, "omp-state");
@@ -1913,7 +1954,7 @@ test("runtime example model blocks are exact, idempotent, and preserve Pumble se
     await invoke(newCommand, parent, ["bundle"], { agent: "alpha" });
     const bundle = join(parent, "bundle");
     const runtime = join(bundle, "runtime.env.example");
-    const fresh = "# Bundled adapter. HTTP serves the agent API and omp-tui.\nOMP_BUNDLER_ADAPTER=http\n\n# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.\nOMP_HTTP_API_TOKEN=\n";
+    const fresh = "# Bundled adapter. HTTP serves the agent API and built-in terminal chat.\nOMP_BUNDLER_ADAPTER=http\n\n# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.\nOMP_HTTP_API_TOKEN=\n";
     assert.equal(await readFile(runtime, "utf8"), fresh);
 
     const alphaOptions = {
@@ -2126,7 +2167,7 @@ test("check and run select runtime env defaults and print exact agent endpoints"
     assert.equal(dockerArgs[0], "run");
     const base = "http://localhost:9999/v1/agents/alpha";
     const endpoint = `Agent endpoint (available once listening; not a readiness check): ${base}`;
-    const tui = `TUI: omp-tui ${base}`;
+    const tui = "TUI: omp-bundler tui";
     assert.deepEqual(
       normal.stdout.split(/\r?\n/).filter((line) => line.startsWith("Agent endpoint") || line.startsWith("TUI:")),
       [endpoint, tui],
