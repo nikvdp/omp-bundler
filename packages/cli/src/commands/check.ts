@@ -457,10 +457,13 @@ async function scanTree(
 ): Promise<void> {
   const entries = await readdir(current).catch(() => [] as string[]);
   for (const name of entries) {
-    if (rootSource && name in PROJECT_SOURCE_FILES && name !== "model.yml") continue;
     const path = join(current, name);
     const info = await lstat(path).catch(() => null);
     if (!info) continue;
+    if (rootSource && name in PROJECT_SOURCE_FILES && name !== "model.yml") {
+      if (info.isSymbolicLink()) errors.push(issue(path, undefined, "must not be a symlink"));
+      continue;
+    }
     if (info.isSymbolicLink()) {
       errors.push(issue(path, undefined, "symlinks are not allowed in agent source"));
       continue;
