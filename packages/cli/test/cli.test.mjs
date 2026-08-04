@@ -29,8 +29,10 @@ import {
 } from "../src/index.ts";
 import {
   buildPreviewCommand,
+  discoverPublishedAdapterPort,
   resolveBuildTag,
   resolveTuiTarget,
+  resolveAvailableRunSettings,
   runReadlineChat,
   resolveRunSettings,
   runPreviewCommand,
@@ -769,6 +771,57 @@ test("check and Docker staging validate one root agent and translate subagents",
   });
 });
 
+test("run settings select the next distinct free ports", async () => {
+  const settings = {
+    image: "bundle:local",
+    corePort: 8787,
+    adapterPort: 8765,
+    dataVolume: "bundle-data",
+    containerName: "bundle-data-service",
+    bundleRoot: "/bundle",
+  };
+  const busy = new Set([8765, 8766, 8787]);
+  const selected = await resolveAvailableRunSettings(settings, async (port) => !busy.has(port));
+  assert.deepEqual(
+    { adapterPort: selected.adapterPort, corePort: selected.corePort },
+    { adapterPort: 8767, corePort: 8788 },
+  );
+  assert.match(
+    runPreviewCommand(selected, "/bundle/runtime.env"),
+    /--label io\.omp-bundler\.bundle-root=\/bundle/,
+  );
+});
+
+test("live adapter discovery follows the labeled foreground container", async () => {
+  await withTempDirectory(async (parent) => {
+    const docker = join(parent, "docker");
+    await writeFile(docker, `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] === "port" && args[1] === "bundle-data-service") process.exit(1);
+if (args[0] === "ps" && args.includes("label=io.omp-bundler.bundle-root=/bundle")) {
+  process.stdout.write("foreground-id\\n");
+  process.exit(0);
+}
+if (args[0] === "port" && args[1] === "foreground-id") {
+  process.stdout.write("0.0.0.0:10001\\n[::]:10001\\n");
+  process.exit(0);
+}
+process.exit(1);
+`, { mode: 0o755 });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${parent}:${previousPath ?? ""}`;
+    try {
+      assert.equal(
+        await discoverPublishedAdapterPort("/bundle", "bundle-data-service"),
+        10001,
+      );
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+});
+
 test("run and tui select one root endpoint without agent id overrides", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
@@ -779,8 +832,10 @@ test("run and tui select one root endpoint without agent id overrides", async ()
     const envPath = join(bundle, "runtime.env");
     await writeText(envPath, await readFile(join(bundle, "runtime.env.example"), "utf8"));
 
-    const target = await resolveTuiTarget(commandArgs([], {}), bundle);
+    const target = await resolveTuiTarget(commandArgs([], {}), bundle, async () => undefined);
     assert.deepEqual(target, { endpoint: "http://localhost:9999/v1/agents/alpha", token: "" });
+    const liveTarget = await resolveTuiTarget(commandArgs([], {}), bundle, async () => 10001);
+    assert.equal(liveTarget.endpoint, "http://localhost:10001/v1/agents/alpha");
     const exact = await resolveTuiTarget(commandArgs([], { endpoint: "http://localhost:9999/v1/agents/alpha" }), bundle);
     assert.equal(exact.endpoint, "http://localhost:9999/v1/agents/alpha");
 
