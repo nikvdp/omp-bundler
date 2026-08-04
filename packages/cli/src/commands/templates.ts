@@ -138,6 +138,7 @@ Agent instructions and every supported component surface live at the bundle root
 \`\`\`text
 AGENTS.md
 config.yml
+model.yml
 subagents/example-subagent.md.example
 commands/example-command.md.example
 extensions/example-extension.ts.example
@@ -159,10 +160,10 @@ omp-bundler generate tool read-transcript
 ## Development loop
 
 1. Edit \`AGENTS.md\` and generate or edit components under the bundle root.
-2. Configure the agent with \`omp-bundler set-model\`. The default mode opens an editor; add \`--wizard\` for guided prompts.
+2. Configure the generated \`model.yml\` with \`omp-bundler set-model\`. The default mode opens an editor; add \`--wizard\` for guided prompts.
 3. Copy \`runtime.env.example\` to the ignored \`runtime.env\` file and fill its generated placeholders.
-4. Run \`omp-bundler check\` and \`omp-bundler build\`, then use \`omp-bundler run\` for the foreground process or \`omp-bundler service start\` for a detached container. Check, run, and service start select \`runtime.env\` automatically.
-5. Chat with the agent by running \`omp-bundler tui\`, or send a message to the HTTP adapter at http://localhost:8765/v1/agents/${agentId}/conversations/local/messages.
+4. Run \`omp-bundler check\` and \`omp-bundler build\`, then use \`omp-bundler run\` for the foreground process or \`omp-bundler service start\` for a detached container. Check, run, and service start select \`runtime.env\` automatically; run and service start select free host ports when the configured preferences are busy.
+5. Chat with the agent by running \`omp-bundler tui\`. It discovers the live adapter port automatically. You can also send a message to the endpoint printed by \`run\` or \`service start\`.
 
 The committed \`runtime.env.example\` contains placeholders only. Keep deployment values in \`runtime.env\`.
 `;
