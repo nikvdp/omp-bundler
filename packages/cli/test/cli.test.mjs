@@ -952,7 +952,7 @@ test("check accepts root VCS metadata and Pumble derives the project agent id", 
   });
 });
 
-test("check and Docker staging validate one root agent and translate subagents", async () => {
+test("check requires agent config while Docker staging copies arbitrary bundle files", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
     const bundle = join(parent, "bundle");
