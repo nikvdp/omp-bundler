@@ -958,6 +958,9 @@ test("check and Docker staging validate one root agent and translate subagents",
     const bundle = join(parent, "bundle");
     await invoke(generateCommand, bundle, ["subagent", "researcher"]);
     await seedModel(bundle, "alpha");
+    await writeText(join(bundle, "toolish.ts"), "export const toolish = true;\n");
+    await mkdir(join(bundle, ".lb"));
+    await writeText(join(bundle, ".lb", "cache.db"), "tracker state\n");
     const report = await validateBundle({ cwd: bundle });
     assert.equal(report.ok, true, report.errors.map((entry) => entry.message).join("\n"));
 
@@ -972,6 +975,8 @@ test("check and Docker staging validate one root agent and translate subagents",
       assert.equal(await exists(join(contextPath, "agent", ".omp", "subagents")), false);
       assert.equal(await exists(join(contextPath, "agent", ".omp", "model.yml")), false);
       assert.equal(await exists(join(contextPath, "agent", ".git")), false);
+      assert.equal(await exists(join(contextPath, "agent", ".omp", "toolish.ts")), true);
+      assert.equal(await exists(join(contextPath, "agent", ".omp", ".lb", "cache.db")), true);
     } finally {
       await removeDockerContext(contextPath);
     }
