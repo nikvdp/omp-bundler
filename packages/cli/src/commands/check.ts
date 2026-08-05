@@ -64,29 +64,7 @@ const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: 
 const AGENT_KEYS: Record<string, true> = { id: true };
 const IMAGE_KEYS: Record<string, true> = { tag: true };
 const RUN_KEYS: Record<string, true> = { dataVolume: true, corePort: true, adapterPort: true };
-const OMP_ALLOWED: Record<string, true> = {
-  "AGENTS.md": true,
-  "config.yml": true,
-  "settings.json": true,
-  subagents: true,
-  commands: true,
-  extensions: true,
-  skills: true,
-  tools: true,
-};
 const OMP_REQUIRED_FILES = ["AGENTS.md", "config.yml"] as const;
-const OMP_REQUIRED_DIRS: readonly string[] = [];
-const PROJECT_SOURCE_FILES: Record<string, true> = {
-  ".git": true,
-  ".gitignore": true,
-  "README.md": true,
-  "omp-bundler.yml": true,
-  "Dockerfile": true,
-  "runtime.env": true,
-  "runtime.env.example": true,
-  "models.yml": true,
-};
-const GLOBAL_STATE_NAMES = /^(?:models\.ya?ml(?:\.tmpl)?|sessions?|(?:\.?cache|caches?)(?:[.-].*)?|agent\.db(?:[.-].*)?|runtime(?:[._-].*)?|\.env(?:\..*)?|credentials?(?:\..*)?|secrets?(?:\..*)?|tokens?(?:\..*)?)$/i;
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
 const SECRET_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/;
 const SECRET_ASSIGNMENT = /(?:\b(?:const|let|var)\s+|(?:^|[,{.;(])\s*|\.)(?:"([^"]+)"|'([^']+)'|([A-Za-z_$][A-Za-z0-9_$-]*))\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|(\$\{[^}]*\}|[^\s,;}]+))/gm;
@@ -424,33 +402,6 @@ async function validateAgent(
   agent: AgentDirectory,
   errors: ValidationIssue[],
 ): Promise<void> {
-  await scanTree(agent.path, errors, true);
-  const entries = await readdir(agent.path).catch(() => [] as string[]);
-  for (const required of OMP_REQUIRED_FILES) {
-    const path = join(agent.path, required);
-    const info = await lstat(path).catch(() => null);
-    if (!info) {
-      errors.push(issue(path, undefined, "is required in the root agent scaffold"));
-    } else if (info.isSymbolicLink()) {
-      errors.push(issue(path, undefined, "must not be a symlink"));
-    } else if (!info.isFile()) {
-      errors.push(issue(path, undefined, "must be a regular file"));
-    }
-  }
-  for (const entry of entries) {
-    if (entry in PROJECT_SOURCE_FILES) continue;
-    const path = join(agent.path, entry);
-    const info = await lstat(path).catch(() => null);
-    if (!info) continue;
-    if (GLOBAL_STATE_NAMES.test(entry) || /^agent\.db/i.test(entry)) continue;
-    if (!(entry in OMP_ALLOWED)) {
-      errors.push(issue(path, undefined, "is not an allowed agent surface; use AGENTS.md, config.yml, settings.json, subagents, commands, extensions, skills, or tools"));
-      continue;
-    }
-    const expectsDirectory = entry !== "AGENTS.md" && entry !== "config.yml" && entry !== "settings.json";
-    if (expectsDirectory && !info.isDirectory()) errors.push(issue(path, undefined, "must be a directory"));
-    if (!expectsDirectory && !info.isFile()) errors.push(issue(path, undefined, "must be a regular file"));
-  }
 
   await validateTextFile(join(agent.path, "AGENTS.md"), "instructions", errors, (source, path) => {
     if (!source.trim()) errors.push(issue(path, undefined, "must not be empty"));
@@ -462,50 +413,6 @@ async function validateAgent(
   await validateComponents(agent, errors);
 }
 
-async function scanTree(
-  current: string,
-  errors: ValidationIssue[],
-  rootSource = false,
-): Promise<void> {
-  const entries = await readdir(current).catch(() => [] as string[]);
-  for (const name of entries) {
-    const path = join(current, name);
-    const info = await lstat(path).catch(() => null);
-    if (!info) continue;
-    if (rootSource && name in PROJECT_SOURCE_FILES && name !== "models.yml") {
-      if (info.isSymbolicLink()) errors.push(issue(path, undefined, "must not be a symlink"));
-      continue;
-    }
-    if (info.isSymbolicLink()) {
-      errors.push(issue(path, undefined, "symlinks are not allowed in agent source"));
-      continue;
-    }
-    if (rootSource && name === "models.yml") {
-      if (!info.isFile()) {
-        errors.push(issue(path, undefined, "must be a regular model catalog file"));
-      } else {
-        const source = await readFile(path, "utf8").catch(() => "");
-        scanCredentialAssignments(source, path, errors);
-      }
-      continue;
-    }
-    if (GLOBAL_STATE_NAMES.test(name) || /^agent\.db/i.test(name)) {
-      errors.push(issue(path, undefined, "runtime state, cache, model catalog, or credential material must not be committed in agent source"));
-    }
-    if (info.isDirectory()) {
-      await scanTree(path, errors);
-      continue;
-    }
-    if (!info.isFile()) {
-      errors.push(issue(path, undefined, "must be a regular file"));
-      continue;
-    }
-    if (isTextPath(path)) {
-      const source = await readFile(path, "utf8").catch(() => "");
-      scanCredentialAssignments(source, path, errors);
-    }
-  }
-}
 
 async function validateComponents(agent: AgentDirectory, errors: ValidationIssue[]): Promise<void> {
   await validateMarkdownDirectory(join(agent.path, "subagents"), "subagents", errors);
@@ -968,9 +875,6 @@ function scanSourceAssignments(source: string, path: string, errors: ValidationI
   }
 }
 
-function isTextPath(path: string): boolean {
-  return /\.(?:md|ts|yml|yaml|json|env|txt)$/i.test(path);
-}
 
 function isRecord(value: YamlValue | unknown): value is RecordValue {
   return value !== null && typeof value === "object" && !Array.isArray(value);

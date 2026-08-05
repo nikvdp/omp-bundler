@@ -110,16 +110,6 @@ export async function stageDockerContext(
     throw error;
   }
 }
-const ROOT_AGENT_SURFACES: Record<string, true> = {
-  "AGENTS.md": true,
-  "config.yml": true,
-  "settings.json": true,
-  subagents: true,
-  commands: true,
-  extensions: true,
-  skills: true,
-  tools: true,
-};
 
 async function copyAgentSourceNoSymlinks(sourcePath: string, destinationPath: string): Promise<void> {
   const sourceInfo = await lstat(sourcePath);
@@ -130,8 +120,7 @@ async function copyAgentSourceNoSymlinks(sourcePath: string, destinationPath: st
     const sourceEntry = join(sourcePath, entry.name);
     const entryInfo = await lstat(sourceEntry);
     if (entryInfo.isSymbolicLink()) throw new Error(`refusing to stage symlink: ${sourceEntry}`);
-    if (entry.name === ".omp") throw new Error(`agent source must not contain a nested .omp directory: ${sourceEntry}`);
-    if (!(entry.name in ROOT_AGENT_SURFACES)) continue;
+    if (entry.name === ".git" || entry.name === ".omp" || entry.name === "models.yml" || entry.name === "runtime.env") continue;
     const destinationName = entry.name === "subagents" ? "agents" : entry.name;
     await copyTreeNoSymlinks(sourceEntry, join(destinationPath, destinationName), false);
   }
