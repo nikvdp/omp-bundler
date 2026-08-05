@@ -24,9 +24,6 @@ const MAX_CONVERSATION_KEY_LENGTH = 512;
 const RECENT_EVENT_LIMIT = 1_000;
 const EARLY_EVENT_LIMIT = 256;
 const EARLY_EVENT_BYTES = 256 * 1024;
-const STREAM_QUEUE_LIMIT = 256;
-const STREAM_QUEUE_BYTES = 256 * 1024;
-const STREAM_HEARTBEAT_MS = 15_000;
 
 type TerminalEvent = TurnReplyEvent | TurnErrorEvent;
 type BufferedEvent = Extract<
@@ -70,11 +67,7 @@ interface TurnTracker {
 }
 
 class SseResponse {
-  private readonly queue: string[] = [];
-  private queuedBytes = 0;
-  private blocked = false;
   private closed = false;
-  private heartbeat?: NodeJS.Timeout;
 
   constructor(
     private readonly res: http.ServerResponse,
@@ -93,47 +86,23 @@ class SseResponse {
     });
     this.res.flushHeaders();
     this.res.once("close", this.handleClose);
-    this.heartbeat = setInterval(() => {
-      this.push(": heartbeat\n\n");
-    }, STREAM_HEARTBEAT_MS);
-    this.heartbeat.unref();
     this.push(formatSse("accepted", { correlationId }));
   }
 
   push(frame: string): void {
     if (this.closed) return;
-    if (!this.blocked) {
-      try {
-        if (!this.res.write(frame)) {
-          this.blocked = true;
-          this.res.once("drain", this.handleDrain);
-        }
-      } catch {
-        this.detach(true);
-      }
-      return;
-    }
-
-    const bytes = Buffer.byteLength(frame);
-    if (
-      this.queue.length >= STREAM_QUEUE_LIMIT ||
-      this.queuedBytes + bytes > STREAM_QUEUE_BYTES
-    ) {
+    try {
+      if (!this.res.write(frame)) this.detach(true);
+    } catch {
       this.detach(true);
-      return;
     }
-    this.queue.push(frame);
-    this.queuedBytes += bytes;
   }
 
   finish(frame: string): void {
     if (this.closed) return;
     this.closed = true;
-    this.clearResources();
-    const queuedFrames = this.queue.splice(0);
-    this.queuedBytes = 0;
+    this.res.off("close", this.handleClose);
     try {
-      for (const queued of queuedFrames) this.res.write(queued);
       this.res.end(frame);
     } catch {
       if (!this.res.destroyed) this.res.destroy();
@@ -149,40 +118,12 @@ class SseResponse {
     this.detach(false);
   };
 
-  private readonly handleDrain = (): void => {
-    if (this.closed) return;
-    this.blocked = false;
-    while (this.queue.length > 0) {
-      const frame = this.queue.shift()!;
-      this.queuedBytes -= Buffer.byteLength(frame);
-      try {
-        if (!this.res.write(frame)) {
-          this.blocked = true;
-          this.res.once("drain", this.handleDrain);
-          return;
-        }
-      } catch {
-        this.detach(true);
-        return;
-      }
-    }
-  };
-
   private detach(destroy: boolean): void {
     if (this.closed) return;
     this.closed = true;
-    this.clearResources();
-    this.queue.length = 0;
-    this.queuedBytes = 0;
+    this.res.off("close", this.handleClose);
     if (destroy && !this.res.destroyed) this.res.destroy();
     this.onDetach();
-  }
-
-  private clearResources(): void {
-    if (this.heartbeat) clearInterval(this.heartbeat);
-    this.heartbeat = undefined;
-    this.res.off("drain", this.handleDrain);
-    this.res.off("close", this.handleClose);
   }
 }
 

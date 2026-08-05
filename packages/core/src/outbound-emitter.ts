@@ -36,8 +36,8 @@
  * agent_end (not at each internal turn_end), and one curated turn.error for a
  * provider/child failure. Progress and text deltas are best-effort and
  * unpersisted. Progress is emitted only after {@link progressThresholdMs} of
- * wall time has elapsed since the last emitted progress, while adjacent text
- * deltas are briefly coalesced and flushed before any terminal event.
+ * wall time has elapsed since the last emitted progress. Text deltas are
+ * delivered immediately before later terminal events.
  *
  * Sequence is monotonic per correlationId and persisted with durable events.
  * Best-effort events share the same monotonic counter but are never persisted,
@@ -211,11 +211,6 @@ export interface PendingOutboundCorrelation {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-/** Briefly coalesce adjacent assistant text chunks before streaming them. */
-const DELTA_BATCH_INTERVAL_MS = 25;
-
-/** Force a pending streamed text batch onto the delivery chain at this size. */
-const DELTA_MAX_PENDING_CHARS = 4096;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS outbound_outbox (
@@ -339,11 +334,6 @@ export class OutboundEmitter {
 
   /** Accumulated reply text from message_update text deltas. */
   private replyText = "";
-  /** Append-only text waiting to be emitted as one best-effort delta. */
-  private pendingDelta = "";
-
-  /** Timer bounding how long an incomplete delta batch can remain pending. */
-  private deltaTimer: NodeJS.Timeout | null = null;
 
   /** Workspace output files requested by the agent for terminal delivery. */
   private readonly replyAttachments: WorkspaceAttachment[] = [];
@@ -532,7 +522,6 @@ export class OutboundEmitter {
   }): void {
     if (this.closed || this.terminalEmitted) return;
     this.ensureStarted();
-    this.flushDelta();
     this.terminalEmitted = true;
     const event: TurnErrorEvent = {
       version: ADAPTER_API_VERSION,
@@ -580,21 +569,6 @@ export class OutboundEmitter {
       this.pendingProgress = null;
       this.emitProgress(message);
     }
-  }
-  /**
-   * Synchronously move any pending text delta onto the serialized delivery
-   * chain. The HTTP POST itself remains asynchronous and best-effort.
-   */
-  private flushDelta(): void {
-    if (this.closed || this.terminalEmitted) {
-      this.discardPendingDelta();
-      return;
-    }
-    if (this.pendingDelta.length === 0) return;
-
-    const text = this.pendingDelta;
-    this.discardPendingDelta();
-    this.emitDelta(text);
   }
 
   /**
@@ -760,7 +734,6 @@ export class OutboundEmitter {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.discardPendingDelta();
     if (this.ownsDb) {
       this.db.close();
     }
@@ -790,7 +763,7 @@ export class OutboundEmitter {
 
   /**
    * message_update -> append every non-empty source chunk to the authoritative
-   * reply exactly once, and independently queue it for best-effort streaming.
+   * reply exactly once, then stream that exact chunk best-effort.
    */
   private handleMessageUpdate(frame: RpcEventFrame): void {
     const delta = extractTextDelta(frame);
@@ -798,7 +771,7 @@ export class OutboundEmitter {
 
     this.replyText += delta;
     if (this.closed || this.terminalEmitted) return;
-    this.queueDelta(delta);
+    this.emitDelta(delta);
     this.handleProgressCandidate(delta);
   }
 
@@ -830,7 +803,6 @@ export class OutboundEmitter {
       return;
     }
     this.ensureStarted();
-    this.flushDelta();
     this.terminalEmitted = true;
     // Prefer usage accumulated from turn_end; fall back to agent_end messages.
     let usage = this.replyUsage ?? null;
@@ -906,29 +878,6 @@ export class OutboundEmitter {
     return this.sequence;
   }
 
-  /** Add exact source text to the independent, bounded delta batch. */
-  private queueDelta(delta: string): void {
-    this.pendingDelta += delta;
-    if (this.pendingDelta.length >= DELTA_MAX_PENDING_CHARS) {
-      this.flushDelta();
-      return;
-    }
-    if (this.deltaTimer !== null) return;
-
-    this.deltaTimer = setTimeout(() => {
-      this.deltaTimer = null;
-      this.flushDelta();
-    }, DELTA_BATCH_INTERVAL_MS);
-  }
-
-  /** Cancel the batch timer and forget text that must no longer be emitted. */
-  private discardPendingDelta(): void {
-    if (this.deltaTimer !== null) {
-      clearTimeout(this.deltaTimer);
-      this.deltaTimer = null;
-    }
-    this.pendingDelta = "";
-  }
 
   /** Emit one exact, non-empty best-effort append-only text chunk. */
   private emitDelta(text: string): void {
