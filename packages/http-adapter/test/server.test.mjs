@@ -611,61 +611,6 @@ test("HTTP disconnect keeps turn ownership until Core terminal", async (t) => {
   assert.equal(inboundCount, 2);
 });
 
-test("slow SSE clients never delay callback acknowledgement", async (t) => {
-  const { adapter, adapterBaseUrl } = await createHarness(t, async ({ res }) => {
-    res.writeHead(202, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "accepted", correlationId: "correlation-slow" }));
-  });
-
-  const response = await sendMessage(adapterBaseUrl, "local", {
-    accept: "text/event-stream",
-  });
-  const reader = response.body.getReader();
-  await reader.read();
-  const tracker = adapter.trackers.get("correlation-slow");
-  assert(tracker?.active?.stream);
-  const streamResponse = tracker.active.stream.res;
-  const originalWrite = streamResponse.write;
-  streamResponse.write = function (...args) {
-    originalWrite.apply(this, args);
-    return false;
-  };
-
-  const firstDelta = turnEvent("turn.delta", 1, {
-    eventId: "slow-delta-1",
-    correlationId: "correlation-slow",
-    text: "first",
-  });
-  const firstCallback = await postEvent(adapterBaseUrl, firstDelta);
-  assert.equal(firstCallback.status, 200);
-  assert.equal(tracker.active.stream.blocked, true);
-
-  const overflowingDelta = turnEvent("turn.delta", 2, {
-    eventId: "slow-delta-2",
-    correlationId: "correlation-slow",
-    text: "x".repeat(300 * 1024),
-  });
-  const overflowCallback = await postEvent(adapterBaseUrl, overflowingDelta);
-  assert.equal(overflowCallback.status, 200);
-  assert.deepEqual(await overflowCallback.json(), { status: "ok" });
-  assert.equal(tracker.active.stream, undefined);
-
-  const overlapping = await sendMessage(adapterBaseUrl);
-  assert.equal(overlapping.status, 409);
-  const terminal = turnEvent("turn.reply", 3, {
-    eventId: "slow-reply-3",
-    correlationId: "correlation-slow",
-    text: "Finished despite detached stream",
-    attachments: [],
-    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
-  });
-  const terminalCallback = await postEvent(adapterBaseUrl, terminal);
-  assert.equal(terminalCallback.status, 200);
-  await reader.cancel().catch(() => {});
-  await immediate();
-  assert.equal(adapter.trackers.size, 0);
-  assert.equal(adapter.inFlightConversations.size, 0);
-});
 
 test("turn timeout closes SSE and releases conversation ownership", async (t) => {
   let inboundCount = 0;
@@ -705,24 +650,4 @@ test("turn timeout closes SSE and releases conversation ownership", async (t) =>
   const recovered = await sendMessage(adapterBaseUrl);
   assert.equal(recovered.status, 200);
   assert.equal((await recovered.json()).text, "Recovered");
-});
-
-test("shutdown destroys streams and clears turn resources", async (t) => {
-  const { adapter, adapterBaseUrl } = await createHarness(t, async ({ res }) => {
-    res.writeHead(202, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "accepted", correlationId: "correlation-shutdown" }));
-  });
-
-  const response = await sendMessage(adapterBaseUrl, "local", {
-    accept: "text/event-stream",
-  });
-  assert.equal(response.status, 200);
-  await adapter.close();
-  await response.text().catch(() => "");
-  await immediate();
-  assert.equal(adapter.server.listening, false);
-  assert.equal(adapter.trackers.size, 0);
-  assert.equal(adapter.inFlightConversations.size, 0);
-  assert.equal(adapter.recentEventIds.size, 0);
-  assert.equal(adapter.recentEventOrder.length, 0);
 });

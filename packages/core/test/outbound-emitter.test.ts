@@ -82,8 +82,7 @@ function replies(events: OutboundEvent[]): TurnReplyEvent[] {
   );
 }
 
-test("coalesces exact adjacent text and flushes it before the terminal reply", async () => {
-  jest.useFakeTimers();
+test("streams exact text chunks before the terminal reply", async () => {
   const { emitter, events } = createHarness();
   emitter.ingest({ type: "turn_start" });
   emitter.ingest(textDelta("Hello, "));
@@ -91,59 +90,24 @@ test("coalesces exact adjacent text and flushes it before the terminal reply", a
   emitter.ingest({ type: "agent_end", messages: [] });
   emitter.ingest(textDelta(" after terminal"));
 
-  jest.advanceTimersByTime(25);
   await emitter.flush();
 
   assert.deepEqual(
     events.map((event) => event.type),
-    ["turn.started", "turn.delta", "turn.reply"],
+    ["turn.started", "turn.delta", "turn.delta", "turn.reply"],
   );
   assert.deepEqual(
     events.map((event) => event.sequence),
-    [1, 2, 3],
+    [1, 2, 3, 4],
   );
   assert.deepEqual(
     deltas(events).map((event) => event.text),
-    ["Hello, world"],
+    ["Hello, ", "world"],
   );
   assert.equal(replies(events)[0]?.text, "Hello, world");
   emitter.close();
 });
 
-test("flushes an incomplete delta batch on the short timer", async () => {
-  jest.useFakeTimers();
-  const { emitter, events } = createHarness();
-  emitter.ingest({ type: "turn_start" });
-  emitter.ingest(textDelta("timed"));
-
-  jest.advanceTimersByTime(24);
-  await emitter.flush();
-  assert.deepEqual(deltas(events), []);
-
-  jest.advanceTimersByTime(1);
-  await emitter.flush();
-
-  assert.deepEqual(
-    deltas(events).map((event) => event.text),
-    ["timed"],
-  );
-  emitter.close();
-});
-
-test("force-flushes a delta batch at 4096 characters", async () => {
-  const { emitter, events } = createHarness();
-  const text = "x".repeat(4096);
-  emitter.ingest({ type: "turn_start" });
-  emitter.ingest(textDelta(text));
-
-  await emitter.flush();
-
-  assert.deepEqual(
-    deltas(events).map((event) => event.text),
-    [text],
-  );
-  emitter.close();
-});
 
 test("a failed best-effort delta does not suppress the terminal error", async () => {
   const { emitter, events, warnings } = createHarness((event) =>
@@ -165,15 +129,4 @@ test("a failed best-effort delta does not suppress the terminal error", async ()
   );
   assert.deepEqual(warnings, ["best-effort outbound delivery non-2xx"]);
   emitter.close();
-});
-
-test("close cancels and discards a pending delta batch", async () => {
-  jest.useFakeTimers();
-  const { emitter, events } = createHarness();
-  emitter.ingest(textDelta("discard me"));
-  emitter.close();
-
-  jest.advanceTimersByTime(25);
-
-  assert.deepEqual(events, []);
 });

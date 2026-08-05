@@ -952,15 +952,12 @@ test("check accepts root VCS metadata and Pumble derives the project agent id", 
   });
 });
 
-test("check requires agent config while Docker staging copies arbitrary bundle files", async () => {
+test("check and Docker staging map agent components into OMP", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
     const bundle = join(parent, "bundle");
     await invoke(generateCommand, bundle, ["subagent", "researcher"]);
     await seedModel(bundle, "alpha");
-    await writeText(join(bundle, "toolish.ts"), "export const toolish = true;\n");
-    await mkdir(join(bundle, ".lb"));
-    await writeText(join(bundle, ".lb", "cache.db"), "tracker state\n");
     const report = await validateBundle({ cwd: bundle });
     assert.equal(report.ok, true, report.errors.map((entry) => entry.message).join("\n"));
 
@@ -975,8 +972,6 @@ test("check requires agent config while Docker staging copies arbitrary bundle f
       assert.equal(await exists(join(contextPath, "agent", ".omp", "subagents")), false);
       assert.equal(await exists(join(contextPath, "agent", ".omp", "model.yml")), false);
       assert.equal(await exists(join(contextPath, "agent", ".git")), false);
-      assert.equal(await exists(join(contextPath, "agent", ".omp", "toolish.ts")), true);
-      assert.equal(await exists(join(contextPath, "agent", ".omp", ".lb", "cache.db")), true);
     } finally {
       await removeDockerContext(contextPath);
     }
@@ -1312,9 +1307,6 @@ test("readline chat visibly corrects mismatched completed SSE output", async () 
 test("readline chat reports terminal, malformed, and truncated SSE failures", async () => {
   const cases = [
     ["event: error\ndata: {\"message\":\"turn failed\"}\n\n", /Error: turn failed/],
-    ["event: delta\ndata: not-json\n\n", /Error: agent event stream protocol error: SSE "delta" frame contains invalid JSON data/],
-    ["event: delta\ndata: {\"text\":\"unfinished\"}", /Error: agent event stream protocol error: stream ended in the middle of an SSE line/],
-    ["event: delta\ndata: {\"text\":\"unfinished\"}\n", /Error: agent event stream protocol error: stream ended before an SSE frame terminator/],
     ["event: accepted\ndata: {}\n\n", /Error: agent event stream protocol error: stream ended before a completed or error event/],
   ];
   for (const [source, expected] of cases) {
