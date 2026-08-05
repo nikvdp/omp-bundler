@@ -23,6 +23,7 @@ node_modules/
 .env.*
 !.env.example
 .lb/
+**/.lb/
 
 # Persistent runtime state (lives on the /data volume, not in layers)
 *.db
