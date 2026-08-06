@@ -100,6 +100,13 @@ export async function stageDockerContext(
     await mkdir(stagedAgent, { recursive: true });
     await writeFile(join(stagedAgent, "id"), `${agent.id}\n`, "utf8");
     await copyAgentSourceNoSymlinks(agent.path, stagedOmp);
+    // Stage the bundle-root schedules/ directory (cron source) when present so
+    // the Dockerfile's `COPY schedules/ /schedules/` resolves. Optional: a
+    // bundle without schedules simply stages nothing and runs core + adapter.
+    const schedulesSource = join(agent.path, "schedules");
+    if (await lstat(schedulesSource).catch(() => null)) {
+      await copyTreeNoSymlinks(schedulesSource, join(contextPath, "schedules"), true);
+    }
 
     if (models !== undefined) {
       await writeFile(join(contextPath, "template", "models.yml.tmpl"), models.source, "utf8");
