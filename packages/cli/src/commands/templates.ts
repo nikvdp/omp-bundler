@@ -147,6 +147,7 @@ commands/example-command.md.example
 extensions/example-extension.ts.example
 skills/example-skill/SKILL.md.example
 tools/example-tool.ts.example
+schedules/example-schedule.yml.example
 \`\`\`
 
 The \`.example\` suffix keeps each starter inactive. Use the matching generator
@@ -158,6 +159,19 @@ omp-bundler generate command summarize
 omp-bundler generate extension lifecycle-log
 omp-bundler generate skill meeting-notes
 omp-bundler generate tool read-transcript
+\`\`\`
+
+## Schedules (cron)
+
+Run the agent on a timer with a schedule file under \`schedules/\`. Each active
+\`*.yml\` file runs its \`prompt\` in a fresh OMP session on its cron schedule and
+writes the reply to \`/data/cron/jobs/<job-id>/runs/\`. The \`.example\` suffix
+keeps a schedule inert, so a fresh bundle starts with cron off; rename
+\`schedules/example-schedule.yml.example\` or generate a new schedule to turn the
+runner on automatically:
+
+\`\`\`bash
+omp-bundler generate schedule daily-summary
 \`\`\`
 
 ## Development loop
