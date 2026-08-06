@@ -475,6 +475,26 @@ test("CLI framework owns command parsing, help, and shell completions", async ()
   assert.match(legacy.stderr(), /Unknown command: service/);
 });
 
+test("generate and destroy accept the schedule kind through the parser", async () => {
+  const generateCalls = [];
+  const generateCapture = captureIO();
+  assert.equal(await main(["generate", "schedule", "daily"], {
+    cwd: "/work",
+    io: generateCapture.io,
+    handlers: { generate(args) { generateCalls.push(args.positionals); return 0; } },
+  }), 0);
+  assert.deepEqual(generateCalls, [["schedule", "daily"]]);
+
+  const destroyCalls = [];
+  const destroyCapture = captureIO();
+  assert.equal(await main(["destroy", "schedule", "daily", "--yes"], {
+    cwd: "/work",
+    io: destroyCapture.io,
+    handlers: { destroy(args) { destroyCalls.push(args.positionals); return 0; } },
+  }), 0);
+  assert.deepEqual(destroyCalls, [["schedule", "daily"]]);
+});
+
 test("compiled standalone invokes the CLI main module", async () => {
   await withTempDirectory(async (root) => {
     const executable = join(root, "omp-bundler");
