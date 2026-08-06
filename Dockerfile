@@ -9,6 +9,15 @@ FROM oven/bun:1.3.14-debian AS base
 # installs the agent folder at the default OMP location, /root/.omp/agent.
 ENV HOME=/root
 
+# ── extra system tools (customize) ─────────────────────────────────────
+# This bundle owns this Dockerfile. Add any CLIs your agent shells out to
+# (git, openssh-client, gh, a Google Docs CLI, etc.) here, before the
+# runtime layout below. Example:
+#
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#       git openssh-client ca-certificates \
+#  && rm -rf /var/lib/apt/lists/*
+
 # ── OMP install ──────────────────────────────────────────────────────
 # OMP is installed into the image, not copied from the host. Pin to
 # 17.1.3; npm's --global install places the `omp` bin on PATH.

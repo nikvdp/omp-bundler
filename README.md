@@ -149,6 +149,15 @@ Relative bundle paths and command-line file arguments resolve from the shell's
 current directory. Bundle configuration is rooted at the directory containing
 `omp-bundler.yml`.
 
+## System dependencies
+
+Every bundle owns its `Dockerfile` (`check` requires it). Add any CLI your
+agent's tools or cron commands shell out to — `git`, `openssh-client`, `gh`,
+a Google Docs CLI, etc. — in the marked `extra system tools (customize)`
+block near the top of `Dockerfile`, right after the base image and before
+the runtime layout. It ships commented out, so a fresh bundle stays minimal
+until you opt in.
+
 ## Agent instructions and config
 
 A fresh `AGENTS.md` is immediately valid:

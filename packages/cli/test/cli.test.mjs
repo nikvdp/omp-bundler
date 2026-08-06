@@ -767,6 +767,10 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
     const starterModels = parseYaml(await readFile(join(derived, "models.yml"), "utf8"));
     assert.deepEqual(starterModels, { providers: {} });
     assert.match(await readFile(join(derived, "Dockerfile"), "utf8"), /FROM oven\/bun:/);
+    assert.match(
+      await readFile(join(derived, "Dockerfile"), "utf8"),
+      /extra system tools \(customize\)/,
+    );
     assert.deepEqual(
       parseYaml(await readFile(join(derived, "omp-bundler.yml"), "utf8"))
         .agent,
