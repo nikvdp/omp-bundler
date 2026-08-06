@@ -4,6 +4,8 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { RpcChild, RpcEventFrame } from "../src/rpc-child.js";
 import { parseCronExpression } from "../src/cron-expression.js";
 import {
@@ -261,6 +263,34 @@ test("computeDueFires catchUp fires once per missed interval up to the cap", () 
   assert.deepEqual(fires, [60_000, 120_000, 180_000]);
 });
 
+test("computeDueFires skip collapses a backlog to the latest due time", () => {
+  // Every minute, three intervals behind: skip must fire ONLY the most recent
+  // boundary (180000), never replay from 60000 one tick at a time.
+  const job: CronJob = {
+    id: "m",
+    schedule: "* * * * *",
+    timezone: "UTC",
+    missed: "skip",
+    prompt: "p",
+    parsed: parseCronExpression("* * * * *"),
+  };
+  assert.deepEqual(computeDueFires(job, 0, 180_000), [180_000]);
+});
+
+test("computeDueFires treats a fresh job (null last run) as having no backlog", () => {
+  // A never-run job must not catch up from epoch 0; anchored at now, nothing is
+  // due until the next boundary arrives.
+  const job: CronJob = {
+    id: "m",
+    schedule: "* * * * *",
+    timezone: "UTC",
+    missed: "skip",
+    prompt: "p",
+    parsed: parseCronExpression("* * * * *"),
+  };
+  assert.deepEqual(computeDueFires(job, null, 90_000), []);
+});
+
 // ---------------------------------------------------------------------------
 // fireOne: end-to-end persistence of one fire
 // ---------------------------------------------------------------------------
@@ -300,5 +330,48 @@ test("fireOne fires a job and writes the run file + last-run", async () => {
     assert.equal(runs.length, 1);
     assert.equal(runs[0], "1700000000000.txt");
     assert.equal(await readFile(join(jobDir, "runs", runs[0]), "utf8"), "ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// startCronScheduler: the standalone process must stay alive on its own timer.
+// An in-process test cannot catch a regression here because the test runner's
+// own handles keep the event loop alive, so this spawns the real boot path.
+// ---------------------------------------------------------------------------
+
+test("the standalone scheduler process stays alive after start", async () => {
+  await withTempDir(async (dir) => {
+    // Empty schedules dir: the loop finds no jobs and idles on a long timer.
+    // Regression guard: an unref'd tick timer let the process exit 0 before the
+    // first tick ever ran, so the entrypoint tore the whole container down.
+    const schedulesDir = join(dir, "schedules");
+    await mkdir(schedulesDir, { recursive: true });
+    const script = fileURLToPath(
+      new URL("../src/cron-scheduler.ts", import.meta.url),
+    );
+    const child = spawn(process.execPath, [script], {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        OMP_CRON_SCHEDULES_DIR: schedulesDir,
+        OMP_CRON_DATA_DIR: join(dir, "cron"),
+      },
+    });
+    const exited = new Promise<number | null>((resolve) => {
+      child.on("exit", (code) => resolve(code));
+    });
+    try {
+      const outcome = await Promise.race([
+        exited,
+        new Promise<"alive">((r) => setTimeout(() => r("alive"), 2000)),
+      ]);
+      assert.equal(
+        outcome,
+        "alive",
+        "scheduler process exited early; the tick timer must keep it alive",
+      );
+    } finally {
+      child.kill("SIGKILL");
+    }
   });
 });
