@@ -134,6 +134,8 @@ test("parseScheduleFile validates the job schema and parses the cron expression"
   assert.deepEqual(job.parsed.hour, [9]);
   assert.deepEqual(job.parsed.dayOfWeek, [1, 2, 3, 4, 5]);
   assert.equal(job.prompt, "Run it.");
+  assert.equal(job.command, null);
+  assert.equal(job.timeout, null);
 });
 
 test("parseScheduleFile rejects a bad missed policy, empty prompt, and bad cron", () => {
@@ -149,6 +151,59 @@ test("parseScheduleFile rejects a bad missed policy, empty prompt, and bad cron"
     () => parseScheduleFile("x", ['schedule: "0 9 * * *"', "timezone: Not/A/Zone", "missed: skip", 'prompt: "p"'].join("\n")),
     /not a valid IANA timezone/,
   );
+});
+
+test("parseScheduleFile accepts command mode and rejects invalid combinations", () => {
+  const job = parseScheduleFile("command", [
+    'schedule: "*/10 * * * *"',
+    "missed: skip",
+    'command: "printf ok"',
+    "timeout: 2",
+    "",
+  ].join("\n"));
+  assert.equal(job.prompt, null);
+  assert.equal(job.command, "printf ok");
+  assert.equal(job.timeout, 2);
+  const defaultTimeoutJob = parseScheduleFile("default-timeout", [
+    'schedule: "0 9 * * *"',
+    "missed: skip",
+    'command: "printf ok"',
+  ].join("\n"));
+  assert.equal(defaultTimeoutJob.timeout, 600);
+
+  assert.throws(
+    () => parseScheduleFile("x", [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'prompt: "p"',
+      'command: "printf ok"',
+    ].join("\n")),
+    /exactly one of prompt or command is required/,
+  );
+  assert.throws(
+    () => parseScheduleFile("x", ['schedule: "0 9 * * *"', "missed: skip"].join("\n")),
+    /exactly one of prompt or command is required/,
+  );
+  assert.throws(
+    () => parseScheduleFile("x", [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'prompt: "p"',
+      "timeout: 1",
+    ].join("\n")),
+    /timeout is only valid with command/,
+  );
+  for (const timeout of ["0", "-1", "1.5", "Infinity"]) {
+    assert.throws(
+      () => parseScheduleFile("x", [
+        'schedule: "0 9 * * *"',
+        "missed: skip",
+        'command: "printf ok"',
+        `timeout: ${timeout}`,
+      ].join("\n")),
+      /timeout must be a positive finite integer/,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -168,6 +223,8 @@ test("runJobOnce captures text deltas and reports ok", async () => {
       timezone: "UTC",
       missed: "skip",
       prompt: "hi",
+      command: null,
+      timeout: null,
       parsed: parseCronExpression("0 9 * * *"),
     };
     const result = await runJobOnce(job, 1000, options);
@@ -191,6 +248,8 @@ test("runJobOnce reports an error when prompt fails", async () => {
       timezone: "UTC",
       missed: "skip",
       prompt: "hi",
+      command: null,
+      timeout: null,
       parsed: parseCronExpression("0 9 * * *"),
     };
     const result = await runJobOnce(job, 1000, options);
@@ -219,11 +278,76 @@ test("runJobOnce reports an error when the child exits without agent_end", async
       timezone: "UTC",
       missed: "skip",
       prompt: "hi",
+      command: null,
+      timeout: null,
       parsed: parseCronExpression("0 9 * * *"),
     };
     const result = await runJobOnce(job, 1000, options);
     assert.equal(result.status, "error");
     assert.match(result.error ?? "", /agent_end/);
+  });
+});
+
+test("runJobOnce runs a command and captures stdout", async () => {
+  await withTempDir(async (dir) => {
+    await mkdir(join(dir, "workspace"), { recursive: true });
+    const options = baseOptions(dir);
+    const job: CronJob = {
+      id: "command",
+      schedule: "* * * * *",
+      timezone: "UTC",
+      missed: "skip",
+      prompt: null,
+      command: "printf ok",
+      timeout: 5,
+      parsed: parseCronExpression("* * * * *"),
+    };
+    const result = await runJobOnce(job, 0, options);
+    assert.equal(result.status, "ok");
+    assert.equal(result.text, "ok");
+    assert.equal(result.sessionFile, null);
+    assert.equal(result.error, null);
+  });
+});
+
+test("runJobOnce reports a command's nonzero exit", async () => {
+  await withTempDir(async (dir) => {
+    await mkdir(join(dir, "workspace"), { recursive: true });
+    const options = baseOptions(dir);
+    const job: CronJob = {
+      id: "command-error",
+      schedule: "* * * * *",
+      timezone: "UTC",
+      missed: "skip",
+      prompt: null,
+      command: "printf fail >&2; exit 3",
+      timeout: 5,
+      parsed: parseCronExpression("* * * * *"),
+    };
+    const result = await runJobOnce(job, 0, options);
+    assert.equal(result.status, "error");
+    assert.equal(result.text, "fail");
+    assert.equal(result.error, "exit code 3");
+  });
+});
+
+test("runJobOnce times out a long-running command", async () => {
+  await withTempDir(async (dir) => {
+    await mkdir(join(dir, "workspace"), { recursive: true });
+    const options = baseOptions(dir);
+    const job: CronJob = {
+      id: "command-timeout",
+      schedule: "* * * * *",
+      timezone: "UTC",
+      missed: "skip",
+      prompt: null,
+      command: "sleep 5",
+      timeout: 1,
+      parsed: parseCronExpression("* * * * *"),
+    };
+    const result = await runJobOnce(job, 0, options);
+    assert.equal(result.status, "error");
+    assert.match(result.error ?? "", /^command timed out after 1s$/);
   });
 });
 
@@ -240,6 +364,8 @@ test("computeDueFires skip fires once for a due time", () => {
     timezone: "UTC",
     missed: "skip",
     prompt: "p",
+    command: null,
+    timeout: null,
     parsed: parseCronExpression("0 9 * * *"),
   };
   const fires = computeDueFires(job, 0, 32_400_001);
@@ -256,6 +382,8 @@ test("computeDueFires catchUp fires once per missed interval up to the cap", () 
     timezone: "UTC",
     missed: "catchUp",
     prompt: "p",
+    command: null,
+    timeout: null,
     parsed: parseCronExpression("* * * * *"),
   };
   const fires = computeDueFires(job, 0, 180_000);
@@ -272,6 +400,8 @@ test("computeDueFires skip collapses a backlog to the latest due time", () => {
     timezone: "UTC",
     missed: "skip",
     prompt: "p",
+    command: null,
+    timeout: null,
     parsed: parseCronExpression("* * * * *"),
   };
   assert.deepEqual(computeDueFires(job, 0, 180_000), [180_000]);
@@ -286,6 +416,8 @@ test("computeDueFires treats a fresh job (null last run) as having no backlog", 
     timezone: "UTC",
     missed: "skip",
     prompt: "p",
+    command: null,
+    timeout: null,
     parsed: parseCronExpression("* * * * *"),
   };
   assert.deepEqual(computeDueFires(job, null, 90_000), []);
@@ -308,6 +440,8 @@ test("fireOne fires a job and writes the run file + last-run", async () => {
       timezone: "UTC",
       missed: "skip",
       prompt: "do it",
+      command: null,
+      timeout: null,
       parsed: parseCronExpression("0 0 1 1 *"),
     };
     const originalError = console.error;

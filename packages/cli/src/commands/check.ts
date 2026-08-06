@@ -498,8 +498,27 @@ function validateScheduleFile(
   if (parsed.missed !== "skip" && parsed.missed !== "catchUp") {
     errors.push(issue(path, "missed", "must be 'skip' or 'catchUp'"));
   }
-  if (typeof parsed.prompt !== "string" || !parsed.prompt.trim()) {
+  const prompt = parsed.prompt;
+  const command = parsed.command;
+  const hasPrompt = typeof prompt === "string" && prompt.trim().length > 0;
+  const hasCommand = typeof command === "string" && command.trim().length > 0;
+  if (prompt !== undefined && !hasPrompt) {
     errors.push(issue(path, "prompt", "must be a non-empty string"));
+  }
+  if (command !== undefined && !hasCommand) {
+    errors.push(issue(path, "command", "must be a non-empty string"));
+  }
+  if (hasPrompt && hasCommand) {
+    errors.push(issue(path, undefined, "exactly one of prompt or command is required"));
+  } else if (!hasPrompt && !hasCommand && prompt === undefined && command === undefined) {
+    errors.push(issue(path, undefined, "exactly one of prompt or command is required"));
+  }
+  if (parsed.timeout !== undefined) {
+    if (!hasCommand) {
+      errors.push(issue(path, "timeout", "is only valid with command"));
+    } else if (!isPositiveFiniteInteger(parsed.timeout)) {
+      errors.push(issue(path, "timeout", "must be a positive finite integer"));
+    }
   }
   scanCredentialAssignments(source, path, errors);
   void expectedId;
@@ -508,6 +527,16 @@ function validateScheduleFile(
 /** A 5-field cron expression: minute hour day-of-month month day-of-week. */
 const CRON_FIELD_RE =
   /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/;
+
+/** True when a YAML scalar is a positive finite integer. */
+function isPositiveFiniteInteger(value: YamlValue): boolean {
+  const number = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : Number.NaN;
+  return Number.isFinite(number) && Number.isInteger(number) && number > 0;
+}
 
 /** True when `tz` is a valid IANA timezone Intl can format. */
 function isValidTimezone(tz: string): boolean {
