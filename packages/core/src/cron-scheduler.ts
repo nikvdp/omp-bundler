@@ -4,10 +4,11 @@
  *
  * This is NOT an adapter. It has no adapter registration, no inbound POST, no
  * Core HTTP path, and no outbound callback. It reuses the OMP `--mode rpc`
- * child machinery ({@link RpcChild}) the way the core supervisor does, but as
- * a standalone process: it spawns a child, runs a fresh session per job, sends
- * the job's prompt, captures the assistant text deltas, writes the run output
- * and a `last-run.json` to `/data/cron/jobs/<job-id>/`, then closes the child.
+ * child machinery ({@link RpcChild}) the way the core supervisor does. Prompt
+ * jobs spawn a child, run a fresh session, send the job's prompt, capture
+ * assistant text deltas, and write the run output; command jobs run their raw
+ * shell string in the workspace. Both modes write a `last-run.json` to
+ * `/data/cron/jobs/<job-id>/` before finishing.
  *
  * Filesystem philosophy: schedules are source (`schedules/*.yml` at the bundle
  * root); cron output is durable runtime state under `/data/cron/` that the
@@ -17,6 +18,7 @@
  * any in-flight job and resolves. Re-scans `schedules/` on each wake so
  * added/edited jobs take effect without a restart.
  */
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,8 +43,12 @@ export interface CronJob {
   timezone: string;
   /** Missed-tick policy. */
   missed: "skip" | "catchUp";
-  /** The user message sent to the agent each run. */
-  prompt: string;
+  /** The user message sent to the agent each run, or null for command mode. */
+  prompt: string | null;
+  /** The raw shell command run each time, or null for prompt mode. */
+  command: string | null;
+  /** Command timeout in seconds, or null for prompt mode. */
+  timeout: number | null;
   /** Parsed schedule, computed once after validation. */
   parsed: CronSchedule;
 }
@@ -104,6 +110,10 @@ const MAX_WAKE_MS = 60_000;
 const CATCH_UP_CAP = 5;
 /** Ready timeout for a spawned child; command acks use RpcChild's default. */
 const CHILD_READY_TIMEOUT_MS = 30_000;
+/** Default timeout for command-mode jobs, in seconds. */
+const DEFAULT_COMMAND_TIMEOUT_SECONDS = 600;
+/** Grace period between command termination signals. */
+const COMMAND_KILL_GRACE_MS = 250;
 
 // ---------------------------------------------------------------------------
 // Schedule loading + parsing
@@ -141,9 +151,19 @@ export function parseScheduleFile(id: string, source: string): CronJob {
   if (missed !== "skip" && missed !== "catchUp") {
     throw new Error(`schedule '${id}': missed must be 'skip' or 'catchUp'`);
   }
-  const prompt = requiredString(record, "prompt", id);
-  if (prompt.trim().length === 0) {
-    throw new Error(`schedule '${id}': prompt must be non-empty`);
+  const prompt = optionalString(record, "prompt", id);
+  const command = optionalString(record, "command", id);
+  if ((prompt === null) === (command === null)) {
+    throw new Error(`schedule '${id}': exactly one of prompt or command is required`);
+  }
+  let timeout: number | null = null;
+  if (record.timeout !== undefined) {
+    if (command === null) {
+      throw new Error(`schedule '${id}': timeout is only valid with command`);
+    }
+    timeout = parseCommandTimeout(record.timeout, id);
+  } else if (command !== null) {
+    timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS;
   }
   validateTimezone(timezone, id);
   let cronSchedule: CronSchedule;
@@ -160,6 +180,8 @@ export function parseScheduleFile(id: string, source: string): CronJob {
     timezone,
     missed,
     prompt,
+    command,
+    timeout,
     parsed: cronSchedule,
   };
 }
@@ -179,6 +201,18 @@ function optionalString(record: Record<string, unknown>, field: string, id: stri
     throw new Error(`schedule '${id}': ${field} must be a non-empty string`);
   }
   return value;
+}
+
+function parseCommandTimeout(value: unknown, id: string): number {
+  const timeout = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : Number.NaN;
+  if (!Number.isFinite(timeout) || !Number.isInteger(timeout) || timeout <= 0) {
+    throw new Error(`schedule '${id}': timeout must be a positive finite integer`);
+  }
+  return timeout;
 }
 
 /** Throw if `tz` is not a valid IANA timezone Intl can format. */
@@ -230,11 +264,23 @@ async function writeRun(
 // ---------------------------------------------------------------------------
 
 /**
+ * Run one cron job fire in the appropriate mode and return its result.
+ */
+export function runJobOnce(
+  job: CronJob,
+  fireEpoch: number,
+  options: CronSchedulerOptions,
+): Promise<RunResult> {
+  if (job.command !== null) return runCommandOnce(job, fireEpoch, options);
+  return runPromptOnce(job, fireEpoch, options);
+}
+
+/**
  * Spawn an OMP RPC child, create a fresh session, send the prompt, capture
  * assistant text deltas until `agent_end`, and return the run result. The
  * child is always closed in a finally block.
  */
-export async function runJobOnce(
+async function runPromptOnce(
   job: CronJob,
   fireEpoch: number,
   options: CronSchedulerOptions,
@@ -289,7 +335,7 @@ export async function runJobOnce(
       const sf = (stateRes.data as { sessionFile?: unknown }).sessionFile;
       if (typeof sf === "string") sessionFile = sf;
     }
-    const promptRes = await child.prompt(job.prompt);
+    const promptRes = await child.prompt(job.prompt!);
     if (!promptRes.success) {
       throw new Error(`prompt failed: ${promptRes.error ?? "unknown"}`);
     }
@@ -315,6 +361,97 @@ export async function runJobOnce(
   } finally {
     if (child) await child.close().catch(() => {});
     void args; // referenced for clarity; args are consumed by the factory
+  }
+}
+
+/** Run one command-mode job through `sh -c`, bounded by its timeout. */
+async function runCommandOnce(
+  job: CronJob,
+  _fireEpoch: number,
+  options: CronSchedulerOptions,
+): Promise<RunResult> {
+  const startedAt = options.now?.() ?? Date.now();
+  const command = job.command!;
+  const timeoutSeconds = job.timeout ?? DEFAULT_COMMAND_TIMEOUT_SECONDS;
+  const timeoutMs = timeoutSeconds * 1000;
+  return new Promise<RunResult>((resolve) => {
+    let child: ChildProcess | null = null;
+    let text = "";
+    let timedOut = false;
+    let settled = false;
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+
+    const finish = (status: "ok" | "error", error: string | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(forceKillTimer);
+      resolve({
+        status,
+        text,
+        sessionFile: null,
+        error,
+        durationMs: (options.now?.() ?? Date.now()) - startedAt,
+      });
+    };
+    const timeoutError = (): string => `command timed out after ${timeoutSeconds}s`;
+
+    try {
+      child = spawn("sh", ["-c", command], {
+        cwd: options.workspaceDir,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      finish("error", error instanceof Error ? error.message : String(error));
+      return;
+    }
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      text += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      text += chunk.toString();
+    });
+    child.once("error", (error) => {
+      if (!timedOut) finish("error", error instanceof Error ? error.message : String(error));
+    });
+    child.once("close", (code) => {
+      if (timedOut) {
+        finish("error", timeoutError());
+      } else if (code === 0) {
+        finish("ok", null);
+      } else {
+        finish("error", `exit code ${code ?? "unknown"}`);
+      }
+    });
+    timeoutTimer = setTimeout(() => {
+      if (settled || !child) return;
+      timedOut = true;
+      killCommandProcess(child, "SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        if (settled || !child) return;
+        killCommandProcess(child, "SIGKILL");
+        finish("error", timeoutError());
+      }, COMMAND_KILL_GRACE_MS);
+    }, timeoutMs);
+  });
+}
+
+/** Terminate a detached command's process group, falling back to its child. */
+function killCommandProcess(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32" && typeof child.pid === "number") {
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      // The child may have exited between the close check and this signal.
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // The child may have exited between the close check and this signal.
   }
 }
 

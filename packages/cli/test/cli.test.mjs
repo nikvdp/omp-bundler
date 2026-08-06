@@ -1137,6 +1137,62 @@ test("check validates cron schedule files at the bundle root", async () => {
     const good = await validateBundle({ cwd: bundle });
     assert.equal(good.ok, true, good.errors.map((entry) => entry.message).join("\n"));
 
+    await writeText(join(bundle, "schedules", "command.yml"), [
+      'schedule: "*/10 * * * *"',
+      "missed: skip",
+      'command: "printf ok"',
+      "timeout: 300",
+      "",
+    ].join("\n"));
+    const commandOnly = await validateBundle({ cwd: bundle });
+    assert.equal(commandOnly.ok, true, commandOnly.errors.map((entry) => entry.message).join("\n"));
+
+    await writeText(join(bundle, "schedules", "both.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'prompt: "Run it."',
+      'command: "printf ok"',
+      "",
+    ].join("\n"));
+    const both = await validateBundle({ cwd: bundle });
+    assert(both.errors.some((entry) =>
+      entry.message.includes("exactly one of prompt or command"),
+    ));
+
+    await writeText(join(bundle, "schedules", "neither.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      "",
+    ].join("\n"));
+    const neither = await validateBundle({ cwd: bundle });
+    assert(neither.errors.some((entry) =>
+      entry.message.includes("exactly one of prompt or command"),
+    ));
+
+    await writeText(join(bundle, "schedules", "prompt-timeout.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'prompt: "Run it."',
+      "timeout: 300",
+      "",
+    ].join("\n"));
+    const promptTimeout = await validateBundle({ cwd: bundle });
+    assert(promptTimeout.errors.some((entry) =>
+      entry.field === "timeout" && entry.message.includes("only valid with command"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-timeout.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'command: "printf ok"',
+      "timeout: 0",
+      "",
+    ].join("\n"));
+    const badTimeout = await validateBundle({ cwd: bundle });
+    assert(badTimeout.errors.some((entry) =>
+      entry.field === "timeout" && entry.message.includes("positive finite integer"),
+    ));
+
     await writeText(join(bundle, "schedules", "bad-cron.yml"), [
       'schedule: "not a cron expr"',
       "missed: skip",

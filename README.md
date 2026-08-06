@@ -346,6 +346,39 @@ OMP_ADAPTERS=[{"adapterId":"http-meetings-agent","callbackUrl":"http://127.0.0.1
 The registration's `agentId` must equal `agent.id`; missing, extra, or unbound
 registrations are rejected before startup.
 
+## Schedules (cron)
+
+Add cron jobs as YAML mappings under `schedules/`. Only active `*.yml` files
+are loaded; the `.example` suffix is inert, so the scaffolded
+`schedules/example-schedule.yml.example` does not run until it is renamed.
+Each schedule requires `schedule`, `missed`, and exactly one of `prompt` or
+`command`; `timezone` defaults to `UTC`.
+
+Prompt mode starts an OMP session for an LLM turn:
+
+```yaml
+schedule: "0 9 * * 1-5"
+timezone: America/New_York
+missed: skip
+prompt: "Summarize today's meetings."
+```
+
+Command mode runs a raw shell command in the workspace without a model turn.
+Its optional `timeout` is in seconds and defaults to 600:
+
+```yaml
+schedule: "*/10 * * * *"
+missed: skip
+command: "git fetch --all --prune"
+timeout: 300
+```
+
+With `missed: skip`, downtime collapses missed fires to the latest due run.
+With `missed: catchUp`, the scheduler runs each missed interval (up to its
+catch-up cap). Output text is written under
+`/data/cron/jobs/<id>/runs/`.
+
+
 ## Validate
 
 From the bundle:
