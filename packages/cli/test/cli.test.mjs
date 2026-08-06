@@ -731,6 +731,7 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
         "extensions",
         "skills",
         "tools",
+        "schedules",
       ]),
     );
     for (const relativePath of [
@@ -739,6 +740,7 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
       join("extensions", "example-extension.ts.example"),
       join("skills", "example-skill", "SKILL.md.example"),
       join("tools", "example-tool.ts.example"),
+      join("schedules", "example-schedule.yml.example"),
     ]) {
       assert.equal(await exists(join(derived, relativePath)), true, relativePath);
     }
@@ -780,6 +782,7 @@ test("component generators and destroy commands use root paths without deployed 
       ["tool", "lookup-record", join("tools", "lookup-record.ts")],
       ["extension", "lifecycle-log", join("extensions", "lifecycle-log.ts")],
       ["subagent", "researcher", join("subagents", "researcher.md")],
+      ["schedule", "daily-summary", join("schedules", "daily-summary.yml")],
     ];
     for (const [kind, name, relativePath] of components) {
       await invoke(generateCommand, bundle, [kind, name]);
@@ -795,6 +798,10 @@ test("component generators and destroy commands use root paths without deployed 
     await assert.rejects(
       () => invoke(generateCommand, bundle, ["skill", "alpha", "wrong"]),
       /usage: omp-bundler generate skill <name>/,
+    );
+    await assert.rejects(
+      () => invoke(generateCommand, bundle, ["schedule", "two", "args"]),
+      /usage: omp-bundler generate schedule <name>/,
     );
     await assert.rejects(
       () => invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" }),
@@ -975,6 +982,73 @@ test("check and Docker staging map agent components into OMP", async () => {
     } finally {
       await removeDockerContext(contextPath);
     }
+  });
+});
+
+test("check validates cron schedule files at the bundle root", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+
+    // The scaffolded example stays inert and does not trip validation.
+    const base = await validateBundle({ cwd: bundle });
+    assert.equal(base.ok, true, base.errors.map((entry) => entry.message).join("\n"));
+
+    await writeText(join(bundle, "schedules", "good.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "timezone: America/New_York",
+      "missed: skip",
+      'prompt: "Run the daily summary."',
+      "",
+    ].join("\n"));
+    const good = await validateBundle({ cwd: bundle });
+    assert.equal(good.ok, true, good.errors.map((entry) => entry.message).join("\n"));
+
+    await writeText(join(bundle, "schedules", "bad-cron.yml"), [
+      'schedule: "not a cron expr"',
+      "missed: skip",
+      'prompt: "x"',
+      "",
+    ].join("\n"));
+    const badCron = await validateBundle({ cwd: bundle });
+    assert(badCron.errors.some((entry) =>
+      entry.field === "schedule" && entry.message.includes("5-field cron"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-tz.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "timezone: Not/A/Zone",
+      "missed: skip",
+      'prompt: "x"',
+      "",
+    ].join("\n"));
+    const badTz = await validateBundle({ cwd: bundle });
+    assert(badTz.errors.some((entry) =>
+      entry.field === "timezone" && entry.message.includes("IANA timezone"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-missed.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "missed: later",
+      'prompt: "x"',
+      "",
+    ].join("\n"));
+    const badMissed = await validateBundle({ cwd: bundle });
+    assert(badMissed.errors.some((entry) =>
+      entry.field === "missed" && entry.message.includes("'skip' or 'catchUp'"),
+    ));
+
+    await writeText(join(bundle, "schedules", "no-prompt.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "missed: skip",
+      'prompt: ""',
+      "",
+    ].join("\n"));
+    const noPrompt = await validateBundle({ cwd: bundle });
+    assert(noPrompt.errors.some((entry) =>
+      entry.field === "prompt" && entry.message.includes("non-empty"),
+    ));
   });
 });
 
