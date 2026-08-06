@@ -21,11 +21,12 @@ commands/example-command.md.example
 extensions/example-extension.ts.example
 skills/example-skill/SKILL.md.example
 tools/example-tool.ts.example
+schedules/example-schedule.yml.example
 ```
 
 The `.example` suffix keeps starter components inactive while making every extension point obvious. `check` must still validate these templates. Never collapse `new` back to a minimal two-file scaffold.
 
-The generated bundle README MUST explain the hierarchy, the inactive example suffix, and the matching `generate` commands. A first-time user should not need prior OMP path knowledge to discover skills, commands, tools, extensions, or subagents.
+The generated bundle README MUST explain the hierarchy, the inactive example suffix, and the matching `generate` commands. A first-time user should not need prior OMP path knowledge to discover skills, commands, tools, extensions, subagents, or cron schedules. Cron schedules are runtime config, not an OMP component: `new` scaffolds `schedules/example-schedule.yml.example`, staged to `/schedules` (not `.omp/`); each active `*.yml` runs its prompt on its cron schedule and writes output under `/data/cron/jobs/`.
 
 The generated `models.yml` MUST be an empty native OMP provider catalog.
 `model add` appends providers and models without changing the default;
