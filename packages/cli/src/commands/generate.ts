@@ -9,7 +9,7 @@ import {
   assertAllowedOptions,
 } from "./common.ts";
 import { assertNoSymlinkComponents } from "./support.ts";
-import { componentFile, updatePumbleBlock } from "./templates.ts";
+import { componentFile, scheduleFile, updatePumbleBlock } from "./templates.ts";
 import type { ComponentKind } from "./templates.ts";
 
 const GENERATE_HELP = [
@@ -19,6 +19,7 @@ const GENERATE_HELP = [
   "omp-bundler generate extension <name> [--dry-run]",
   "omp-bundler generate subagent <name> [--dry-run]",
   "omp-bundler generate adapter pumble [--dry-run]",
+  "omp-bundler generate schedule <name> [--dry-run]",
 ].join("\n");
 
 const COMPONENT_KINDS: Record<string, ComponentKind> = {
@@ -38,9 +39,10 @@ export const generateCommand: CommandHandler = async (args, context) => {
   assertAllowedOptions(args, ["dry-run"]);
   const dryRun = args.options["dry-run"] === true;
   if (kind === "adapter") return generateAdapter(args, context, dryRun);
+  if (kind === "schedule") return generateSchedule(args, context, dryRun);
   const componentKind = COMPONENT_KINDS[kind];
   if (componentKind === undefined) {
-    throw new Error(`usage: omp-bundler generate <skill|command|tool|extension|subagent|adapter> ...`);
+    throw new Error(`usage: omp-bundler generate <skill|command|tool|extension|subagent|adapter|schedule> ...`);
   }
   return generateComponent(args, context, componentKind, dryRun);
 };
@@ -85,5 +87,22 @@ async function generateAdapter(
   const plan = await createFilePlan(project.rootDir, [
     { path: "runtime.env.example", content: merged, overwrite: true },
   ]);
+  await applyAndReport(plan, context, dryRun);
+}
+
+async function generateSchedule(
+  args: ParsedArguments,
+  context: CommandContext,
+  dryRun: boolean,
+): Promise<void> {
+  if (args.positionals.length !== 2) {
+    throw new Error(`usage: omp-bundler generate schedule <name> [--dry-run]`);
+  }
+  const name = args.positionals[1];
+  assertSafeIdentifier(name, "schedule name");
+  const project = await loadProject(undefined, context.cwd);
+  const path = join(project.rootDir, `schedules/${name}.yml`);
+  await assertNoSymlinkComponents(project.rootDir, path, "schedule path");
+  const plan = await createFilePlan(project.rootDir, [scheduleFile(name)]);
   await applyAndReport(plan, context, dryRun);
 }

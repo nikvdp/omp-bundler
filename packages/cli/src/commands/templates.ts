@@ -86,6 +86,10 @@ export function agentScaffoldFiles(agentId: string): readonly PlannedWrite[] {
       path: "tools/example-tool.ts.example",
       content: exampleToolTemplate(),
     },
+    {
+      path: "schedules/example-schedule.yml.example",
+      content: exampleScheduleTemplate(),
+    },
   ];
 }
 
@@ -190,6 +194,40 @@ function exampleExtensionTemplate(): string {
 
 function exampleToolTemplate(): string {
   return `import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";\n\nconst factory: CustomToolFactory = (pi) => ({\n  name: "example_tool",\n  label: "Example Tool",\n  description: "A harmless starter custom tool.",\n  parameters: pi.zod.object({}),\n\n  async execute() {\n    return {\n      content: [{ type: "text", text: "Customize this tool before using it." }],\n    };\n  },\n});\n\nexport default factory;\n`;
+}
+
+export function scheduleFile(name: string): PlannedWrite {
+  return { path: `schedules/${name}.yml`, content: scheduleTemplate(name) };
+}
+
+export function exampleScheduleTemplate(): string {
+  return [
+    "# Cron schedule. This example is inert while it has the .example suffix.",
+    "# Rename to example-schedule.yml (drop .example) to activate it.",
+    "# The agent runs `prompt` in a fresh OMP session on this schedule and writes",
+    "# its output to /data/cron/jobs/<job-id>/ for the agent to read.",
+    "schedule: \"0 9 * * 1-5\"",
+    "timezone: UTC",
+    "missed: skip",
+    "prompt: \"Summarize today's meetings and post the summary.\"",
+    "",
+  ].join("\n");
+}
+
+export function scheduleTemplate(name: string): string {
+  return [
+    `# Cron schedule for ${name}. Edit the fields below.`,
+    "# schedule: 5-field cron expression (minute hour day month weekday).",
+  "# timezone: IANA timezone (e.g. America/New_York). Defaults to UTC.",
+  "# missed: skip (advance to next fire time) or catchUp (fire for missed intervals).",
+  "# prompt: the user message sent to the agent each run.",
+  'schedule: "0 9 * * 1-5"',
+  "timezone: UTC",
+  "missed: skip",
+  "prompt: |",
+  `  Replace this with the prompt ${name} should run on schedule.`,
+  "",
+  ].join("\n");
 }
 
 function skillTemplate(name: string): string {

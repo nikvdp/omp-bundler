@@ -160,6 +160,7 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   const projectInfo = buildProjectContext(rootDir, configPath, parsedConfig, errors);
   const agents = [projectInfo.project.agent] as [AgentDirectory];
   await validateAgent(projectInfo.project.agent, errors);
+  await validateSchedulesDirectory(rootDir, errors);
 
   let modelBundle: LoadedModelBundle = {
     catalog: { providers: {} },
@@ -422,6 +423,102 @@ async function validateComponents(agent: AgentDirectory, errors: ValidationIssue
   await validateSkillsDirectory(join(agent.path, "skills"), errors);
 }
 
+/**
+ * Validate the bundle-root `schedules/` directory of cron job YAML files.
+ * `*.yml` are active; `*.example` (and any other suffix) are inert. Schedules
+ * live at the bundle root, not under the agent `.omp` surface, so this is
+ * separate from {@link validateComponents}.
+ */
+async function validateSchedulesDirectory(
+  bundleRoot: string,
+  errors: ValidationIssue[],
+): Promise<void> {
+  const directory = join(bundleRoot, "schedules");
+  const info = await lstat(directory).catch(() => null);
+  if (!info?.isDirectory()) return;
+  const names = await readdir(directory).catch(() => [] as string[]);
+  const seen = new Set<string>();
+  for (const name of names.sort()) {
+    const path = join(directory, name);
+    const entry = await lstat(path).catch(() => null);
+    if (!entry) continue;
+    if (entry.isSymbolicLink()) {
+      errors.push(issue(path, undefined, "schedule files must not be symlinks"));
+      continue;
+    }
+    if (!entry.isFile()) {
+      errors.push(issue(path, undefined, "schedule entries must be regular files"));
+      continue;
+    }
+    const parsed = componentFileName(name, ".yml");
+    if (!parsed || parsed.example) continue; // inert (e.g. *.yml.example) or unrelated: ignore
+    if (seen.has(parsed.id)) {
+      errors.push(issue(path, "schedule name", `duplicates active schedule '${parsed.id}'`));
+    }
+    seen.add(parsed.id);
+    const source = await readFile(path, "utf8").catch(() => null);
+    if (source === null) {
+      errors.push(issue(path, undefined, "cannot be read; check file permissions"));
+      continue;
+    }
+    validateScheduleFile(path, source, parsed.id, errors);
+  }
+}
+
+/** Validate one cron schedule YAML body against the job schema. */
+function validateScheduleFile(
+  path: string,
+  source: string,
+  expectedId: string,
+  errors: ValidationIssue[],
+): void {
+  let parsed: YamlValue;
+  try {
+    parsed = parseYaml(source);
+  } catch {
+    errors.push(issue(path, undefined, "schedule is not valid YAML"));
+    return;
+  }
+  if (!isRecord(parsed)) {
+    errors.push(issue(path, undefined, "schedule must be a YAML mapping"));
+    return;
+  }
+  if (typeof parsed.schedule !== "string" || !parsed.schedule.trim()) {
+    errors.push(issue(path, "schedule", "must be a non-empty 5-field cron expression"));
+  } else if (!CRON_FIELD_RE.test(parsed.schedule.trim())) {
+    errors.push(issue(path, "schedule", "must be a 5-field cron expression (minute hour day month weekday)"));
+  }
+  if (parsed.timezone !== undefined) {
+    if (typeof parsed.timezone !== "string" || !parsed.timezone.trim()) {
+      errors.push(issue(path, "timezone", "must be a non-empty IANA timezone"));
+    } else if (!isValidTimezone(parsed.timezone.trim())) {
+      errors.push(issue(path, "timezone", "must be a valid IANA timezone (e.g. America/New_York)"));
+    }
+  }
+  if (parsed.missed !== "skip" && parsed.missed !== "catchUp") {
+    errors.push(issue(path, "missed", "must be 'skip' or 'catchUp'"));
+  }
+  if (typeof parsed.prompt !== "string" || !parsed.prompt.trim()) {
+    errors.push(issue(path, "prompt", "must be a non-empty string"));
+  }
+  scanCredentialAssignments(source, path, errors);
+  void expectedId;
+}
+
+/** A 5-field cron expression: minute hour day-of-month month day-of-week. */
+const CRON_FIELD_RE =
+  /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/;
+
+/** True when `tz` is a valid IANA timezone Intl can format. */
+function isValidTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function validateMarkdownDirectory(
   directory: string,
   kind: "subagents" | "commands",
@@ -548,7 +645,7 @@ async function validateSkillsDirectory(directory: string, errors: ValidationIssu
   }
 }
 
-function componentFileName(name: string, extension: ".md" | ".ts"): { id: string; example: boolean } | null {
+function componentFileName(name: string, extension: ".md" | ".ts" | ".yml"): { id: string; example: boolean } | null {
   const active = new RegExp(`^([a-z0-9][a-z0-9_-]{0,63})\\${extension}$`).exec(name);
   if (active) return { id: active[1], example: false };
   const example = new RegExp(`^([a-z0-9][a-z0-9_-]{0,63})\\${extension}\\.example$`).exec(name);
