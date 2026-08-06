@@ -102,9 +102,8 @@ export interface CronScheduler {
 const MAX_WAKE_MS = 60_000;
 /** Cap catch-up fires per due job to avoid runaway catch-up. */
 const CATCH_UP_CAP = 5;
-/** Default ready/response timeouts for spawned children. */
+/** Ready timeout for a spawned child; command acks use RpcChild's default. */
 const CHILD_READY_TIMEOUT_MS = 30_000;
-const CHILD_RESPONSE_TIMEOUT_MS = 0; // 0 = wait indefinitely for long turns
 
 // ---------------------------------------------------------------------------
 // Schedule loading + parsing
@@ -337,7 +336,6 @@ function defaultChildFactory(options: CronSchedulerOptions): ChildFactory {
       args: buildChildArgs(options),
       cwd,
       readyTimeoutMs: CHILD_READY_TIMEOUT_MS,
-      responseTimeoutMs: CHILD_RESPONSE_TIMEOUT_MS,
     });
     await child.start();
     return child;
@@ -393,13 +391,23 @@ export function startCronScheduler(
     let earliestNext = Number.POSITIVE_INFINITY;
     for (const job of jobs) {
       const lastRun = await readLastRun(options.cronDataDir, job.id);
-      const due = computeDueFires(job, lastRun, nowMs);
-      for (const fireEpoch of due) {
-        // Run one fire at a time; await so ticks never overlap.
-        inFlight = fireOne(options, job, fireEpoch).finally(() => {
-          inFlight = null;
+      if (lastRun === null) {
+        // First time we see this job: anchor at now so its first fire is the
+        // next scheduled boundary, not a catch-up from epoch 0. No fire yet.
+        await writeLastRun(options.cronDataDir, job.id, {
+          jobId: job.id,
+          fireEpoch: nowMs,
+          anchoredAt: nowMs,
         });
-        await inFlight;
+      } else {
+        const due = computeDueFires(job, lastRun, nowMs);
+        for (const fireEpoch of due) {
+          // Run one fire at a time; await so ticks never overlap.
+          inFlight = fireOne(options, job, fireEpoch).finally(() => {
+            inFlight = null;
+          });
+          await inFlight;
+        }
       }
       const next = nextRunAfter(job.parsed, nowMs, job.timezone);
       if (next < earliestNext) earliestNext = next;
@@ -421,7 +429,6 @@ export function startCronScheduler(
         scheduleNext(MAX_WAKE_MS);
       });
     }, delayMs);
-    timer.unref();
   };
 
   return {
@@ -442,22 +449,32 @@ export function computeDueFires(
   lastRunMs: number | null,
   nowMs: number,
 ): number[] {
-  const next = nextRunAfter(job.parsed, lastRunMs ?? 0, job.timezone);
-  if (next > nowMs) return [];
+  // A fresh job (no persisted last run) has no backlog: anchor at now so the
+  // first fire is the next scheduled boundary, never a catch-up from epoch 0.
+  const base = lastRunMs ?? nowMs;
   if (job.missed === "skip") {
-    // Fire once for the single due time; advance implicitly via lastRun.
-    return [next];
+    // Fire at most once, at the most recent due boundary; drop any backlog so
+    // downtime never replays missed fires one tick at a time.
+    let latest = -1;
+    let cursor = base;
+    for (;;) {
+      const fire = nextRunAfter(job.parsed, cursor, job.timezone);
+      if (fire > nowMs) break;
+      latest = fire;
+      cursor = fire;
+    }
+    return latest >= 0 ? [latest] : [];
   }
   // catchUp: fire once per missed interval up to the cap.
   const fires: number[] = [];
-  let cursor = lastRunMs ?? 0;
+  let cursor = base;
   for (let i = 0; i < CATCH_UP_CAP; i++) {
     const fire = nextRunAfter(job.parsed, cursor, job.timezone);
     if (fire > nowMs) break;
     fires.push(fire);
     cursor = fire;
   }
-  return fires.length > 0 ? fires : [next];
+  return fires;
 }
 
 /** Run one fire of a job and persist its output + last-run state. */
