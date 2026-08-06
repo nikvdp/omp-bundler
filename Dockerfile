@@ -43,6 +43,7 @@ COPY template/         "${HOME}/.omp/agent/"
 # volume and leaves the persistent workspace untouched.
 COPY agent/id       /agent/id
 COPY agent/.omp/    /agent/.omp/
+COPY agent/files.json  /agent/files.json
 COPY schedules/     /schedules/
 
 # ── production dependency install ─────────────────────────────────────

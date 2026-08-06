@@ -9,7 +9,7 @@ import {
 export { CANONICAL_ASSET_PATHS } from "../package-assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import type { LoadedModelBundle } from "../model-config.ts";
-import type { AgentDirectory } from "../types.ts";
+import type { AgentDirectory, ProjectConfig } from "../types.ts";
 
 
 export const BUNDLE_ROOT_LABEL = "io.omp-bundler.bundle-root";
@@ -81,6 +81,7 @@ export async function stageDockerContext(
   agents: readonly AgentDirectory[],
   modelsOrAssetsRoot?: LoadedModelBundle | string,
   assetsRoot?: string,
+  filesConfig?: ProjectConfig["files"],
 ): Promise<string> {
   const models = typeof modelsOrAssetsRoot === "object" ? modelsOrAssetsRoot : undefined;
   const sourceAssetsRoot = typeof modelsOrAssetsRoot === "string" ? modelsOrAssetsRoot : assetsRoot;
@@ -107,6 +108,7 @@ export async function stageDockerContext(
     if (await lstat(schedulesSource).catch(() => null)) {
       await copyTreeNoSymlinks(schedulesSource, join(contextPath, "schedules"), true);
     }
+    await writeFile(join(stagedAgent, "files.json"), JSON.stringify(filesConfig ?? [], null, 2), "utf8");
 
     if (models !== undefined) {
       await writeFile(join(contextPath, "template", "models.yml.tmpl"), models.source, "utf8");

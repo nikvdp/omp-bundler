@@ -60,10 +60,11 @@ export interface BuildValidation {
 }
 
 
-const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: true, run: true };
+const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: true, run: true, files: true };
 const AGENT_KEYS: Record<string, true> = { id: true };
 const IMAGE_KEYS: Record<string, true> = { tag: true };
 const RUN_KEYS: Record<string, true> = { dataVolume: true, corePort: true, adapterPort: true };
+const FILE_KEYS: Record<string, true> = { env: true, path: true, mode: true };
 const OMP_REQUIRED_FILES = ["AGENTS.md", "config.yml"] as const;
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
 const SECRET_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/;
@@ -161,6 +162,12 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   const agents = [projectInfo.project.agent] as [AgentDirectory];
   await validateAgent(projectInfo.project.agent, errors);
   await validateSchedulesDirectory(rootDir, errors);
+  const filesConfig: unknown = projectInfo.project.config.files;
+  if (Array.isArray(filesConfig)) {
+    for (const entry of filesConfig) {
+      if (isRecord(entry) && typeof entry.env === "string") credentialNames.add(entry.env);
+    }
+  }
 
   let modelBundle: LoadedModelBundle = {
     catalog: { providers: {} },
@@ -375,11 +382,69 @@ function validateProjectConfig(
       }
     }
   }
+  if (value.files !== undefined) validateFilesConfig(value.files, path, errors);
   if (isRecord(value.image) && value.image.tag !== undefined && (
     typeof value.image.tag !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/.test(value.image.tag) || value.image.tag.includes("..")
   )) {
     errors.push(issue(path, "image.tag", "must be a safe Docker image tag without traversal, whitespace, or shell expansion"));
   }
+}
+
+function validateFilesConfig(
+  value: YamlValue,
+  path: string,
+  errors: ValidationIssue[],
+): void {
+  if (!Array.isArray(value)) {
+    errors.push(issue(path, "files", "must be an array"));
+    return;
+  }
+  const seenPaths = new Set<string>();
+  value.forEach((entry, index) => {
+    const field = `files[${index}]`;
+    if (!isRecord(entry)) {
+      errors.push(issue(path, field, "must be a mapping"));
+      return;
+    }
+    for (const key of Object.keys(entry)) {
+      if (!(key in FILE_KEYS)) errors.push(issue(path, `${field}.${key}`, "is not a supported field"));
+    }
+
+    if (typeof entry.env !== "string" || !entry.env.trim()) {
+      errors.push(issue(path, `${field}.env`, "must be a non-empty environment variable name"));
+    } else if (!ENV_KEY.test(entry.env)) {
+      errors.push(issue(path, `${field}.env`, "must be a valid environment variable name"));
+    }
+
+    if (typeof entry.path !== "string" || !entry.path) {
+      errors.push(issue(path, `${field}.path`, "must be a non-empty absolute path"));
+    } else {
+      if (seenPaths.has(entry.path)) {
+        errors.push(issue(path, `${field}.path`, "must be unique across files entries"));
+      } else {
+        seenPaths.add(entry.path);
+      }
+      if (!isAbsolute(entry.path)) {
+        errors.push(issue(path, `${field}.path`, "must be an absolute path"));
+      } else if (entry.path === "/data" || entry.path.startsWith("/data/")) {
+        errors.push(issue(path, `${field}.path`, "must not be under /data"));
+      } else if (
+        entry.path === "/agent" ||
+        entry.path.startsWith("/agent/") ||
+        entry.path === "/app" ||
+        entry.path.startsWith("/app/")
+      ) {
+        errors.push(issue(path, `${field}.path`, "must not target reserved bundler paths /agent or /app"));
+      }
+    }
+
+    if (
+      entry.mode !== undefined &&
+      (typeof entry.mode !== "string" || !/^0?[0-7]{3,4}$/.test(entry.mode))
+    ) {
+      errors.push(issue(path, `${field}.mode`, "must be an octal mode with 3 or 4 digits"));
+    }
+  });
 }
 
 function validateMapping(

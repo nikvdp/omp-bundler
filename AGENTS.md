@@ -47,3 +47,4 @@ selected model to exist in the catalog. Model IDs are literal. Provider
 - Refreshed readable definition: `/data/agent/.omp`.
 - Persistent agent cwd: `/data/agent/workspace`.
 - OMP's ephemeral discovery directory may materialize the definition, but sessions must remain under `/data` and rendered credentials must not be persisted in the readable definition.
+- `omp-bundler.yml` `files:` entries declare env-to-file materialization; `check` validates them; builds bake the manifest as `/agent/files.json`; the entrypoint materializes files before core/adapter/cron start; destinations must stay outside `/data`.
