@@ -6,8 +6,8 @@
 #   1. Render models.yml from the env-var template.
 #   2. Configure the selected bundled adapter (HTTP by default).
 #   3. Run the orphan sweep once; fail if it is missing or fails.
-#   4. Supervise the core server (port 8787) and selected adapter
-#      (port 8765). The first child to exit tears down its sibling.
+#   4. Supervise the core server (port 8787), selected adapter (port 8765),
+#      and optional cron scheduler. The first child to exit tears down siblings.
 #
 # The core server loads the ambient ingest extension at runtime; it
 # must be present in the staged packages/core/src tree.
@@ -50,6 +50,7 @@ ORPHAN_SWEEP="${OMP_ORPHAN_SWEEP:-/app/packages/core/src/orphan-sweep.ts}"
 CORE_SERVER="${OMP_CORE_SERVER:-/app/packages/core/src/server.ts}"
 HTTP_SERVER="${OMP_HTTP_SERVER:-/app/packages/http-adapter/src/server.ts}"
 PUMBLE_SERVER="${OMP_PUMBLE_SERVER:-/app/packages/pumble-adapter/src/server.ts}"
+CRON_SERVER="${OMP_CRON_SERVER:-/app/packages/core/src/cron-scheduler.ts}"
 
 # Ambient ingest extension loaded by the core server at runtime.
 AMBIENT_EXTENSION="${OMP_AMBIENT_EXTENSION:-/app/packages/core/src/ambient-ingest-extension.ts}"
@@ -298,6 +299,35 @@ pumble)
 	;;
 esac
 
+# -- 4. cron scheduler -------------------------------------------------
+# Cron is opt-in when an explicit flag is provided; otherwise active staged
+# schedules enable it automatically.
+CRON_ENABLED=""
+if [ "${OMP_CRON_ENABLED+x}" = x ]; then
+	case "${OMP_CRON_ENABLED,,}" in
+	true|1|yes|on)
+		CRON_ENABLED=1
+		;;
+	*)
+		CRON_ENABLED=0
+		log "cron disabled (OMP_CRON_ENABLED=${OMP_CRON_ENABLED})"
+		;;
+	esac
+else
+	if [ -d "${OMP_CRON_SCHEDULES_DIR:-}" ]; then
+		for _schedule in "$OMP_CRON_SCHEDULES_DIR"/*.yml; do
+			if [ -f "$_schedule" ]; then
+				CRON_ENABLED=1
+				break
+			fi
+		done
+	fi
+	if [ "$CRON_ENABLED" != 1 ]; then
+		CRON_ENABLED=0
+		log "cron disabled (no active schedules)"
+	fi
+fi
+
 # -- 4. orphan sweep ---------------------------------------------------
 # The orphan sweep is a core module. It MUST run once; we do not
 # silently skip it. If the executable is absent or fails, the
@@ -309,9 +339,9 @@ log "running orphan sweep: ${ORPHAN_SWEEP}"
 bun "$ORPHAN_SWEEP"
 log "orphan sweep complete"
 
-# -- 5. start core + selected adapter under supervision -----------------
-# This shell remains PID 1, forwards signals, and tears down the sibling
-# when either supervised service exits.
+# -- 5. start core + selected adapter (+ optional cron) under supervision -
+# This shell remains PID 1, forwards signals, and tears down every
+# supervised sibling when any service exits.
 
 [ -f "$CORE_SERVER" ] || die "core server not found at ${CORE_SERVER}"
 [ -f "$ADAPTER_SERVER" ] || die "${ADAPTER_LABEL} adapter server not found at ${ADAPTER_SERVER}"
@@ -319,6 +349,7 @@ log "orphan sweep complete"
 
 CORE_PID=""
 ADAPTER_PID=""
+CRON_PID=""
 EXIT_CODE=0
 TEARING_DOWN=0
 
@@ -329,6 +360,9 @@ forward_signal() {
 	fi
 	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 		kill -"$sig" "$CORE_PID" 2>/dev/null || true
+	fi
+	if [ -n "$CRON_PID" ] && kill -0 "$CRON_PID" 2>/dev/null; then
+		kill -"$sig" "$CRON_PID" 2>/dev/null || true
 	fi
 }
 
@@ -343,7 +377,19 @@ log "starting ${ADAPTER_LABEL} adapter: ${ADAPTER_SERVER}"
 bun "$ADAPTER_SERVER" &
 ADAPTER_PID=$!
 
-log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}"
+if [ "$CRON_ENABLED" = 1 ] && [ -f "$CRON_SERVER" ]; then
+	log "starting cron scheduler: ${CRON_SERVER}"
+	bun "$CRON_SERVER" &
+	CRON_PID=$!
+elif [ "$CRON_ENABLED" = 1 ]; then
+	log "cron scheduler not found; skipping: ${CRON_SERVER}"
+fi
+
+if [ -n "$CRON_PID" ]; then
+	log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}, cron pid=${CRON_PID}"
+else
+	log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}"
+fi
 
 set +e
 wait -n
@@ -361,13 +407,19 @@ fi
 for _ in {1..50}; do
 	CORE_ALIVE=0
 	ADAPTER_ALIVE=0
+	CRON_ALIVE=0
 	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 		CORE_ALIVE=1
 	fi
 	if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
 		ADAPTER_ALIVE=1
 	fi
-	if [ "$CORE_ALIVE" -eq 0 ] && [ "$ADAPTER_ALIVE" -eq 0 ]; then
+	if [ -n "$CRON_PID" ] && kill -0 "$CRON_PID" 2>/dev/null; then
+		CRON_ALIVE=1
+	fi
+	if [ "$CORE_ALIVE" -eq 0 ] &&
+		[ "$ADAPTER_ALIVE" -eq 0 ] &&
+		[ "$CRON_ALIVE" -eq 0 ]; then
 		break
 	fi
 	sleep 0.1
@@ -381,6 +433,11 @@ if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
 	log "${ADAPTER_LABEL} adapter did not exit; sending SIGKILL"
 	kill -9 "$ADAPTER_PID" 2>/dev/null || true
 	wait "$ADAPTER_PID" 2>/dev/null || true
+fi
+if [ -n "$CRON_PID" ] && kill -0 "$CRON_PID" 2>/dev/null; then
+	log "cron scheduler did not exit; sending SIGKILL"
+	kill -9 "$CRON_PID" 2>/dev/null || true
+	wait "$CRON_PID" 2>/dev/null || true
 fi
 
 log "supervisor exiting (status ${EXIT_CODE})"
