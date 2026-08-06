@@ -43,6 +43,7 @@ COPY template/         "${HOME}/.omp/agent/"
 # volume and leaves the persistent workspace untouched.
 COPY agent/id       /agent/id
 COPY agent/.omp/    /agent/.omp/
+COPY schedules/     /schedules/
 
 # ── production dependency install ─────────────────────────────────────
 # Install production dependencies for each package from its lock file.
@@ -74,6 +75,8 @@ ENV OMP_WORKSPACE_DIR=/data/workspace
 ENV OMP_ARTIFACTS_DIR=/data/artifacts
 ENV PI_ARTIFACTS_DIR=/data/artifacts
 ENV OMP_AGENT_ROOT=/data/agent
+ENV OMP_CRON_SCHEDULES_DIR=/schedules
+ENV OMP_CRON_DATA_DIR=/data/cron
 
 # Core runtime invariants. Paths and internal service addresses belong to
 # this image; credentials and adapter registrations remain runtime inputs.
