@@ -999,6 +999,8 @@ test("check and Docker staging map agent components into OMP", async () => {
       assert.equal(await exists(join(contextPath, "agent", ".omp", "subagents")), false);
       assert.equal(await exists(join(contextPath, "agent", ".omp", "model.yml")), false);
       assert.equal(await exists(join(contextPath, "agent", ".git")), false);
+      // The scaffolded inert example schedule is staged so the Dockerfile COPY resolves.
+      assert.equal(await exists(join(contextPath, "schedules", "example-schedule.yml.example")), true);
     } finally {
       await removeDockerContext(contextPath);
     }
