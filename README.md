@@ -279,6 +279,25 @@ secret values, when available from local OMP, are written only to ignored
 `runtime.env`, with mode `0600`, and are never printed. Existing providers,
 models, adapter fields, and unrelated runtime variables are preserved.
 
+## Environment-to-file secrets
+
+Bundles can materialize a runtime environment variable into a file before the
+agent starts. Declare each file in `omp-bundler.yml`:
+
+```yaml
+files:
+  - env: GITHUB_SSH_KEY
+    path: /root/.ssh/id_ed25519
+    mode: "0600"
+```
+
+Set `GITHUB_SSH_KEY` in `runtime.env` to the base64-encoded file content (for
+example, `base64 < id_ed25519`). The default mode is `0600`. Destinations must
+not be under `/data`: materialized files live in the ephemeral container layer
+and are re-created from `runtime.env` on every boot. `omp-bundler check` lists
+each declared environment variable alongside the other required credential
+names.
+
 ## Runtime adapters
 
 New bundles default to the built-in HTTP adapter:

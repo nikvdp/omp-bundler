@@ -1012,6 +1012,111 @@ test("check and Docker staging map agent components into OMP", async () => {
   });
 });
 
+test("check validates and Docker staging writes env-to-file secret manifests", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    const configPath = join(bundle, "omp-bundler.yml");
+    const writeFilesConfig = async (files) => {
+      const lines = ["version: 1", "agent:", "  id: alpha"];
+      if (files !== undefined) {
+        lines.push("files:");
+        for (const file of files) {
+          lines.push(`  - env: ${file.env}`, `    path: ${file.path}`);
+          if (file.mode !== undefined) lines.push(`    mode: "${file.mode}"`);
+        }
+      }
+      lines.push("");
+      await writeText(configPath, `${lines.join("\n")}`);
+    };
+
+    const validFiles = [
+      { env: "GITHUB_SSH_KEY", path: "/root/.ssh/id_ed25519", mode: "0600" },
+      { env: "SECOND_SECRET", path: "/root/.ssh/known_key" },
+    ];
+    await writeFilesConfig(validFiles);
+    const valid = await validateBundle({ cwd: bundle });
+    assert.equal(valid.ok, true, valid.errors.map((entry) => entry.message).join("\n"));
+    assert.deepEqual(valid.credentialNames, ["GITHUB_SSH_KEY", "SECOND_SECRET"]);
+    const checked = await invoke(checkCommand, bundle, []);
+    assert.equal(checked.result, 0, checked.stderr);
+    assert.match(checked.stdout, /Credential names present: GITHUB_SSH_KEY, SECOND_SECRET/);
+
+    const assets = join(parent, "assets");
+    await createCanonicalAssetSource(assets);
+    const staged = await stageDockerContext([valid.agent], assets, undefined, valid.project.config.files);
+    try {
+      assert.deepEqual(
+        JSON.parse(await readFile(join(staged, "agent", "files.json"), "utf8")),
+        validFiles,
+      );
+    } finally {
+      await removeDockerContext(staged);
+    }
+
+    const invalidCases = [
+      {
+        name: "relative path",
+        files: [{ env: "KEY", path: "relative/key" }],
+        field: "files[0].path",
+        message: "absolute path",
+      },
+      {
+        name: "persistent path",
+        files: [{ env: "KEY", path: "/data/secret" }],
+        field: "files[0].path",
+        message: "under /data",
+      },
+      {
+        name: "bad mode",
+        files: [{ env: "KEY", path: "/root/secret", mode: "0999" }],
+        field: "files[0].mode",
+        message: "octal mode",
+      },
+      {
+        name: "bad environment name",
+        files: [{ env: "KEY-NAME", path: "/root/secret" }],
+        field: "files[0].env",
+        message: "valid environment variable",
+      },
+      {
+        name: "duplicate path",
+        files: [
+          { env: "KEY_ONE", path: "/root/secret" },
+          { env: "KEY_TWO", path: "/root/secret" },
+        ],
+        field: "files[1].path",
+        message: "unique",
+      },
+    ];
+    for (const invalid of invalidCases) {
+      await writeFilesConfig(invalid.files);
+      const report = await validateBundle({ cwd: bundle });
+      assert.equal(report.ok, false, `${invalid.name} unexpectedly passed`);
+      assert(
+        report.errors.some((entry) =>
+          entry.field === invalid.field && entry.message.includes(invalid.message)
+        ),
+        `${invalid.name}: ${report.errors.map((entry) => `${entry.field}: ${entry.message}`).join("; ")}`,
+      );
+    }
+
+    await writeFilesConfig(undefined);
+    const withoutFiles = await validateBundle({ cwd: bundle });
+    assert.equal(withoutFiles.ok, true, withoutFiles.errors.map((entry) => entry.message).join("\n"));
+    const emptyStaged = await stageDockerContext([withoutFiles.agent], assets, undefined, withoutFiles.project.config.files);
+    try {
+      assert.deepEqual(
+        JSON.parse(await readFile(join(emptyStaged, "agent", "files.json"), "utf8")),
+        [],
+      );
+    } finally {
+      await removeDockerContext(emptyStaged);
+    }
+  });
+});
+
 test("check validates cron schedule files at the bundle root", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });

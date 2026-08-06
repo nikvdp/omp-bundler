@@ -101,6 +101,66 @@ for _required in AGENTS.md config.yml; do
 	fi
 done
 
+# -- 0b. materialize env-to-file secrets -------------------------------
+FILES_MANIFEST="${AGENT_SRC}/files.json"
+if [ -f "$FILES_MANIFEST" ]; then
+	# shellcheck disable=SC2016
+	FILES_MANIFEST="$FILES_MANIFEST" bun -e '
+    import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+    import { dirname } from "node:path";
+
+    const manifestPath = process.env.FILES_MANIFEST;
+    const fail = (message) => {
+      console.error(`[entrypoint] error: ${message}`);
+      process.exit(1);
+    };
+    let entries;
+    try {
+      entries = JSON.parse(await readFile(manifestPath, "utf8"));
+    } catch {
+      fail(`cannot read env-to-file manifest ${manifestPath}`);
+    }
+    if (!Array.isArray(entries)) fail(`${manifestPath} must contain an array`);
+    for (const [index, entry] of entries.entries()) {
+      const field = `files[${index}]`;
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        fail(`${field} must be an object`);
+      }
+      const env = entry.env;
+      const path = entry.path;
+      const mode = entry.mode === undefined ? "0600" : entry.mode;
+      if (typeof env !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(env)) {
+        fail(`${field}.env must be a valid environment variable name`);
+      }
+      if (
+        typeof path !== "string" ||
+        !path.startsWith("/") ||
+        path === "/data" ||
+        path.startsWith("/data/") ||
+        path === "/agent" ||
+        path.startsWith("/agent/") ||
+        path === "/app" ||
+        path.startsWith("/app/")
+      ) {
+        fail(`${field}.path must be an absolute path outside /data, /agent, and /app`);
+      }
+      if (typeof mode !== "string" || !/^0?[0-7]{3,4}$/.test(mode)) {
+        fail(`${field}.mode must be an octal mode with 3 or 4 digits`);
+      }
+      const value = process.env[env];
+      if (value === undefined || value.length === 0) {
+        fail(`${env} is required for ${field} and must be non-empty`);
+      }
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await writeFile(path, Buffer.from(value, "base64"));
+      await chmod(path, Number.parseInt(mode, 8));
+    }
+  '
+else
+	log "no env-to-file manifest found; skipping materialization"
+fi
+
+
 
 # The durable root, refreshed definition, and persistent workspace are
 # operator state. Never follow symlinks while preparing them.

@@ -57,6 +57,11 @@ export interface ProjectConfig {
     readonly adapterPort?: number;
     readonly [key: string]: YamlValue | undefined;
   };
+  readonly files?: readonly {
+    readonly env: string;
+    readonly path: string;
+    readonly mode?: string;
+  }[];
 }
 
 export interface ProjectContext {
