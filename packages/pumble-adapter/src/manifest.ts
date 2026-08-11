@@ -34,6 +34,6 @@ export function buildManifest(config: BridgeConfig) {
     },
     redirectUrls: [joinPublicUrl(config, "/pumble/oauth/callback")],
     listingUrl: joinPublicUrl(config, "/pumble/oauth/start"),
-    offlineMessage: "agent is currently unavailable.",
+    offlineMessage: "The agent is currently unavailable.",
   };
 }

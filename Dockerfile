@@ -28,7 +28,7 @@ WORKDIR /app
 
 # Copy all four staged package trees: contracts (shared types and
 # schemas), core (inbound HTTP server on port 8787), http-adapter
-# (default agent-like agent HTTP API on port 8765), and pumble-adapter
+# (default agent HTTP API on port 8765), and pumble-adapter
 # (optional Pumble webhook/callback service on port 8765).
 # node_modules and secrets are excluded by .dockerignore; Bun executes
 # the TypeScript source directly.
@@ -129,9 +129,7 @@ EXPOSE 8765
 # first, so fixed-base providers remain available without provider keys.
 # Custom providers still need their base URL at runtime.
 #   CLIPROXY_BASE_URL    optional cliproxyapi provider base URL
-#   custom-provider_BASE_URL     optional custom-provider provider base URL
 #   CLIPROXY_API_KEY     cliproxyapi key without a broker
-#   custom-provider_API_KEY      custom-provider key without a broker
 #   OLLAMA_CLOUD_API_KEY ollama-cloud key without a broker
 #   OPENCODE_GO_API_KEY  opencode-go key without a broker
 #   SYNTHETIC_API_KEY    synthetic key without a broker

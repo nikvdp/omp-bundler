@@ -80,14 +80,12 @@ const URL_ENV_NAMES: Record<string, true> = {
   PUMBLE_API_BASE_URL: true,
   PUMBLE_FILE_HOST_BASE_URL: true,
   CLIPROXY_BASE_URL: true,
-  custom-provider_BASE_URL: true,
 };
 const CREDENTIAL_ENV_NAMES: Record<string, true> = {
   OMP_AUTH_BROKER_TOKEN: true,
   OMP_HTTP_API_TOKEN: true,
   OMP_ADAPTERS: true,
   CLIPROXY_API_KEY: true,
-  custom-provider_API_KEY: true,
   OLLAMA_CLOUD_API_KEY: true,
   OPENCODE_GO_API_KEY: true,
   PUMBLE_APP_CLIENT_SECRET: true,

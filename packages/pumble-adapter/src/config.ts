@@ -97,7 +97,7 @@ export function loadBridgeConfig(env = process.env): BridgeConfig {
     ),
     manifestDisplayName: valueOrDefault(
       env.PUMBLE_MANIFEST_DISPLAY_NAME,
-      "agent",
+      "OMP Bundler",
       "PUMBLE_MANIFEST_DISPLAY_NAME",
     ),
     manifestBotTitle: valueOrDefault(
