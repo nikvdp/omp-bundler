@@ -313,6 +313,30 @@ fi
 link_into_data "${RUNTIME_AGENT_DIR}/sessions" "$SESSIONS_DIR"
 log "materialized OMP runtime agent directory"
 
+# OMP resolves custom tools and extensions from its DEFAULT agent directory,
+# not from OMP_AGENT_DIR. Without this the image's template samples stay in
+# place and the bundle's own tools/ and extensions/ never load, while skills
+# and instructions (which do follow OMP_AGENT_DIR) appear to work — so the
+# agent looks healthy while silently missing its tools.
+#
+# Replace those component directories with the bundle's, so one definition is
+# in force. Same OMP_AGENT_DIR inconsistency recorded in docs/agent-folder.md.
+for _component in tools extensions skills agents commands; do
+	_source_component="${DURABLE_OMP_DIR}/${_component}"
+	_target_component="${AGENT_DIR}/${_component}"
+	[ -d "$_source_component" ] || continue
+	rm -rf "$_target_component"
+	cp -R "$_source_component" "$_target_component" ||
+		die "failed to install ${_component} at ${AGENT_DIR}"
+done
+# AGENTS.md and config.yml are read from the default directory too.
+for _definition in AGENTS.md config.yml; do
+	[ -f "${DURABLE_OMP_DIR}/${_definition}" ] || continue
+	cp "${DURABLE_OMP_DIR}/${_definition}" "${AGENT_DIR}/${_definition}" ||
+		die "failed to install ${_definition} at ${AGENT_DIR}"
+done
+log "installed bundle components at ${AGENT_DIR}"
+
 # -- 2. render models --------------------------------------------------
 # bun build/render-models.ts expands runtime placeholders, omits providers
 # with no configured placeholders, and fails on partial or malformed values.
