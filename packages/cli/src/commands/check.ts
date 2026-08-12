@@ -1,7 +1,7 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { optionString } from "../args.ts";
-import { parseYaml } from "../config.ts";
+import { parse as parseSpecYaml } from "yaml";
 import {
   expandModelPlaceholders,
   loadBundleModels,
@@ -58,6 +58,32 @@ export interface BuildValidation {
   readonly result: CheckResult;
   readonly modelBundle: LoadedModelBundle;
 }
+
+/**
+ * Parse user-authored YAML for read-only validation using the full-spec
+ * parser, so `check` accepts every document the runtime accepts (block
+ * scalars in particular). The hand-rolled parser in `config.ts` stays on the
+ * round-trip editing path, where preserving comments and formatting matters.
+ *
+ * Returns the parsed value, or `null` after recording a parse error that
+ * names the offending line. A syntax error must never surface as a schema
+ * complaint about an unrelated field.
+ */
+function readValidationYaml(
+  path: string,
+  source: string,
+  label: string,
+  errors: ValidationIssue[],
+): unknown | null {
+  try {
+    return parseSpecYaml(source) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    errors.push(issue(path, undefined, `${label} is not valid YAML: ${detail}`));
+    return null;
+  }
+}
+
 
 
 const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: true, run: true, files: true };
@@ -144,11 +170,9 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   } else if (!configStat.isFile()) {
     errors.push(issue(configPath, undefined, "must be a regular file"));
   } else {
-    try {
-      parsedConfig = parseYaml(await readFile(configPath, "utf8"));
-    } catch {
-      errors.push(issue(configPath, undefined, "is not valid YAML; fix its syntax without committing credentials"));
-    }
+    const configSource = await readFile(configPath, "utf8");
+    const parsedDocument = readValidationYaml(configPath, configSource, PROJECT_CONFIG_FILE, errors);
+    if (parsedDocument !== null) parsedConfig = parsedDocument as YamlValue;
   }
 
   const dockerfilePath = join(rootDir, "Dockerfile");
@@ -535,17 +559,13 @@ function validateScheduleFile(
   expectedId: string,
   errors: ValidationIssue[],
 ): void {
-  let parsed: YamlValue;
-  try {
-    parsed = parseYaml(source);
-  } catch {
-    errors.push(issue(path, undefined, "schedule is not valid YAML"));
-    return;
-  }
-  if (!isRecord(parsed)) {
+  const document = readValidationYaml(path, source, "schedule", errors) as YamlValue | null;
+  if (document === null) return;
+  if (!isRecord(document)) {
     errors.push(issue(path, undefined, "schedule must be a YAML mapping"));
     return;
   }
+  const parsed = document;
   if (typeof parsed.schedule !== "string" || !parsed.schedule.trim()) {
     errors.push(issue(path, "schedule", "must be a non-empty 5-field cron expression"));
   } else if (!CRON_FIELD_RE.test(parsed.schedule.trim())) {
@@ -762,13 +782,9 @@ function validateFrontmatter(
     return;
   }
   const body = lines.slice(1, end + 1).join("\n");
-  let parsed: YamlValue;
-  try {
-    parsed = parseYaml(body);
-  } catch {
-    errors.push(issue(path, "frontmatter", "is not valid YAML"));
-    return;
-  }
+  const frontmatter = readValidationYaml(path, body, "frontmatter", errors) as YamlValue | null;
+  if (frontmatter === null) return;
+  const parsed = frontmatter;
   if (!isRecord(parsed)) {
     errors.push(issue(path, "frontmatter", "must be a YAML mapping"));
     return;
@@ -820,12 +836,10 @@ async function validateYamlFile(
     errors.push(issue(path, undefined, "cannot be read; check permissions"));
     return;
   }
-  try {
-    const value = parseYaml(source);
+  const value = readValidationYaml(path, source, label, errors) as YamlValue | null;
+  if (value !== null) {
     if (!isRecord(value)) errors.push(issue(path, undefined, `${label} must be a YAML mapping`));
     else validator?.(value, path, errors);
-  } catch {
-    errors.push(issue(path, undefined, `${label} is not valid YAML`));
   }
   scanCredentialAssignments(source, path, errors);
 }
@@ -974,7 +988,7 @@ function scanCredentialAssignments(source: string, path: string, errors: Validat
   if (structured) {
     try {
       scanStructuredCredentialValues(
-        /\.(?:json)$/i.test(path) ? (JSON.parse(source) as YamlValue) : parseYaml(source),
+        /\.(?:json)$/i.test(path) ? (JSON.parse(source) as YamlValue) : (parseSpecYaml(source) as YamlValue),
         path,
         errors,
       );

@@ -973,6 +973,40 @@ if (args[0] === "models") {
   });
 });
 
+test("check accepts block scalars in schedules and reports YAML syntax errors as such", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+
+    // A multi-line command is ordinary YAML and the cron runtime executes it,
+    // so check must accept it too.
+    await writeText(
+      join(bundle, "schedules", "sync.yml"),
+      'schedule: "*/10 * * * *"\nmissed: skip\ntimeout: 600\ncommand: |\n  set -eu\n  echo one\n  echo two\n',
+    );
+    const blockScalar = await validateBundle({ cwd: bundle });
+    assert.equal(
+      blockScalar.ok,
+      true,
+      blockScalar.errors.map((entry) => entry.message).join("\n"),
+    );
+
+    // A real syntax error must name YAML, not a schema field that happens to
+    // be missing because the parser gave up early.
+    await writeText(
+      join(bundle, "schedules", "sync.yml"),
+      'schedule: "*/10 * * * *"\nmissed: skip\n  command: "echo hi"\n bad indent\n',
+    );
+    const malformed = await validateBundle({ cwd: bundle });
+    assert.equal(malformed.ok, false);
+    assert(
+      malformed.errors.some((entry) => entry.message.includes("not valid YAML")),
+      `expected a YAML parse error, got: ${malformed.errors.map((entry) => entry.message).join("\n")}`,
+    );
+  });
+});
+
 test("check accepts root VCS metadata and Pumble derives the project agent id", async () => {
   await withTempDirectory(async (parent) => {
     await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
