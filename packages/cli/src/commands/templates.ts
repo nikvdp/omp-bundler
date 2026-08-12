@@ -164,11 +164,16 @@ omp-bundler generate tool read-transcript
 ## Schedules (cron)
 
 Run the agent on a timer with a schedule file under \`schedules/\`. Each active
-\`*.yml\` file runs its \`prompt\` in a fresh OMP session on its cron schedule and
-writes the reply to \`/data/cron/jobs/<job-id>/runs/\`. The \`.example\` suffix
-keeps a schedule inert, so a fresh bundle starts with cron off; rename
-\`schedules/example-schedule.yml.example\` or generate a new schedule to turn the
-runner on automatically:
+\`*.yml\` file is copied once into \`/data/cron/schedules\` on first container
+start, then that data-volume directory becomes the live source. Agent sessions
+can edit it with their normal file tools; changes survive restarts and image
+rebuilds using the same \`dataVolume\`.
+
+Each active \`*.yml\` file runs its \`prompt\` in a fresh OMP session on its cron
+schedule and writes the reply to \`/data/cron/jobs/<job-id>/runs/\`. The
+\`.example\` suffix keeps a schedule inert. The scheduler re-reads the live
+directory on every wake, at most 60 seconds apart, and stays idle when no
+active jobs exist:
 
 \`\`\`bash
 omp-bundler generate schedule daily-summary

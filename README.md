@@ -348,11 +348,18 @@ registrations are rejected before startup.
 
 ## Schedules (cron)
 
-Add cron jobs as YAML mappings under `schedules/`. Only active `*.yml` files
-are loaded; the `.example` suffix is inert, so the scaffolded
-`schedules/example-schedule.yml.example` does not run until it is renamed.
-Each schedule requires `schedule`, `missed`, and exactly one of `prompt` or
-`command`; `timezone` defaults to `UTC`.
+Add cron jobs as YAML mappings under the bundle's `schedules/` directory. Only
+active `*.yml` files are loaded; the `.example` suffix is inert, so the
+scaffolded `schedules/example-schedule.yml.example` does not run until it is
+renamed. Each schedule requires `schedule`, `missed`, and exactly one of
+`prompt` or `command`; `timezone` defaults to `UTC`.
+
+On first container start, the baked bundle schedules are seeded once into
+`/data/cron/schedules` on the named data volume. That directory is the live
+schedule source after startup: agent sessions receive `/data/cron` as an
+additional workspace root and can create, edit, or delete schedule files with
+their normal file tools. The seed is not repeated, so those edits survive
+container restarts and image rebuilds using the same data volume.
 
 Prompt mode starts an OMP session for an LLM turn:
 
@@ -373,10 +380,13 @@ command: "git fetch --all --prune"
 timeout: 300
 ```
 
-With `missed: skip`, downtime collapses missed fires to the latest due run.
-With `missed: catchUp`, the scheduler runs each missed interval (up to its
-catch-up cap). Output text is written under
-`/data/cron/jobs/<id>/runs/`.
+The scheduler re-reads the live directory on every wake, at most 60 seconds
+apart, so schedule edits take effect without a restart. It stays idle when the
+directory has no active jobs, which lets an agent create its first schedule;
+set `OMP_CRON_ENABLED=false` to disable the scheduler. With `missed: skip`,
+downtime collapses missed fires to the latest due run. With `missed: catchUp`,
+the scheduler runs each missed interval (up to its catch-up cap). Output text
+is written under `/data/cron/jobs/<id>/runs/`.
 
 
 ## Validate
@@ -604,10 +614,12 @@ an ephemeral runtime view under `$HOME/.omp/runtime-agent`, points
 and OMP databases off the persistent definition while conversations and
 workspace files survive restarts.
 
-The data volume also holds core registries, outbound state, artifacts, and
-sessions. Container replacement with the same `dataVolume` preserves them.
-The image definition remains authoritative; live changes to the refreshed
-`.omp` copy are discarded at the next start.
+The data volume also holds core registries, outbound state, artifacts, sessions,
+and the live cron schedules and run history under `/data/cron`. `/data/cron` is
+provided as an additional OMP workspace root, so the agent's normal file tools
+can edit `/data/cron/schedules/*.yml`. Container replacement with the same
+`dataVolume` preserves them. The image definition remains authoritative for
+`.omp`; cron schedules are separate runtime state and are not replaced on boot.
 
 This layout is a configuration boundary, not a filesystem security sandbox.
 An unrestricted agent can still use absolute paths available inside its
