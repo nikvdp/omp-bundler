@@ -322,6 +322,19 @@ bun "$BUILD_DIR/render-models.ts" \
 	--output "$MODELS_OUT"
 log "models rendered to ${MODELS_OUT}"
 
+# OMP resolves the model catalog from its DEFAULT agent directory, not from
+# OMP_AGENT_DIR. Without this copy the agent boots with "No models available"
+# and every turn fails with agent_unavailable. Same inconsistency that
+# docs/agent-folder.md records for task-agent discovery.
+#
+# The rendered file holds real credentials, so it stays on the ephemeral
+# container layer (AGENT_DIR), never on the durable /data definition, and is
+# re-created from runtime env on every boot.
+cp "$MODELS_OUT" "${AGENT_DIR}/models.yml" ||
+	die "failed to install rendered models.yml at ${AGENT_DIR}"
+chmod 0600 "${AGENT_DIR}/models.yml"
+log "installed rendered models.yml at ${AGENT_DIR}"
+
 # Optional central credential vault. Both values are required together. The
 # renderer removes provider apiKey fields when the broker is configured, so
 # the broker remains ahead of provider environment variables in OMP's
