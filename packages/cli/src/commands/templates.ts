@@ -240,8 +240,7 @@ export function scheduleTemplate(name: string): string {
   'schedule: "0 9 * * 1-5"',
   "timezone: UTC",
   "missed: skip",
-  "prompt: |",
-  `  Replace this with the prompt ${name} should run on schedule.`,
+  `prompt: ${JSON.stringify(`Replace this with the prompt ${name} should run on schedule.`)}`,
   "",
   ].join("\n");
 }

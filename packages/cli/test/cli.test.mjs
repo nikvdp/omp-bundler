@@ -813,6 +813,15 @@ test("component generators and destroy commands use root paths without deployed 
       await invoke(generateCommand, bundle, [kind, name]);
       assert.equal(await exists(join(bundle, relativePath)), true);
     }
+    assert.deepEqual(
+      parseYaml(await readFile(join(bundle, "schedules", "daily-summary.yml"), "utf8")),
+      {
+        schedule: "0 9 * * 1-5",
+        timezone: "UTC",
+        missed: "skip",
+        prompt: "Replace this with the prompt daily-summary should run on schedule.",
+      },
+    );
     const generatedAdapter = await invoke(generateCommand, bundle, ["adapter", "pumble"]);
     assert.equal(generatedAdapter.result, undefined);
     const envExample = await readFile(join(bundle, "runtime.env.example"), "utf8");
