@@ -69,7 +69,8 @@ RUN cd packages/contracts && bun install --frozen-lockfile --production \
 
 # ── /data mount ──────────────────────────────────────────────────────
 # A single shared volume covers sessions, the legacy unbound workspace,
-# the bound agent workspace, artifacts, and adapter-specific persistent state.
+# the bound agent workspace, artifacts, adapter state, and mutable cron
+# schedules/run history.
 # OMP's default agent dir is $HOME/.omp/agent; session data lives at
 # $HOME/.omp/agent/sessions and artifacts at .../artifacts. To keep
 # these on the durable volume instead of the ephemeral layer:
@@ -85,7 +86,7 @@ ENV OMP_WORKSPACE_DIR=/data/workspace
 ENV OMP_ARTIFACTS_DIR=/data/artifacts
 ENV PI_ARTIFACTS_DIR=/data/artifacts
 ENV OMP_AGENT_ROOT=/data/agent
-ENV OMP_CRON_SCHEDULES_DIR=/schedules
+ENV OMP_CRON_SCHEDULES_DIR=/data/cron/schedules
 ENV OMP_CRON_DATA_DIR=/data/cron
 
 # Core runtime invariants. Paths and internal service addresses belong to

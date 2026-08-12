@@ -761,8 +761,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
 /** Resolve scheduler options from the process environment. */
 export function optionsFromEnv(env: NodeJS.ProcessEnv = process.env): CronSchedulerOptions {
-  const schedulesDir = env.OMP_CRON_SCHEDULES_DIR;
   const cronDataDir = env.OMP_CRON_DATA_DIR ?? "/data/cron";
+  const schedulesDir = env.OMP_CRON_SCHEDULES_DIR ?? join(cronDataDir, "schedules");
   const workspaceDir = env.OMP_WORKSPACE_DIR ?? "/data/workspace";
   const ompBinary = env.OMP_BINARY?.trim() || "omp";
   const ompModel = env.OMP_MODEL?.trim() || null;

@@ -38,6 +38,14 @@ DURABLE_OMP_DIR="${DURABLE_AGENT_DIR}/.omp"
 export OMP_AGENT_ROOT="$DURABLE_AGENT_DIR"
 export OMP_WORKSPACE_DIR="$WORKSPACE_DIR"
 
+# Cron source is seeded into this durable tree once, then the agent owns
+# edits/deletions there across container restarts.
+CRON_DATA_DIR="${OMP_CRON_DATA_DIR:-${DATA_DIR}/cron}"
+CRON_SCHEDULES_DIR="${OMP_CRON_SCHEDULES_DIR:-${CRON_DATA_DIR}/schedules}"
+SOURCE_SCHEDULES_DIR="${OMP_CRON_SOURCE_DIR:-/schedules}"
+export OMP_CRON_DATA_DIR="$CRON_DATA_DIR"
+export OMP_CRON_SCHEDULES_DIR="$CRON_SCHEDULES_DIR"
+
 # Child registry: the orphan sweep and the core server both read and
 # write this JSON file to track live RPC child process groups. It
 # lives on the durable /data volume so it survives restarts.
@@ -190,6 +198,52 @@ mkdir -p \
 	"$ARTIFACTS_DIR" \
 	"$DURABLE_AGENT_DIR" \
 	"$DURABLE_WORKSPACE_DIR"
+
+# Cron schedules and run history share the durable /data volume. Seed the
+# mutable schedule tree once; later boots preserve agent edits and deletions.
+if [ -L "$CRON_DATA_DIR" ]; then
+	die "${CRON_DATA_DIR} must not be a symlink"
+fi
+if [ -e "$CRON_DATA_DIR" ] && [ ! -d "$CRON_DATA_DIR" ]; then
+	die "${CRON_DATA_DIR} must be a directory"
+fi
+if [ -L "$CRON_SCHEDULES_DIR" ]; then
+	die "${CRON_SCHEDULES_DIR} must not be a symlink"
+fi
+if [ -e "$CRON_SCHEDULES_DIR" ] && [ ! -d "$CRON_SCHEDULES_DIR" ]; then
+	die "${CRON_SCHEDULES_DIR} must be a directory"
+fi
+mkdir -p "$CRON_DATA_DIR" "$CRON_SCHEDULES_DIR"
+CRON_SEED_MARKER="${CRON_SCHEDULES_DIR}/.omp-bundler-seeded"
+if [ -L "$CRON_SEED_MARKER" ]; then
+	die "${CRON_SEED_MARKER} must not be a symlink"
+fi
+if [ ! -e "$CRON_SEED_MARKER" ]; then
+	if [ -L "$SOURCE_SCHEDULES_DIR" ]; then
+		die "${SOURCE_SCHEDULES_DIR} must not be a symlink"
+	fi
+	if [ -d "$SOURCE_SCHEDULES_DIR" ] && [ "$SOURCE_SCHEDULES_DIR" != "$CRON_SCHEDULES_DIR" ]; then
+		for _schedule in "$SOURCE_SCHEDULES_DIR"/*; do
+			[ -e "$_schedule" ] || continue
+			if [ -L "$_schedule" ]; then
+				die "${_schedule} must not be a symlink"
+			fi
+			_schedule_name="${_schedule##*/}"
+			_schedule_target="${CRON_SCHEDULES_DIR}/${_schedule_name}"
+			if [ -e "$_schedule_target" ] || [ -L "$_schedule_target" ]; then
+				continue
+			fi
+			cp -R "$_schedule" "$_schedule_target" ||
+				die "failed to seed ${_schedule}"
+		done
+	fi
+	touch "$CRON_SCHEDULES_DIR/.omp-bundler-seeded"
+fi
+
+# Make cron state available to every OMP session through its native additional
+# workspace-root flag; the scheduler and adapter sessions share these args.
+OMP_ARGS="${OMP_ARGS:+${OMP_ARGS} }--add-dir ${CRON_DATA_DIR}"
+export OMP_ARGS
 
 link_into_data() {
 	local target="$1" expected="$2"
@@ -360,8 +414,8 @@ pumble)
 esac
 
 # -- 4. cron scheduler -------------------------------------------------
-# Cron is opt-in when an explicit flag is provided; otherwise active staged
-# schedules enable it automatically.
+# Keep the scheduler alive even when the directory starts empty so an agent
+# can create its first schedule without a container restart.
 CRON_ENABLED=""
 if [ "${OMP_CRON_ENABLED+x}" = x ]; then
 	case "${OMP_CRON_ENABLED,,}" in
@@ -374,18 +428,8 @@ if [ "${OMP_CRON_ENABLED+x}" = x ]; then
 		;;
 	esac
 else
-	if [ -d "${OMP_CRON_SCHEDULES_DIR:-}" ]; then
-		for _schedule in "$OMP_CRON_SCHEDULES_DIR"/*.yml; do
-			if [ -f "$_schedule" ]; then
-				CRON_ENABLED=1
-				break
-			fi
-		done
-	fi
-	if [ "$CRON_ENABLED" != 1 ]; then
-		CRON_ENABLED=0
-		log "cron disabled (no active schedules)"
-	fi
+	CRON_ENABLED=1
+	log "cron enabled with durable schedules at ${CRON_SCHEDULES_DIR}"
 fi
 
 # -- 4. orphan sweep ---------------------------------------------------
