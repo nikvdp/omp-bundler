@@ -7,7 +7,6 @@ export const CANONICAL_ASSET_PATHS = [
   ".dockerignore",
   "build",
   "entrypoint",
-  "template",
   "packages/contracts",
   "packages/core",
   "packages/http-adapter",
@@ -154,7 +153,6 @@ async function verifyAssetTree(root: string): Promise<void> {
     ".dockerignore": true,
     build: true,
     entrypoint: true,
-    template: true,
     packages: true,
   };
   const entries = await readdir(root, { withFileTypes: true });

@@ -41,18 +41,17 @@ COPY packages/pumble-adapter/   ./packages/pumble-adapter/
 COPY build/            ./build/
 COPY entrypoint/       ./entrypoint/
 
-# Install the agent folder at $HOME/.omp/agent, OMP's default agent
-# directory. NOT OMP_AGENT_DIR: OMP 17.1.3 does not apply that
-# var consistently to task-agent discovery, so we use the default
-# location to keep every discovery surface on one root.
-COPY template/         "${HOME}/.omp/agent/"
-
 # Bake the single staged agent definition. The image-side source is
 # immutable; the entrypoint refreshes only its .omp tree onto the durable
 # volume and leaves the persistent workspace untouched.
+#
+# There is no separate sample agent folder. OMP honors OMP_AGENT_DIR for
+# some loaders and not others, so the entrypoint installs this one
+# definition at OMP's default agent directory and every loader agrees.
 COPY agent/id       /agent/id
 COPY agent/.omp/    /agent/.omp/
 COPY agent/files.json  /agent/files.json
+COPY agent/models.yml.tmpl /agent/models.yml.tmpl
 COPY schedules/     /schedules/
 
 # ── production dependency install ─────────────────────────────────────

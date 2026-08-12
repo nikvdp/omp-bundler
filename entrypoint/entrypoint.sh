@@ -19,12 +19,21 @@
 set -euo pipefail
 
 # -- paths -------------------------------------------------------------
+# One agent directory, at OMP's default location.
+#
+# OMP 17.1.3 honors OMP_AGENT_DIR for skills, AGENTS.md, and config.yml but
+# ignores it for tools, extensions, models, and task agents. Pointing that
+# variable at a second directory therefore splits the definition in half and
+# silently drops whichever surface the loader resolves from the default. This
+# installs the whole definition where every loader already looks, and does not
+# set OMP_AGENT_DIR at all.
+#
+# This directory lives on the ephemeral container layer, never on /data, so
+# rendered credentials do not persist. `sessions` is symlinked into /data.
 AGENT_DIR="${HOME}/.omp/agent"
-RUNTIME_AGENT_DIR="${HOME}/.omp/runtime-agent"
 BUILD_DIR="${OMP_BUILD_DIR:-/app/build}"
-MODELS_TMPL="${AGENT_DIR}/models.yml.tmpl"
-MODELS_OUT="${RUNTIME_AGENT_DIR}/models.yml"
-export OMP_AGENT_DIR="$RUNTIME_AGENT_DIR"
+MODELS_TMPL="${AGENT_SRC:-/agent}/models.yml.tmpl"
+MODELS_OUT="${AGENT_DIR}/models.yml"
 
 # Explicit /data mount paths shared by core and the selected adapter.
 DATA_DIR="${OMP_DATA_DIR:-/data}"
@@ -299,43 +308,21 @@ if [ "$_had_previous_omp" -eq 1 ]; then
 fi
 log "refreshed agent ${OMP_AGENT_ID}"
 
-# OMP only discovers project .omp files in the exact cwd. Materialize the
-# refreshed definition as its explicit agent directory so the child can keep
-# cwd in the empty persistent workspace without losing config or components.
-if [ -L "$RUNTIME_AGENT_DIR" ]; then
-	die "${RUNTIME_AGENT_DIR} must not be a symlink"
+# Install the refreshed definition at OMP's default agent directory. This is
+# the whole definition in one place: instructions, config, skills, commands,
+# tools, extensions, and task agents. Every OMP loader resolves from here,
+# whether or not it honors OMP_AGENT_DIR.
+if [ -L "$AGENT_DIR" ]; then
+	die "${AGENT_DIR} must not be a symlink"
 fi
-rm -rf "$RUNTIME_AGENT_DIR"
-if ! cp -R "$DURABLE_OMP_DIR" "$RUNTIME_AGENT_DIR"; then
-	rm -rf "$RUNTIME_AGENT_DIR"
-	die "failed to materialize OMP runtime agent directory"
+rm -rf "$AGENT_DIR"
+mkdir -p "$(dirname "$AGENT_DIR")"
+if ! cp -R "$DURABLE_OMP_DIR" "$AGENT_DIR"; then
+	rm -rf "$AGENT_DIR"
+	die "failed to install the agent definition at ${AGENT_DIR}"
 fi
-link_into_data "${RUNTIME_AGENT_DIR}/sessions" "$SESSIONS_DIR"
-log "materialized OMP runtime agent directory"
-
-# OMP resolves custom tools and extensions from its DEFAULT agent directory,
-# not from OMP_AGENT_DIR. Without this the image's template samples stay in
-# place and the bundle's own tools/ and extensions/ never load, while skills
-# and instructions (which do follow OMP_AGENT_DIR) appear to work — so the
-# agent looks healthy while silently missing its tools.
-#
-# Replace those component directories with the bundle's, so one definition is
-# in force. Same OMP_AGENT_DIR inconsistency recorded in docs/agent-folder.md.
-for _component in tools extensions skills agents commands; do
-	_source_component="${DURABLE_OMP_DIR}/${_component}"
-	_target_component="${AGENT_DIR}/${_component}"
-	[ -d "$_source_component" ] || continue
-	rm -rf "$_target_component"
-	cp -R "$_source_component" "$_target_component" ||
-		die "failed to install ${_component} at ${AGENT_DIR}"
-done
-# AGENTS.md and config.yml are read from the default directory too.
-for _definition in AGENTS.md config.yml; do
-	[ -f "${DURABLE_OMP_DIR}/${_definition}" ] || continue
-	cp "${DURABLE_OMP_DIR}/${_definition}" "${AGENT_DIR}/${_definition}" ||
-		die "failed to install ${_definition} at ${AGENT_DIR}"
-done
-log "installed bundle components at ${AGENT_DIR}"
+link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
+log "installed agent definition at ${AGENT_DIR}"
 
 # -- 2. render models --------------------------------------------------
 # bun build/render-models.ts expands runtime placeholders, omits providers
@@ -344,20 +331,10 @@ log "rendering models.yml from ${MODELS_TMPL}"
 bun "$BUILD_DIR/render-models.ts" \
 	--input "$MODELS_TMPL" \
 	--output "$MODELS_OUT"
+# The rendered catalog holds real credentials, so it lands on the ephemeral
+# container layer and is re-created from runtime env on every boot.
+chmod 0600 "$MODELS_OUT"
 log "models rendered to ${MODELS_OUT}"
-
-# OMP resolves the model catalog from its DEFAULT agent directory, not from
-# OMP_AGENT_DIR. Without this copy the agent boots with "No models available"
-# and every turn fails with agent_unavailable. Same inconsistency that
-# docs/agent-folder.md records for task-agent discovery.
-#
-# The rendered file holds real credentials, so it stays on the ephemeral
-# container layer (AGENT_DIR), never on the durable /data definition, and is
-# re-created from runtime env on every boot.
-cp "$MODELS_OUT" "${AGENT_DIR}/models.yml" ||
-	die "failed to install rendered models.yml at ${AGENT_DIR}"
-chmod 0600 "${AGENT_DIR}/models.yml"
-log "installed rendered models.yml at ${AGENT_DIR}"
 
 # Optional central credential vault. Both values are required together. The
 # renderer removes provider apiKey fields when the broker is configured, so

@@ -202,7 +202,6 @@ async function createEntrypointHarness(root) {
   const ambientExtension = join(root, "ambient-ingest-extension.ts");
   await mkdir(binDir, { recursive: true });
   await writeText(join(buildDir, "render-models.ts"), "export {};\n");
-  await writeText(join(homeDir, ".omp", "agent", "models.yml.tmpl"), "{}\n");
   await writeText(orphanSweep, "export {};\n");
   await writeText(coreServer, "export {};\n");
   await writeText(httpServer, "export {};\n");
@@ -249,6 +248,9 @@ if (args[0]?.endsWith("/render-models.ts")) {
 
   return {
     async run(agentSrc, dataDir, overrides = {}) {
+      // The models template ships beside the baked agent definition, so it
+      // lives in the image source directory rather than the home agent dir.
+      await writeText(join(agentSrc, "models.yml.tmpl"), "{}\n");
       await rm(capturePath, { force: true });
       const env = {
         ...process.env,
@@ -534,14 +536,9 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
       [],
       "the persistent agent workspace starts empty",
     );
-    const runtimeAgentDir = join(
-      root,
-      "entrypoint-home",
-      ".omp",
-      "runtime-agent",
-    );
+    const agentDir = join(root, "entrypoint-home", ".omp", "agent");
     await writeText(
-      join(runtimeAgentDir, "stale-runtime.txt"),
+      join(agentDir, "stale-runtime.txt"),
       "remove stale runtime copy\n",
     );
 
@@ -572,6 +569,17 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
       join(imageV2, ".omp", "skills", "meeting-notes", "SKILL.md"),
       "# Meeting notes\n",
     );
+    // Tools and extensions are the surfaces OMP resolves from its default
+    // agent directory regardless of OMP_AGENT_DIR. Stage them so a split
+    // definition cannot pass this test.
+    await writeText(
+      join(imageV2, ".omp", "tools", "custom_tool.ts"),
+      "export default () => ({});\n",
+    );
+    await writeText(
+      join(imageV2, ".omp", "extensions", "custom-ext.ts"),
+      "export default () => {};\n",
+    );
     const second = await harness.run(imageV2, dataDir);
     assert.equal(second.code, 0, second.stderr);
     assert.equal(
@@ -588,36 +596,59 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
     assert.equal(second.capture.OMP_AGENT_ID, "alpha");
     assert.equal(second.capture.OMP_AGENT_ROOT, join(dataDir, "agent"));
     assert.equal(second.capture.OMP_WORKSPACE_DIR, join(dataDir, "workspace"));
-    assert.equal(second.capture.OMP_AGENT_DIR, runtimeAgentDir);
     assert.equal(
-      await readFile(join(runtimeAgentDir, "config.yml"), "utf8"),
+      second.capture.OMP_AGENT_DIR,
+      undefined,
+      "OMP_AGENT_DIR must not be set: OMP honors it for only some loaders",
+    );
+    assert.equal(
+      await readFile(join(agentDir, "config.yml"), "utf8"),
       "image-v2\n",
     );
     assert.equal(
-      await readFile(join(runtimeAgentDir, "AGENTS.md"), "utf8"),
+      await readFile(join(agentDir, "AGENTS.md"), "utf8"),
       "# alpha\n\nStaged instructions.\n",
     );
     assert.equal(
       await readFile(
-        join(runtimeAgentDir, "skills", "meeting-notes", "SKILL.md"),
+        join(agentDir, "skills", "meeting-notes", "SKILL.md"),
         "utf8",
       ),
       "# Meeting notes\n",
     );
+    // These two assertions are the regression guard. OMP loads tools and
+    // extensions from its default agent directory only, so a definition
+    // split across two directories leaves them missing while skills and
+    // instructions still resolve and the agent looks healthy.
     assert.equal(
-      await exists(join(runtimeAgentDir, "stale-runtime.txt")),
+      await readFile(join(agentDir, "tools", "custom_tool.ts"), "utf8"),
+      "export default () => ({});\n",
+      "bundle tools must reach the directory OMP loads tools from",
+    );
+    assert.equal(
+      await readFile(join(agentDir, "extensions", "custom-ext.ts"), "utf8"),
+      "export default () => {};\n",
+      "bundle extensions must reach the directory OMP loads extensions from",
+    );
+    assert.equal(
+      await exists(join(agentDir, "stale-runtime.txt")),
       false,
     );
     assert.equal(
-      await readFile(join(runtimeAgentDir, "models.yml"), "utf8"),
+      await readFile(join(agentDir, "models.yml"), "utf8"),
       "{}\n",
     );
     assert.equal(
-      (await lstat(join(runtimeAgentDir, "sessions"))).isSymbolicLink(),
+      await exists(join(root, "entrypoint-home", ".omp", "runtime-agent")),
+      false,
+      "the second agent directory must not exist: one definition, one location",
+    );
+    assert.equal(
+      (await lstat(join(agentDir, "sessions"))).isSymbolicLink(),
       true,
     );
     assert.equal(
-      await realpath(join(runtimeAgentDir, "sessions")),
+      await realpath(join(agentDir, "sessions")),
       await realpath(join(dataDir, "sessions")),
     );
     assert.equal(

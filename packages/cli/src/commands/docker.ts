@@ -111,7 +111,9 @@ export async function stageDockerContext(
     await writeFile(join(stagedAgent, "files.json"), JSON.stringify(filesConfig ?? [], null, 2), "utf8");
 
     if (models !== undefined) {
-      await writeFile(join(contextPath, "template", "models.yml.tmpl"), models.source, "utf8");
+      // Staged beside the agent definition, not into a shared sample folder.
+      // The Dockerfile copies it to the agent directory the entrypoint reads.
+      await writeFile(join(stagedAgent, "models.yml.tmpl"), models.source, "utf8");
     }
     return contextPath;
   } catch (error) {
