@@ -198,6 +198,7 @@ async function createEntrypointHarness(root) {
   const coreServer = join(root, "core-server.ts");
   const httpServer = join(root, "http-server.ts");
   const pumbleServer = join(root, "pumble-server.ts");
+  const cronServer = join(root, "cron-server.ts");
   const ambientExtension = join(root, "ambient-ingest-extension.ts");
   await mkdir(binDir, { recursive: true });
   await writeText(join(buildDir, "render-models.ts"), "export {};\n");
@@ -206,6 +207,7 @@ async function createEntrypointHarness(root) {
   await writeText(coreServer, "export {};\n");
   await writeText(httpServer, "export {};\n");
   await writeText(pumbleServer, "export {};\n");
+  await writeText(cronServer, "export {};\n");
   await writeText(ambientExtension, "export {};\n");
   const capturePath = join(root, "entrypoint-capture.json");
   await writeFile(
@@ -233,9 +235,13 @@ if (args[0]?.endsWith("/render-models.ts")) {
     OMP_AGENT_ROOT: process.env.OMP_AGENT_ROOT,
     OMP_WORKSPACE_DIR: process.env.OMP_WORKSPACE_DIR,
     OMP_AGENT_DIR: process.env.OMP_AGENT_DIR,
+    OMP_ARGS: process.env.OMP_ARGS,
+    OMP_CRON_SCHEDULES_DIR: process.env.OMP_CRON_SCHEDULES_DIR,
   });
   writeFileSync(process.env.ENTRYPOINT_CAPTURE_PATH + ".tmp", capture);
   renameSync(process.env.ENTRYPOINT_CAPTURE_PATH + ".tmp", process.env.ENTRYPOINT_CAPTURE_PATH);
+} else if ([process.env.OMP_HTTP_SERVER, process.env.OMP_PUMBLE_SERVER, process.env.OMP_CRON_SERVER].includes(args[0])) {
+  setInterval(() => {}, 1000);
 }
 `,
     { encoding: "utf8", mode: 0o755 },
@@ -253,6 +259,7 @@ if (args[0]?.endsWith("/render-models.ts")) {
         OMP_CORE_SERVER: coreServer,
         OMP_HTTP_SERVER: httpServer,
         OMP_PUMBLE_SERVER: pumbleServer,
+        OMP_CRON_SERVER: cronServer,
         OMP_AMBIENT_EXTENSION: ambientExtension,
         OMP_CHILD_REGISTRY_PATH: join(dataDir, "child-registry.json"),
         OMP_BUNDLER_ADAPTER: "http",
@@ -626,6 +633,58 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
         agentId: "alpha",
       },
     ]);
+  });
+});
+
+test("entrypoint persists live cron schedules and exposes their workspace root", async () => {
+  await withTempDirectory(async (root) => {
+    const harness = await createEntrypointHarness(root);
+    const dataDir = join(root, "cron-data");
+    const source = await createStagedAgent(root, "image", "alpha", "config\n");
+    const bakedSchedules = join(root, "baked-schedules");
+    await writeText(
+      join(bakedSchedules, "daily.yml"),
+      'schedule: "0 9 * * *"\nmissed: skip\nprompt: "original"\n',
+    );
+    await writeText(
+      join(bakedSchedules, "example-schedule.yml.example"),
+      'schedule: "0 9 * * *"\nmissed: skip\nprompt: "inactive"\n',
+    );
+
+    const first = await harness.run(source, dataDir, {
+      OMP_ARGS: "--profile test",
+      OMP_CRON_ENABLED: "true",
+      OMP_CRON_SOURCE_DIR: bakedSchedules,
+    });
+    assert.equal(first.code, 0, first.stderr);
+    const liveSchedules = join(dataDir, "cron", "schedules");
+    assert.equal(
+      await readFile(join(liveSchedules, "daily.yml"), "utf8"),
+      'schedule: "0 9 * * *"\nmissed: skip\nprompt: "original"\n',
+    );
+    assert.equal(first.capture.OMP_CRON_SCHEDULES_DIR, liveSchedules);
+    assert.equal(first.capture.OMP_ARGS, `--profile test --add-dir ${join(dataDir, "cron")}`);
+
+    await writeText(
+      join(liveSchedules, "daily.yml"),
+      'schedule: "0 10 * * *"\nmissed: skip\nprompt: "edited"\n',
+    );
+    await rm(join(liveSchedules, "example-schedule.yml.example"));
+
+    const second = await harness.run(source, dataDir, {
+      OMP_ARGS: "--profile test",
+      OMP_CRON_ENABLED: "true",
+      OMP_CRON_SOURCE_DIR: bakedSchedules,
+    });
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(
+      await readFile(join(liveSchedules, "daily.yml"), "utf8"),
+      'schedule: "0 10 * * *"\nmissed: skip\nprompt: "edited"\n',
+    );
+    assert.equal(
+      await exists(join(liveSchedules, "example-schedule.yml.example")),
+      false,
+    );
   });
 });
 
