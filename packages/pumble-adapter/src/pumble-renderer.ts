@@ -20,9 +20,10 @@ import type { PumbleApi } from "./pumble-api.js";
  *
  * Side effect policy
  * ------------------
- *   - turn.started   : adds one "working" reaction (eyes) on the triggering
- *                      message. Best-effort; a failed reaction never blocks the
- *                      turn.
+ *   - turn.started   : adds both status reactions on the triggering message,
+ *                      eyes ("seen") and speech balloon ("replying").
+ *                      Best-effort and independent; a failed reaction never
+ *                      blocks the turn.
  *   - turn.progress  : the first progress event posts one substantive interim
  *                      message (threaded when the resolver provides a thread
  *                      root). Every later progress event edits that same
@@ -41,15 +42,19 @@ import type { PumbleApi } from "./pumble-api.js";
  *                      notice and then rejects so the core retries the durable
  *                      redelivery; attachments are never silently dropped.
  *   - turn.error     : posts the curated error message as the final message.
- *   - presence       : maps active/idle/offline to a low-noise reaction policy
- *                      on the triggering message (a single working reaction that
- *                      transitions between eyes and hourglass, then clears on
- *                      offline). Pumble exposes no bot typing or presence
- *                      endpoints, so reactions stand in for presence.
+ *   - presence       : no reactions. Presence is derived from the agent's own
+ *                      turn lifecycle (turn_start -> active, agent_end ->
+ *                      idle), so it says nothing a person cannot read from the
+ *                      reply itself. `offline` clears both reactions, since the
+ *                      agent died without replying and stale markers on a dead
+ *                      turn are worse than clearing early.
  *
  * A terminal event (reply or error) closes the correlation within this
  * renderer: subsequent events for the same correlation, including late
- * presence, are ignored, and the working reaction is cleared.
+ * presence, are ignored, and both status reactions are removed. Reactions
+ * describe what is true right now; once the reply exists, neither "seen" nor
+ * "replying" still holds, so leaving them would decorate every answered
+ * message permanently.
  *
  * Failure semantics
  * -----------------
@@ -61,11 +66,14 @@ import type { PumbleApi } from "./pumble-api.js";
  * recorded.
  */
 
-/** Working/active reaction: "looking at this". */
-const ACTIVE_REACTION = "\u{1F440}";
+/** "I have seen this message." */
+const SEEN_REACTION = "\u{1F440}";
 
-/** Idle reaction: "waiting". */
-const IDLE_REACTION = "\u{23F3}";
+/** "I am writing a reply." Removed when the reply posts. */
+const REPLYING_REACTION = "\u{1F4AC}";
+
+/** Both status reactions, in the order they are added and removed. */
+const STATUS_REACTIONS = [SEEN_REACTION, REPLYING_REACTION] as const;
 
 /**
  * Conversation target resolved for a correlation. Produced by the injected
@@ -127,10 +135,14 @@ export interface PumbleRendererOptions {
 interface CorrelationState {
   /** Event ids already applied within this process, for in-memory dedupe. */
   seen: Set<string>;
-  /** Whether the started reaction was already attempted. */
+  /** Whether the status reactions were already attempted for this turn. */
   startedReaction: boolean;
-  /** Current working reaction emoji on the trigger message, if any. */
-  workingEmoji?: string;
+  /**
+   * Status reactions currently believed to be on the trigger message. The two
+   * markers are independent: eyes and speech balloon coexist during a turn,
+   * and one failing to apply never affects the other.
+   */
+  activeReactions: Set<string>;
   /** Id of the first interim progress message, reused by later edits. */
   interimMessageId?: string;
   /**
@@ -212,6 +224,7 @@ export class PumbleRenderer {
       state = {
         seen: new Set<string>(),
         startedReaction: false,
+        activeReactions: new Set<string>(),
         finalTextPosted: false,
         sentAttachmentIndexes: new Set<number>(),
         terminal: false,
@@ -269,25 +282,36 @@ export class PumbleRenderer {
     state: CorrelationState,
     checkpoints: Set<string>,
   ): Promise<void> {
-    const checkpoint = `reaction:add:${ACTIVE_REACTION}`;
-    if (checkpoints.has(checkpoint)) {
+    // Both markers go up at turn start. Adding the speech balloon later, on
+    // first progress, would read better but progress is only emitted after
+    // progressThresholdMs, so a fast turn would never show it at all.
+    const pending = STATUS_REACTIONS.filter(
+      (emoji) => !checkpoints.has(`reaction:add:${emoji}`),
+    );
+    for (const emoji of STATUS_REACTIONS) {
+      if (checkpoints.has(`reaction:add:${emoji}`)) state.activeReactions.add(emoji);
+    }
+    if (pending.length === 0) {
       state.startedReaction = true;
-      state.workingEmoji = ACTIVE_REACTION;
       return;
     }
     if (state.startedReaction) {
-      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
+      for (const emoji of pending) {
+        await this.markCheckpoint(event.eventId, checkpoints, `reaction:add:${emoji}`);
+      }
       return;
     }
     const target = await this.resolve(event);
     if (!target) {
       return;
     }
-    const ok = await this.safeAddReaction(target, ACTIVE_REACTION);
     state.startedReaction = true;
-    if (ok) {
-      state.workingEmoji = ACTIVE_REACTION;
-      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
+    // Independent: one reaction failing must not suppress the other.
+    for (const emoji of pending) {
+      if (await this.safeAddReaction(target, emoji)) {
+        state.activeReactions.add(emoji);
+        await this.markCheckpoint(event.eventId, checkpoints, `reaction:add:${emoji}`);
+      }
     }
   }
 
@@ -380,7 +404,7 @@ export class PumbleRenderer {
     }
 
     await this.deliverAttachments(target, event, state, checkpoints);
-    await this.clearWorkingReaction(target, state, event.eventId, checkpoints);
+    await this.clearStatusReactions(target, state, event.eventId, checkpoints);
     state.terminal = true;
   }
 
@@ -407,7 +431,7 @@ export class PumbleRenderer {
       );
       await this.markCheckpoint(event.eventId, checkpoints, "text");
     }
-    await this.clearWorkingReaction(target, state, event.eventId, checkpoints);
+    await this.clearStatusReactions(target, state, event.eventId, checkpoints);
     state.terminal = true;
   }
 
@@ -416,89 +440,43 @@ export class PumbleRenderer {
     state: CorrelationState,
     checkpoints: Set<string>,
   ): Promise<void> {
+    // active/idle carry no information a person cannot read from the reply, so
+    // they produce no reactions. offline means the agent died mid-turn: clear
+    // the markers rather than leave them stranded on a turn that will never
+    // finish.
+    if (event.presence !== "offline") {
+      return;
+    }
     const target = await this.resolve(event);
     if (!target) {
       return;
     }
-    const presence = event.presence;
-    if (presence === "active") {
-      await this.setWorkingEmoji(
-        target,
-        state,
-        ACTIVE_REACTION,
-        event.eventId,
-        checkpoints,
-      );
-    } else if (presence === "idle") {
-      await this.setWorkingEmoji(
-        target,
-        state,
-        IDLE_REACTION,
-        event.eventId,
-        checkpoints,
-      );
-    } else {
-      await this.clearWorkingReaction(
-        target,
-        state,
-        event.eventId,
-        checkpoints,
-      );
-    }
+    await this.clearStatusReactions(target, state, event.eventId, checkpoints);
   }
 
-  private async setWorkingEmoji(
+  /**
+   * Remove both status reactions. Each is guarded by its own checkpoint so a
+   * retry does not re-issue a delete that already succeeded, and a failure on
+   * one marker does not strand the other.
+   */
+  private async clearStatusReactions(
     target: ResolvedTarget,
     state: CorrelationState,
-    emoji: string,
     eventId: string,
     checkpoints: Set<string>,
   ): Promise<void> {
-    const addCheckpoint = `reaction:add:${emoji}`;
-    if (checkpoints.has(addCheckpoint)) {
-      state.workingEmoji = emoji;
-      return;
-    }
-    if (state.workingEmoji === emoji) {
-      await this.markCheckpoint(eventId, checkpoints, addCheckpoint);
-      return;
-    }
-    if (state.workingEmoji) {
-      const removeCheckpoint = `reaction:remove:${state.workingEmoji}`;
-      if (!checkpoints.has(removeCheckpoint)) {
-        const removed = await this.safeRemoveReaction(
-          target,
-          state.workingEmoji,
-        );
-        if (removed) {
-          await this.markCheckpoint(eventId, checkpoints, removeCheckpoint);
+    for (const emoji of STATUS_REACTIONS) {
+      if (!state.activeReactions.has(emoji)) {
+        continue;
+      }
+      const checkpoint = `reaction:remove:${emoji}`;
+      if (!checkpoints.has(checkpoint)) {
+        if (await this.safeRemoveReaction(target, emoji)) {
+          await this.markCheckpoint(eventId, checkpoints, checkpoint);
         }
       }
+      state.activeReactions.delete(emoji);
     }
-    const ok = await this.safeAddReaction(target, emoji);
-    if (ok) {
-      state.workingEmoji = emoji;
-      await this.markCheckpoint(eventId, checkpoints, addCheckpoint);
-    }
-  }
-
-  private async clearWorkingReaction(
-    target: ResolvedTarget,
-    state: CorrelationState,
-    eventId: string,
-    checkpoints: Set<string>,
-  ): Promise<void> {
-    if (!state.workingEmoji) {
-      return;
-    }
-    const checkpoint = `reaction:remove:${state.workingEmoji}`;
-    if (!checkpoints.has(checkpoint)) {
-      const removed = await this.safeRemoveReaction(target, state.workingEmoji);
-      if (removed) {
-        await this.markCheckpoint(eventId, checkpoints, checkpoint);
-      }
-    }
-    state.workingEmoji = undefined;
   }
 
   private async deliverAttachments(
