@@ -21,7 +21,8 @@
   "scripts": {
     "check": "tsc --noEmit -p tsconfig.json",
     "test": "node --test test/cli.test.mjs",
-    "prepack": "bun scripts/prepack.ts"
+    "prepack": "bun scripts/prepack.ts",
+    "compile": "bun scripts/compile.ts"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",
