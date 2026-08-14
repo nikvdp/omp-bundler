@@ -40,9 +40,10 @@
  * All event sequencing and delivery goes through the OutboundEmitter; the
  * supervisor never POSTs directly.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -733,6 +734,7 @@ export class CoreSupervisor {
           : join(root, "workspace", attachment.path);
       try {
         const bytes = await readFile(absolute);
+        await this.retainImageBlob(bytes);
         images.push({
           type: "image",
           data: bytes.toString("base64"),
@@ -747,6 +749,39 @@ export class CoreSupervisor {
       }
     }
     return images;
+  }
+
+  /**
+   * Keep a copy of an inline image under the agent's blob store.
+   *
+   * OMP records an image in session history as a `blob:sha256:<digest>`
+   * reference rather than inline base64, and resolves it from the blob store
+   * when replaying that history to the model. The blob store lives in the
+   * agent's ephemeral home while attachments live on the durable volume, so a
+   * rebuild leaves history pointing at bytes that no longer exist and every
+   * later turn in that conversation fails to build a model request.
+   *
+   * Writing the blob here, keyed by the same digest OMP derives, makes the
+   * durable attachment the source of truth for its own history reference.
+   * Failure is not fatal: the current turn already carries the image inline.
+   */
+  private async retainImageBlob(bytes: Buffer): Promise<void> {
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    // $HOME/.omp/agent is OMP's default agent directory, which the child
+    // inherits; the bundle installs the agent definition there precisely so
+    // every OMP discovery surface shares one root.
+    const blobPath = join(homedir(), ".omp", "agent", "blobs", digest);
+    try {
+      await mkdir(dirname(blobPath), { recursive: true });
+      await writeFile(blobPath, bytes, { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return;
+      console.error(
+        `[attachment] could not retain image blob ${digest}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
