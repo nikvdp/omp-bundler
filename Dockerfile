@@ -98,6 +98,10 @@ ENV OMP_OUTBOX_DB_PATH=/data/core/outbound.sqlite
 ENV OMP_MAX_CHILDREN=8
 ENV OMP_IDLE_TIMEOUT_MS=900000
 ENV OMP_ENGAGEMENT_WINDOW_MS=300000
+# Hold ambient replies while a conversation is moving faster than this, then
+# deliver everything held as one catch-up turn once it settles. Being directly
+# addressed always answers immediately. 0 disables holding.
+ENV OMP_AMBIENT_QUIET_PERIOD_MS=30000
 ENV OMP_CALLBACK_TIMEOUT_MS=15000
 ENV OMP_PROGRESS_THRESHOLD_MS=500
 ENV OMP_RETRY_DELAYS_MS=250,1000,5000

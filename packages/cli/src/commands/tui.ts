@@ -246,7 +246,8 @@ class IncrementalSseParser {
     }
     this.eventName = "";
     this.dataLines = [];
-    if (type === "completed" || type === "error") this.terminalSeen = true;
+    if (type === "completed" || type === "error" || type === "cancelled")
+      this.terminalSeen = true;
     this.onEvent({ type, data });
   }
 }
@@ -352,6 +353,18 @@ function renderStreamEvent(
       }
       output.write("\n\n");
       state.renderedText = data.text;
+      return;
+    }
+    // The turn was superseded before it answered. Terminal output cannot be
+    // unprinted, so mark the abandoned partial rather than leaving it looking
+    // like a finished answer, and return to the prompt without an error: a
+    // newer message is already being handled.
+    case "cancelled": {
+      state.stopSpinner();
+      if (state.prefixWritten) {
+        output.write("\n[interrupted]\n\n");
+      }
+      state.renderedText = "";
       return;
     }
     case "error": {
