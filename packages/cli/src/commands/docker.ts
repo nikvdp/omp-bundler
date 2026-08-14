@@ -19,6 +19,7 @@ export interface RunDockerArguments {
   readonly corePort: number;
   readonly adapterPort: number;
   readonly dataVolume: string;
+  readonly agentVolume: string;
   readonly envFile: string;
   readonly bundleRoot: string;
   readonly containerName?: string;
@@ -53,6 +54,8 @@ export function runDockerArgs(
     `${options.adapterPort}:8765`,
     "-v",
     `${options.dataVolume}:/data`,
+    "-v",
+    `${options.agentVolume}:/root/.omp/agent`,
     "--env-file",
     options.envFile,
     options.image,

@@ -28,8 +28,10 @@ set -euo pipefail
 # installs the whole definition where every loader already looks, and does not
 # set OMP_AGENT_DIR at all.
 #
-# This directory lives on the ephemeral container layer, never on /data, so
-# rendered credentials do not persist. `sessions` is symlinked into /data.
+# This directory is a durable Docker volume, so everything OMP writes here --
+# sessions, blobs, agent.db, history.db, memories -- survives a rebuild. The
+# rendered models.yml persists with it and is overwritten from runtime env on
+# every boot.
 AGENT_DIR="${HOME}/.omp/agent"
 BUILD_DIR="${OMP_BUILD_DIR:-/app/build}"
 MODELS_TMPL="${AGENT_SRC:-/agent}/models.yml.tmpl"
@@ -47,6 +49,13 @@ DURABLE_OMP_DIR="${DURABLE_AGENT_DIR}/.omp"
 export OMP_AGENT_ROOT="$DURABLE_AGENT_DIR"
 export OMP_WORKSPACE_DIR="$WORKSPACE_DIR"
 
+# Inbound attachments must land inside the directory the agent actually runs
+# in. Core spawns the agent with --cwd <agent root>/workspace, so a file
+# written under OMP_WORKSPACE_DIR is invisible to it: the model receives a
+# workspace-relative path that resolves to nothing, and reports that it can
+# see the filename but cannot open the file.
+export PUMBLE_BRIDGE_FILE_DIR="${PUMBLE_BRIDGE_FILE_DIR:-${DURABLE_WORKSPACE_DIR}/pumble-files}"
+
 # Cron source is seeded into this durable tree once, then the agent owns
 # edits/deletions there across container restarts.
 CRON_DATA_DIR="${OMP_CRON_DATA_DIR:-${DATA_DIR}/cron}"
@@ -54,6 +63,12 @@ CRON_SCHEDULES_DIR="${OMP_CRON_SCHEDULES_DIR:-${CRON_DATA_DIR}/schedules}"
 SOURCE_SCHEDULES_DIR="${OMP_CRON_SOURCE_DIR:-/schedules}"
 export OMP_CRON_DATA_DIR="$CRON_DATA_DIR"
 export OMP_CRON_SCHEDULES_DIR="$CRON_SCHEDULES_DIR"
+
+# Adapter settings are seeded into the durable tree once, then the agent owns
+# them: it can change its own behavior at runtime by editing this file.
+SETTINGS_DIR="${DATA_DIR}/config"
+SETTINGS_FILE="${SETTINGS_DIR}/settings.jsonc"
+export PUMBLE_SETTINGS_FILE="$SETTINGS_FILE"
 
 # Child registry: the orphan sweep and the core server both read and
 # write this JSON file to track live RPC child process groups. It
@@ -249,29 +264,28 @@ if [ ! -e "$CRON_SEED_MARKER" ]; then
 	touch "$CRON_SCHEDULES_DIR/.omp-bundler-seeded"
 fi
 
+# The adapter seeds this file itself on first read, from the template that
+# lives beside the defaults in settings.ts, so there is one source of truth
+# for both. The directory is created here because the agent must be able to
+# write it, and never overwritten: after first boot the file is the agent's,
+# and an image upgrade must not discard its changes.
+if [ -e "$SETTINGS_DIR" ] && [ ! -d "$SETTINGS_DIR" ]; then
+	die "${SETTINGS_DIR} must be a directory"
+fi
+mkdir -p "$SETTINGS_DIR"
+if [ -L "$SETTINGS_FILE" ]; then
+	die "${SETTINGS_FILE} must not be a symlink"
+fi
+
+# The agent edits its own settings, so the file must be inside a directory it
+# is allowed to write.
+OMP_ARGS="${OMP_ARGS:+${OMP_ARGS} }--add-dir ${SETTINGS_DIR}"
+export OMP_ARGS
+
 # Make cron state available to every OMP session through its native additional
 # workspace-root flag; the scheduler and adapter sessions share these args.
 OMP_ARGS="${OMP_ARGS:+${OMP_ARGS} }--add-dir ${CRON_DATA_DIR}"
 export OMP_ARGS
-
-link_into_data() {
-	local target="$1" expected="$2"
-	if [ -e "$target" ] && [ ! -L "$target" ]; then
-		die "refusing to clobber existing $target (expected a symlink or nothing)"
-	fi
-	if [ -L "$target" ]; then
-		# Already a symlink: verify it points at the expected data dir.
-		# A stale link to a different path is a failure, not silently
-		# accepted.
-		local resolved
-		resolved="$(readlink "$target")"
-		if [ "$resolved" != "$expected" ]; then
-			die "$target is a symlink to '$resolved', expected '$expected'"
-		fi
-		return 0
-	fi
-	ln -s "$expected" "$target"
-}
 
 # -- 1. refresh the durable agent definition ---------------------------
 # Stage the image-owned tree beside the destination, then swap it into place.
@@ -312,16 +326,33 @@ log "refreshed agent ${OMP_AGENT_ID}"
 # the whole definition in one place: instructions, config, skills, commands,
 # tools, extensions, and task agents. Every OMP loader resolves from here,
 # whether or not it honors OMP_AGENT_DIR.
+#
+# This directory is a durable volume: OMP owns everything it writes here
+# (sessions, blobs, agent.db, history.db, memories). The definition is copied
+# over the top on every boot so bundle edits land, and nothing is ever
+# deleted. A component removed from the bundle therefore lingers until the
+# volume is cleared by hand; that is the deliberate trade for never touching
+# OMP's own data.
 if [ -L "$AGENT_DIR" ]; then
 	die "${AGENT_DIR} must not be a symlink"
 fi
-rm -rf "$AGENT_DIR"
-mkdir -p "$(dirname "$AGENT_DIR")"
-if ! cp -R "$DURABLE_OMP_DIR" "$AGENT_DIR"; then
-	rm -rf "$AGENT_DIR"
+mkdir -p "$AGENT_DIR"
+if ! cp -R "${DURABLE_OMP_DIR}/." "$AGENT_DIR/"; then
 	die "failed to install the agent definition at ${AGENT_DIR}"
 fi
-link_into_data "${AGENT_DIR}/sessions" "$SESSIONS_DIR"
+
+# One-time migration: sessions used to live at /data/sessions, symlinked into
+# the ephemeral agent directory. Now that the agent directory is itself a
+# durable volume, OMP writes them in place. Move any pre-migration history
+# across so conversations survive the switch; the legacy directory is left
+# behind, empty, rather than deleted.
+if [ -d "$SESSIONS_DIR" ] && [ ! -L "$SESSIONS_DIR" ] && [ ! -e "${AGENT_DIR}/sessions" ]; then
+	mkdir -p "${AGENT_DIR}/sessions"
+	if ! cp -R "${SESSIONS_DIR}/." "${AGENT_DIR}/sessions/"; then
+		die "failed to migrate sessions from ${SESSIONS_DIR}"
+	fi
+	log "migrated sessions from ${SESSIONS_DIR} to ${AGENT_DIR}/sessions"
+fi
 log "installed agent definition at ${AGENT_DIR}"
 
 # -- 2. render models --------------------------------------------------

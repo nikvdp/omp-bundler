@@ -32,6 +32,7 @@ export interface RunSettings {
   readonly corePort: number;
   readonly adapterPort: number;
   readonly dataVolume: string;
+  readonly agentVolume: string;
   readonly containerName: string;
   readonly bundleRoot: string;
 }
@@ -202,6 +203,7 @@ export function resolveRunSettings(
   const dataVolume = typeof configuredRun?.dataVolume === "string" && configuredRun.dataVolume.trim()
     ? configuredRun.dataVolume
     : `${bundleName}-data`;
+  const agentVolume = `${dataVolume}-agent`;
   const corePort = typeof configuredRun?.corePort === "number" ? configuredRun.corePort : 8787;
   const adapterPort = typeof configuredRun?.adapterPort === "number" ? configuredRun.adapterPort : 8765;
   const containerName = `${dataVolume}-service`;
@@ -215,7 +217,7 @@ export function resolveRunSettings(
   if (!Number.isSafeInteger(adapterPort) || adapterPort < 1 || adapterPort > 65535) {
     throw new Error(`adapter port is not valid: ${adapterPort}`);
   }
-  return { image, dataVolume, corePort, adapterPort, containerName, bundleRoot: result.project.rootDir };
+  return { image, dataVolume, agentVolume, corePort, adapterPort, containerName, bundleRoot: result.project.rootDir };
 }
 export type PortProbe = (port: number) => Promise<boolean>;
 

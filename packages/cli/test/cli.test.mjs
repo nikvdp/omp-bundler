@@ -630,9 +630,13 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
       "export default () => {};\n",
       "bundle extensions must reach the directory OMP loads extensions from",
     );
+    // The agent directory is a durable volume that OMP owns: the definition is
+    // copied over the top on every boot and nothing is deleted, so a file
+    // written at runtime survives the refresh.
     assert.equal(
       await exists(join(agentDir, "stale-runtime.txt")),
-      false,
+      true,
+      "runtime state in the agent directory must survive a definition refresh",
     );
     assert.equal(
       await readFile(join(agentDir, "models.yml"), "utf8"),
@@ -645,11 +649,13 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
     );
     assert.equal(
       (await lstat(join(agentDir, "sessions"))).isSymbolicLink(),
-      true,
+      false,
+      "sessions are written in place now that the agent directory is durable",
     );
     assert.equal(
-      await realpath(join(agentDir, "sessions")),
-      await realpath(join(dataDir, "sessions")),
+      await exists(join(agentDir, "sessions")),
+      true,
+      "OMP writes sessions inside its own durable agent directory",
     );
     assert.equal(
       await exists(join(dataDir, "agent", ".omp", "models.yml")),
@@ -694,7 +700,12 @@ test("entrypoint persists live cron schedules and exposes their workspace root",
       'schedule: "0 9 * * *"\nmissed: skip\nprompt: "original"\n',
     );
     assert.equal(first.capture.OMP_CRON_SCHEDULES_DIR, liveSchedules);
-    assert.equal(first.capture.OMP_ARGS, `--profile test --add-dir ${join(dataDir, "cron")}`);
+    // Both the settings file and cron state are agent-writable, so each is
+    // exposed as a workspace root.
+    assert.equal(
+      first.capture.OMP_ARGS,
+      `--profile test --add-dir ${join(dataDir, "config")} --add-dir ${join(dataDir, "cron")}`,
+    );
 
     await writeText(
       join(liveSchedules, "daily.yml"),
