@@ -374,7 +374,15 @@ async function processNewMessage(
 ): Promise<NewMessageResult> {
   const event = parseNewMessage(payload);
   if (!event) {
-    // Malformed payload: not retryable, but we ack so Pumble does not retry.
+    // Not retryable, so we ack; but a rejected payload is otherwise invisible.
+    // Log the shape that failed: a message the parser refuses looks exactly
+    // like one that was never sent, and that is the hardest failure to find.
+    const body = payload.body;
+    const shape =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? Object.keys(body as Record<string, unknown>).sort().join(",")
+        : typeof body;
+    console.warn(`>>> Pumble NEW_MESSAGE rejected: body keys=[${shape}]`);
     return { ok: true };
   }
 

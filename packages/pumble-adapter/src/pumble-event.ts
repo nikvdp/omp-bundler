@@ -131,13 +131,12 @@ export function parseNewMessage(
   const authorId = stringValue(body.aId) || stringValue(payload.authorId);
   const text = stringValue(body.tx) || stringValue(payload.text);
   const files = parseMessageFiles(body.f);
-  if (
-    !workspaceId ||
-    !channelId ||
-    !messageId ||
-    !authorId ||
-    (!text && files.length === 0)
-  ) {
+  // Only identity makes a message unroutable. Empty content does not: Pumble
+  // omits `f` from the NEW_MESSAGE webhook for a file posted with no caption,
+  // so rejecting here dropped image-only messages entirely -- no webhook
+  // trace, no reply, nothing for the sender to see. The caller refetches the
+  // message from the API and decides then.
+  if (!workspaceId || !channelId || !messageId || !authorId) {
     return null;
   }
   const channelTypeRaw = stringValue(
