@@ -14,6 +14,12 @@ export interface Target {
   channelId: string;
   triggerMessageId: string;
   threadRootId?: string;
+  /**
+   * True when the conversation is a direct message. Persisted so the renderer
+   * can apply DM-only behavior (such as streaming) after a process restart,
+   * when the originating event is no longer in memory.
+   */
+  direct?: boolean;
 }
 
 interface TargetStoreData {
@@ -280,6 +286,7 @@ function isValidTarget(value: unknown): boolean {
     typeof record.triggerMessageId === "string" &&
     record.triggerMessageId.length > 0 &&
     (record.threadRootId === undefined ||
-      typeof record.threadRootId === "string")
+      typeof record.threadRootId === "string") &&
+    (record.direct === undefined || typeof record.direct === "boolean")
   );
 }

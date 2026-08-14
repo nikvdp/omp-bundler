@@ -17,10 +17,17 @@ export function verifyPumbleSignature(
     return false;
   }
 
-  const timestampSeconds = Number(timestamp);
-  if (!Number.isFinite(timestampSeconds)) {
+  // Pumble sends X-Pumble-Request-Timestamp in MILLISECONDS (13 digits).
+  // Comparing that against epoch seconds put every request ~1.8e12 outside the
+  // tolerance, so each webhook was rejected here before its HMAC was checked
+  // and the adapter stayed silent. Accept either unit: 13-digit values are
+  // milliseconds, 10-digit values are seconds.
+  const timestampNumber = Number(timestamp);
+  if (!Number.isFinite(timestampNumber)) {
     return false;
   }
+  const timestampSeconds =
+    Math.abs(timestampNumber) >= 1e11 ? timestampNumber / 1000 : timestampNumber;
 
   const nowSeconds = Math.floor(Date.now() / 1000);
   if (Math.abs(nowSeconds - timestampSeconds) > maxAgeSeconds) {

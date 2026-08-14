@@ -2,12 +2,15 @@ import type {
   OutboundEvent,
   PresenceChangedEvent,
   TurnErrorEvent,
+  TurnCancelledEvent,
+  TurnDeltaEvent,
   TurnProgressEvent,
   TurnReplyEvent,
   TurnStartedEvent,
 } from "@omp-bundler/contracts/outbound";
 import type { WorkspaceAttachment } from "@omp-bundler/contracts/shared";
 import type { PumbleApi } from "./pumble-api.js";
+import type { SettingsStore } from "./settings.js";
 
 /**
  * Pumble outbound renderer.
@@ -66,14 +69,47 @@ import type { PumbleApi } from "./pumble-api.js";
  * recorded.
  */
 
-/** "I have seen this message." */
-const SEEN_REACTION = "\u{1F440}";
+/**
+ * Status markers on the triggering message, in lifecycle order:
+ *
+ *   turn.started -> eyes            "I saw your message"
+ *   turn.started -> brain           "I am working out a reply"
+ *   first delta  -> brain removed, speech balloon added
+ *   reply/error  -> all cleared
+ *
+ * Pumble takes a shortcode, not raw Unicode.
+ */
+const SEEN_REACTION = ":eyes:";
+const THINKING_REACTION = ":brain:";
+const REPLYING_REACTION = ":speech_balloon:";
 
-/** "I am writing a reply." Removed when the reply posts. */
-const REPLYING_REACTION = "\u{1F4AC}";
+/** Every status reaction, for bulk clearing at the end of a turn. */
+const STATUS_REACTIONS = [
+  SEEN_REACTION,
+  THINKING_REACTION,
+  REPLYING_REACTION,
+] as const;
 
-/** Both status reactions, in the order they are added and removed. */
-const STATUS_REACTIONS = [SEEN_REACTION, REPLYING_REACTION] as const;
+/**
+ * Events that end a turn. These are the only ones that clear status markers,
+ * and they do so from one place so a new terminal type cannot be added without
+ * inheriting the cleanup.
+ */
+const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "turn.reply",
+  "turn.error",
+  "turn.cancelled",
+]);
+
+function isTerminalEvent(event: OutboundEvent): boolean {
+  return TERMINAL_EVENT_TYPES.has(event.type);
+}
+
+/**
+ * Minimum gap between interim edits. Deltas can arrive per token; editing
+ * Pumble that often would flood the API for no readable benefit.
+ */
+const INTERIM_EDIT_INTERVAL_MS = 900;
 
 /**
  * Conversation target resolved for a correlation. Produced by the injected
@@ -85,6 +121,8 @@ export interface ResolvedTarget {
   channelId: string;
   triggerMessageId: string;
   threadRootId?: string;
+  /** True when this conversation is a direct message. */
+  direct?: boolean;
 }
 
 /**
@@ -129,6 +167,12 @@ export interface PumbleRendererOptions {
   attachmentSender?: AttachmentSender;
   /** Optional persistent checkpoints for confirmed Pumble side effects. */
   checkpointStore?: RenderingCheckpointStore;
+  /**
+   * Runtime settings. Streaming is decided per message rather than at
+   * construction, so the agent can change it mid-conversation and so a
+   * channel and a DM can behave differently.
+   */
+  settings?: Pick<SettingsStore, "get">;
 }
 
 /** In-memory per-correlation delivery checkpoints. */
@@ -143,8 +187,20 @@ interface CorrelationState {
    * and one failing to apply never affects the other.
    */
   activeReactions: Set<string>;
+
+  /** Status reactions already attempted, including attempts that failed. */
+  attemptedReactions: Set<string>;
+
   /** Id of the first interim progress message, reused by later edits. */
   interimMessageId?: string;
+  /**
+   * Running text shown in the interim message. `turn.progress` carries only
+   * the newest chunk, not the reply so far, so the renderer accumulates here.
+   * Without this each edit replaced the message with a single fragment.
+   */
+  interimText: string;
+  /** Epoch ms of the last interim edit, for throttling. */
+  lastInterimEditAt: number;
   /**
    * Checkpoint for an in-flight terminal reply: the final text message has
    * been posted. A retry of the same event skips re-posting the text.
@@ -167,6 +223,7 @@ export class PumbleRenderer {
   private readonly logger: RendererLogger;
   private readonly attachmentSender?: AttachmentSender;
   private readonly checkpointStore?: RenderingCheckpointStore;
+  private readonly settings?: Pick<SettingsStore, "get">;
 
   /** Nested map keyed by (conversationKey, correlationId), never concatenation. */
   private readonly correlations = new Map<
@@ -180,6 +237,7 @@ export class PumbleRenderer {
     this.logger = options.logger;
     this.attachmentSender = options.attachmentSender;
     this.checkpointStore = options.checkpointStore;
+    this.settings = options.settings;
   }
 
   /**
@@ -225,6 +283,11 @@ export class PumbleRenderer {
         seen: new Set<string>(),
         startedReaction: false,
         activeReactions: new Set<string>(),
+
+        attemptedReactions: new Set<string>(),
+
+        interimText: "",
+        lastInterimEditAt: 0,
         finalTextPosted: false,
         sentAttachmentIndexes: new Set<number>(),
         terminal: false,
@@ -246,7 +309,19 @@ export class PumbleRenderer {
     if (state.terminal) {
       return;
     }
-    await this.dispatch(event, state, checkpoints);
+    // Status reactions are cleared here, not in each handler: a terminal event
+    // must never leave the thinking/replying markers on the message, including
+    // when the handler throws partway through. Clearing is idempotent and the
+    // markers are the only thing a reader has to tell a live turn from a dead
+    // one, so this runs even if delivery failed.
+    try {
+      await this.dispatch(event, state, checkpoints);
+    } finally {
+      if (isTerminalEvent(event)) {
+        await this.clearTerminalStatus(event, state, checkpoints);
+        state.terminal = true;
+      }
+    }
     state.seen.add(event.eventId);
   }
 
@@ -263,13 +338,18 @@ export class PumbleRenderer {
         await this.onProgress(event, state, checkpoints);
         return;
       case "turn.delta":
-        // Deltas are acknowledged without any Pumble platform action.
+        // Deltas post nothing, but the first one marks the moment the model
+        // stopped thinking and started writing.
+        await this.onDelta(event, state, checkpoints);
         return;
       case "turn.reply":
         await this.onReply(event, state, checkpoints);
         return;
       case "turn.error":
         await this.onError(event, state, checkpoints);
+        return;
+      case "turn.cancelled":
+        await this.onCancelled(event, state, checkpoints);
         return;
       case "presence.changed":
         await this.onPresence(event, state, checkpoints);
@@ -282,36 +362,115 @@ export class PumbleRenderer {
     state: CorrelationState,
     checkpoints: Set<string>,
   ): Promise<void> {
-    // Both markers go up at turn start. Adding the speech balloon later, on
-    // first progress, would read better but progress is only emitted after
-    // progressThresholdMs, so a fast turn would never show it at all.
-    const pending = STATUS_REACTIONS.filter(
-      (emoji) => !checkpoints.has(`reaction:add:${emoji}`),
-    );
-    for (const emoji of STATUS_REACTIONS) {
-      if (checkpoints.has(`reaction:add:${emoji}`)) state.activeReactions.add(emoji);
-    }
-    if (pending.length === 0) {
-      state.startedReaction = true;
+    // At turn start the model has not produced text yet, so the pair is
+    // "seen" plus "thinking". The first delta swaps thinking for replying.
+    // addStatusReaction is idempotent through its checkpoint, and each marker
+    // is independent so one failing never suppresses the other.
+    const target = await this.resolve(event);
+    if (!target) {
       return;
     }
-    if (state.startedReaction) {
-      for (const emoji of pending) {
-        await this.markCheckpoint(event.eventId, checkpoints, `reaction:add:${emoji}`);
+    state.startedReaction = true;
+    for (const emoji of [SEEN_REACTION, THINKING_REACTION]) {
+      await this.addStatusReaction(
+        target,
+        state,
+        emoji,
+        event.eventId,
+        checkpoints,
+      );
+    }
+  }
+
+  /**
+   * Handle one streamed text chunk.
+   *
+   * `turn.delta` is the real stream: emitted for every chunk, append-only, no
+   * coalescing. `turn.progress` is a 500ms sampler that overwrites a single
+   * pending slot, so chunks inside its window are lost and it can never show
+   * the full reply. The interim message is therefore driven from deltas.
+   *
+   * Pumble is edited at most once per {@link INTERIM_EDIT_INTERVAL_MS} so a
+   * fast stream does not turn into an edit-per-token flood. The accumulated
+   * text is always complete; only the edit rate is throttled.
+   */
+  private async onDelta(
+    event: TurnDeltaEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    state.interimText += event.text;
+
+    if (!state.attemptedReactions.has(REPLYING_REACTION)) {
+      const target = await this.resolve(event);
+      if (target) {
+        await this.removeStatusReaction(
+          target,
+          state,
+          THINKING_REACTION,
+          event.eventId,
+          checkpoints,
+        );
+        await this.addStatusReaction(
+          target,
+          state,
+          REPLYING_REACTION,
+          event.eventId,
+          checkpoints,
+        );
       }
+    }
+
+    const now = Date.now();
+    if (state.interimMessageId && now - state.lastInterimEditAt < INTERIM_EDIT_INTERVAL_MS) {
       return;
     }
     const target = await this.resolve(event);
     if (!target) {
       return;
     }
-    state.startedReaction = true;
-    // Independent: one reaction failing must not suppress the other.
-    for (const emoji of pending) {
-      if (await this.safeAddReaction(target, emoji)) {
-        state.activeReactions.add(emoji);
-        await this.markCheckpoint(event.eventId, checkpoints, `reaction:add:${emoji}`);
+    // Resolved first: streaming is a per-conversation decision, and only the
+    // target knows whether this is a DM.
+    if (!this.streamingEnabled(target)) {
+      return;
+    }
+    const body = state.interimText;
+    if (!state.interimMessageId) {
+      try {
+        const response = await this.pumble.sendMessage(
+          target.appKey,
+          target.botToken,
+          target.channelId,
+          body,
+          target.threadRootId,
+        );
+        const id = messageIdOf(response);
+        if (id) state.interimMessageId = id;
+        state.lastInterimEditAt = now;
+      } catch (error) {
+        this.logger.warn(
+          "pumble-renderer: interim post failed",
+          this.describeCorrelation(event),
+          this.errorText(error),
+        );
       }
+      return;
+    }
+    try {
+      await this.pumble.editMessage(
+        target.appKey,
+        target.botToken,
+        target.channelId,
+        state.interimMessageId,
+        body,
+      );
+      state.lastInterimEditAt = now;
+    } catch (error) {
+      this.logger.warn(
+        "pumble-renderer: interim edit failed",
+        this.describeCorrelation(event),
+        this.errorText(error),
+      );
     }
   }
 
@@ -320,62 +479,13 @@ export class PumbleRenderer {
     state: CorrelationState,
     checkpoints: Set<string>,
   ): Promise<void> {
-    const checkpoint = "text";
-    if (checkpoints.has(checkpoint)) {
-      return;
-    }
-    const target = await this.resolve(event);
-    if (!target) {
-      return;
-    }
-    let confirmed = false;
-    if (!state.interimMessageId) {
-      try {
-        const response = await this.pumble.sendMessage(
-          target.appKey,
-          target.botToken,
-          target.channelId,
-          event.message,
-          target.threadRootId,
-        );
-        confirmed = true;
-        const id = messageIdOf(response);
-        if (id) {
-          state.interimMessageId = id;
-        } else {
-          this.logger.warn(
-            "pumble-renderer: progress interim posted but no message id returned",
-            this.describeCorrelation(event),
-          );
-        }
-      } catch (error) {
-        this.logger.warn(
-          "pumble-renderer: progress interim post failed",
-          this.describeCorrelation(event),
-          this.errorText(error),
-        );
-      }
-    } else {
-      try {
-        await this.pumble.editMessage(
-          target.appKey,
-          target.botToken,
-          target.channelId,
-          state.interimMessageId,
-          event.message,
-        );
-        confirmed = true;
-      } catch (error) {
-        this.logger.warn(
-          "pumble-renderer: progress edit failed",
-          this.describeCorrelation(event),
-          this.errorText(error),
-        );
-      }
-    }
-    if (confirmed) {
-      await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
-    }
+    // No-op. The interim message is driven by turn.delta, which carries every
+    // chunk. turn.progress is a 500ms sampler whose pending slot is
+    // overwritten between flushes, so acting on it both loses text and fights
+    // the delta stream for the same message.
+    void event;
+    void state;
+    void checkpoints;
   }
 
   private async onReply(
@@ -391,21 +501,73 @@ export class PumbleRenderer {
       } else if (state.finalTextPosted) {
         await this.markCheckpoint(event.eventId, checkpoints, "text");
       } else {
-        await this.pumble.sendMessage(
-          target.appKey,
-          target.botToken,
-          target.channelId,
-          event.text,
-          target.threadRootId,
-        );
+        await this.deliverFinalText(target, state, event.text, event);
         state.finalTextPosted = true;
         await this.markCheckpoint(event.eventId, checkpoints, "text");
       }
     }
 
+    // A silent turn that already streamed an interim would otherwise leave it
+    // standing: a half-written thought the agent decided not to send. Remove
+    // it so choosing silence actually looks silent.
+    if (!event.text && state.interimMessageId) {
+      try {
+        await this.pumble.deleteMessage(
+          target.appKey,
+          target.botToken,
+          target.channelId,
+          state.interimMessageId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          "pumble-renderer: silent interim delete failed",
+          this.describeCorrelation(event),
+          this.errorText(error),
+        );
+      }
+      state.interimMessageId = undefined;
+    }
+
     await this.deliverAttachments(target, event, state, checkpoints);
-    await this.clearStatusReactions(target, state, event.eventId, checkpoints);
-    state.terminal = true;
+  }
+
+  /**
+   * Deliver terminal text. When a streamed interim message is already in the
+   * channel, edit it into the final text so the partial does not linger above
+   * the real answer; otherwise post a new message. Falls back to posting if
+   * the edit fails, because losing the answer is worse than a duplicate.
+   */
+  private async deliverFinalText(
+    target: ResolvedTarget,
+    state: CorrelationState,
+    text: string,
+    event: OutboundEvent,
+  ): Promise<void> {
+    if (state.interimMessageId) {
+      try {
+        await this.pumble.editMessage(
+          target.appKey,
+          target.botToken,
+          target.channelId,
+          state.interimMessageId,
+          text,
+        );
+        return;
+      } catch (error) {
+        this.logger.warn(
+          "pumble-renderer: final edit failed, posting a new message",
+          this.describeCorrelation(event),
+          this.errorText(error),
+        );
+      }
+    }
+    await this.pumble.sendMessage(
+      target.appKey,
+      target.botToken,
+      target.channelId,
+      text,
+      target.threadRootId,
+    );
   }
 
   private async onError(
@@ -422,17 +584,45 @@ export class PumbleRenderer {
     const target = await this.resolveRequired(event);
 
     if (!checkpoints.has("text")) {
-      await this.pumble.sendMessage(
-        target.appKey,
-        target.botToken,
-        target.channelId,
-        event.message,
-        target.threadRootId,
-      );
+      await this.deliverFinalText(target, state, event.message, event);
       await this.markCheckpoint(event.eventId, checkpoints, "text");
     }
-    await this.clearStatusReactions(target, state, event.eventId, checkpoints);
-    state.terminal = true;
+  }
+
+  /**
+   * A turn was abandoned because a newer addressed message replaced it.
+   *
+   * Core rewound the session past this turn, so any interim message already
+   * posted has to go: leaving it would show a half-written reply that the
+   * agent no longer has any record of. Nothing is posted in its place, since
+   * the replacement turn is already running and will answer.
+   */
+  private async onCancelled(
+    event: TurnCancelledEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    const target = await this.resolve(event);
+    if (!target) {
+      return;
+    }
+    if (state.interimMessageId) {
+      try {
+        await this.pumble.deleteMessage(
+          target.appKey,
+          target.botToken,
+          target.channelId,
+          state.interimMessageId,
+        );
+      } catch (error) {
+        this.logger.warn(
+          "pumble-renderer: interim delete failed",
+          this.describeCorrelation(event),
+          this.errorText(error),
+        );
+      }
+      state.interimMessageId = undefined;
+    }
   }
 
   private async onPresence(
@@ -466,17 +656,87 @@ export class PumbleRenderer {
     checkpoints: Set<string>,
   ): Promise<void> {
     for (const emoji of STATUS_REACTIONS) {
-      if (!state.activeReactions.has(emoji)) {
-        continue;
-      }
-      const checkpoint = `reaction:remove:${emoji}`;
-      if (!checkpoints.has(checkpoint)) {
-        if (await this.safeRemoveReaction(target, emoji)) {
-          await this.markCheckpoint(eventId, checkpoints, checkpoint);
-        }
-      }
-      state.activeReactions.delete(emoji);
+      await this.removeStatusReaction(
+        target,
+        state,
+        emoji,
+        eventId,
+        checkpoints,
+      );
     }
+  }
+
+  /**
+   * Clear status markers for a terminal event. Resolving the target can fail
+   * (deleted channel, revoked token) and that must not propagate: the turn is
+   * already over and the caller is in a `finally`, so throwing here would
+   * replace the real outcome with a cleanup error.
+   */
+  private async clearTerminalStatus(
+    event: OutboundEvent,
+    state: CorrelationState,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    try {
+      const target = await this.resolveRequired(event);
+      await this.clearStatusReactions(target, state, event.eventId, checkpoints);
+    } catch (error) {
+      this.logger.warn(
+        "pumble-renderer: status cleanup failed",
+        this.describeCorrelation(event),
+        this.errorText(error),
+      );
+    }
+  }
+
+  /**
+   * Add one status reaction and record it, unless a checkpoint says it is
+   * already there. Shared by turn start and the thinking/replying swap so the
+   * checkpoint key and state bookkeeping stay in one place.
+   */
+  private async addStatusReaction(
+    target: ResolvedTarget,
+    state: CorrelationState,
+    emoji: string,
+    eventId: string,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    const checkpoint = `reaction:add:${emoji}`;
+    if (state.attemptedReactions.has(emoji)) {
+      return;
+    }
+    state.attemptedReactions.add(emoji);
+    if (checkpoints.has(checkpoint)) {
+      state.activeReactions.add(emoji);
+      return;
+    }
+    if (await this.safeAddReaction(target, emoji)) {
+      state.activeReactions.add(emoji);
+      await this.markCheckpoint(eventId, checkpoints, checkpoint);
+    }
+  }
+
+  /**
+   * Remove one status reaction, mirroring {@link addStatusReaction}.
+   *
+   * Removal is not gated on `activeReactions`. That set is per-process memory:
+   * a restart or a rebuilt correlation empties it while the reaction is still
+   * on the message in Pumble, and skipping the delete then strands the marker
+   * with no error. Pumble is the source of truth, the checkpoint already stops
+   * repeat deletes, and removing a reaction that is not there is harmless.
+   */
+  private async removeStatusReaction(
+    target: ResolvedTarget,
+    state: CorrelationState,
+    emoji: string,
+    eventId: string,
+    checkpoints: Set<string>,
+  ): Promise<void> {
+    const checkpoint = `reaction:remove:${emoji}`;
+    if (!checkpoints.has(checkpoint) && (await this.safeRemoveReaction(target, emoji))) {
+      await this.markCheckpoint(eventId, checkpoints, checkpoint);
+    }
+    state.activeReactions.delete(emoji);
   }
 
   private async deliverAttachments(
@@ -547,6 +807,21 @@ export class PumbleRenderer {
       state.sentAttachmentIndexes.add(index);
       await this.markCheckpoint(event.eventId, checkpoints, checkpoint);
     }
+  }
+
+  /**
+   * Whether to post and edit an interim message for this conversation.
+   *
+   * Streaming suits a direct message, where the conversation is just the two
+   * participants. In a channel the same behavior is a message mutating in
+   * place while other people are talking, so it is off by default there.
+   */
+  private streamingEnabled(target: ResolvedTarget): boolean {
+    const settings = this.settings?.get();
+    if (!settings) return false;
+    return target.direct === true
+      ? settings.streamInDirectMessages
+      : settings.streamInChannels;
   }
 
   private async resolve(event: OutboundEvent): Promise<ResolvedTarget | null> {
