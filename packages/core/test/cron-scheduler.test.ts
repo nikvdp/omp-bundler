@@ -118,7 +118,9 @@ test("parseYaml parses scalars, quoted scalars, and block scalars", () => {
   assert.equal(parsed.schedule, "0 9 * * 1-5");
   assert.equal(parsed.timezone, "America/New_York");
   assert.equal(parsed.missed, "skip");
-  assert.equal(parsed.prompt, "Line one.\nLine two.");
+  // A `|` block scalar keeps its trailing newline; the hand-rolled parser this
+  // replaced stripped it.
+  assert.equal(parsed.prompt, "Line one.\nLine two.\n");
 });
 
 test("parseScheduleFile validates the job schema and parses the cron expression", () => {

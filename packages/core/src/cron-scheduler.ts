@@ -49,6 +49,14 @@ export interface CronJob {
   command: string | null;
   /** Command timeout in seconds, or null for prompt mode. */
   timeout: number | null;
+  /**
+   * Run once at startup, in addition to the normal schedule.
+   *
+   * For work that leaves the durable volume stale after downtime, such as a
+   * repo clone: without this a fresh volume stays empty until the next
+   * scheduled fire. A boot run never shifts the schedule.
+   */
+  runAtBoot: boolean;
   /** Parsed schedule, computed once after validation. */
   parsed: CronSchedule;
 }
@@ -165,6 +173,10 @@ export function parseScheduleFile(id: string, source: string): CronJob {
   } else if (command !== null) {
     timeout = DEFAULT_COMMAND_TIMEOUT_SECONDS;
   }
+  if (record.runAtBoot !== undefined && typeof record.runAtBoot !== "boolean") {
+    throw new Error(`schedule '${id}': runAtBoot must be true or false`);
+  }
+  const runAtBoot = record.runAtBoot === true;
   validateTimezone(timezone, id);
   let cronSchedule: CronSchedule;
   try {
@@ -182,6 +194,7 @@ export function parseScheduleFile(id: string, source: string): CronJob {
     prompt,
     command,
     timeout,
+    runAtBoot,
     parsed: cronSchedule,
   };
 }
@@ -506,6 +519,9 @@ export function startCronScheduler(
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   let inFlight: Promise<void> | null = null;
+  // Jobs whose boot run already happened in this process, so a reload or a
+  // later tick never repeats it.
+  const bootRan = new Set<string>();
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
@@ -526,6 +542,18 @@ export function startCronScheduler(
     const nowMs = now();
     // Track per-job lastRun on disk; load lazily into memory for this tick.
     let earliestNext = Number.POSITIVE_INFINITY;
+    for (const job of jobs) {
+      if (!job.runAtBoot || bootRan.has(job.id)) continue;
+      bootRan.add(job.id);
+      // Deliberately not fireOne: a boot run must not advance the schedule
+      // anchor. Writing last-run here would make a job on a 10 minute cron
+      // that boots at 15:51 next fire at 16:01 instead of 16:00, and would
+      // swallow a catchUp window. The run output is still recorded.
+      inFlight = runAtBootOnce(options, job, nowMs).finally(() => {
+        inFlight = null;
+      });
+      await inFlight;
+    }
     for (const job of jobs) {
       const lastRun = await readLastRun(options.cronDataDir, job.id);
       if (lastRun === null) {
@@ -635,6 +663,27 @@ export async function fireOne(
   console.error(`[cron] job '${job.id}' ${result.status} (${result.durationMs}ms)`);
 }
 
+/**
+ * Run a `runAtBoot` job once at startup.
+ *
+ * Shares execution and run-output recording with {@link fireOne} but does not
+ * write last-run state: that field is what the tick loop reads to decide when
+ * a job is next due, so writing it here would move the schedule. A boot run is
+ * an extra execution alongside the schedule, never a substitute for one.
+ */
+export async function runAtBootOnce(
+  options: CronSchedulerOptions,
+  job: CronJob,
+  atMs: number,
+): Promise<void> {
+  console.error(`[cron] boot run for job '${job.id}'`);
+  const result = await runJobOnce(job, atMs, options);
+  await writeRun(options.cronDataDir, job.id, atMs, result.text || "");
+  console.error(
+    `[cron] job '${job.id}' boot run ${result.status} (${result.durationMs}ms)`,
+  );
+}
+
 /** Read the persisted last-run epoch for a job, or null if none. */
 async function readLastRun(
   cronDataDir: string,
@@ -652,84 +701,19 @@ async function readLastRun(
 }
 
 // ---------------------------------------------------------------------------
-// Minimal YAML parser (mapping only; no third-party dependency)
+// YAML
 // ---------------------------------------------------------------------------
 
 /**
- * Parse a small YAML mapping into a plain object. Supports only the cron
- * schedule surface: scalar values, quoted scalars, and a single block scalar
- * (`key: |` with indented lines). Intentionally minimal — schedules are tiny.
+ * Parse a schedule file.
+ *
+ * Uses the runtime's YAML parser rather than a hand-rolled one. The previous
+ * minimal implementation returned every scalar as a string, so `runAtBoot:
+ * true` arrived as `"true"` and `timeout: 600` as `"600"`, pushing type
+ * coercion into each field's validation.
  */
 export function parseYaml(source: string): unknown {
-  const lines = source.split("\n");
-  const result: Record<string, unknown> = {};
-  let i = 0;
-  while (i < lines.length) {
-    const raw = lines[i];
-    i++;
-    const line = stripComment(raw);
-    if (line.trim().length === 0) continue;
-    const keyMatch = /^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$/.exec(line);
-    if (!keyMatch) continue;
-    const key = keyMatch[1];
-    const rest = keyMatch[2].trimEnd();
-    if (rest === "|") {
-      // Block scalar: collect following indented lines.
-      const blockLines: string[] = [];
-      let indent = -1;
-      while (i < lines.length) {
-        const next = lines[i];
-        if (next.trim().length === 0) {
-          blockLines.push("");
-          i++;
-          continue;
-        }
-        const lead = next.search(/\S/);
-        if (lead < 0 || (indent >= 0 && lead < indent)) break;
-        if (indent < 0) indent = lead;
-        blockLines.push(next.slice(indent).replace(/\s+$/, ""));
-        i++;
-      }
-      // Trim trailing blank lines.
-      while (blockLines.length > 0 && blockLines[blockLines.length - 1] === "") {
-        blockLines.pop();
-      }
-      result[key] = blockLines.join("\n");
-      continue;
-    }
-    if (rest.length === 0) {
-      // Could be a block scalar on the next line; treat empty as null scalar.
-      result[key] = "";
-      continue;
-    }
-    result[key] = parseScalar(rest);
-  }
-  return result;
-}
-
-/** Parse a single-line YAML scalar (handles quotes). */
-function parseScalar(value: string): string {
-  const trimmed = value.trim();
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1);
-  }
-  return trimmed;
-}
-
-/** Strip a `#` comment from a line, respecting quotes. */
-function stripComment(line: string): string {
-  let inSingle = false;
-  let inDouble = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === "'" && !inDouble) inSingle = !inSingle;
-    else if (ch === '"' && !inSingle) inDouble = !inDouble;
-    else if (ch === "#" && !inSingle && !inDouble) return line.slice(0, i);
-  }
-  return line;
+  return Bun.YAML.parse(source);
 }
 
 // ---------------------------------------------------------------------------

@@ -19,10 +19,8 @@ export const PUMBLE_RUNTIME_FIELDS = [
 ] as const;
 
 /**
- * Fresh runtime.env.example for a default HTTP bundle. Compact and
- * self-explaining: one comment, the adapter mode, a blank line, and the
- * optional HTTP Bearer token. No auth-broker or Pumble fields — those are
- * opt-in sections generated on request.
+ * Fresh runtime.env.example for a default HTTP bundle. It explains the
+ * adapter, HTTP token, and opt-in cron override without enabling extra modes.
  */
 export const RUNTIME_ENV_EXAMPLE = runtimeEnvExample();
 
@@ -34,6 +32,9 @@ export function runtimeEnvExample(): string {
     "",
     "# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.",
     "OMP_HTTP_API_TOKEN=",
+    "",
+    "# Cron is enabled automatically when schedules/*.yml exists. See README.md: Cron schedules.",
+    "# OMP_CRON_ENABLED=",
   ];
   return `${lines.join("\n")}\n`;
 }
@@ -161,23 +162,18 @@ omp-bundler generate skill meeting-notes
 omp-bundler generate tool read-transcript
 \`\`\`
 
-## Schedules (cron)
+## Cron
 
-Run the agent on a timer with a schedule file under \`schedules/\`. Each active
-\`*.yml\` file is copied once into \`/data/cron/schedules\` on first container
-start, then that data-volume directory becomes the live source. Agent sessions
-can edit it with their normal file tools; changes survive restarts and image
-rebuilds using the same \`dataVolume\`.
+Schedules live under \`schedules/\`. The scaffolded
+\`schedules/example-schedule.yml.example\` is inert; create an active schedule
+with \`omp-bundler generate schedule <name>\` and remove it with
+\`omp-bundler destroy schedule <name>\`. On first startup, image schedules are
+seeded once into \`/data/cron/schedules\`; that durable directory is then owned
+by the agent and is not refreshed by rebuilding an existing deployment.
 
-Each active \`*.yml\` file runs its \`prompt\` in a fresh OMP session on its cron
-schedule and writes the reply to \`/data/cron/jobs/<job-id>/runs/\`. The
-\`.example\` suffix keeps a schedule inert. The scheduler re-reads the live
-directory on every wake, at most 60 seconds apart, and stays idle when no
-active jobs exist:
+Each run writes to \`/data/cron/jobs/<job-id>/\`. See the repository README's
+\`Cron schedules\` section for the YAML schema and prompt/command examples.
 
-\`\`\`bash
-omp-bundler generate schedule daily-summary
-\`\`\`
 
 ## Development loop
 

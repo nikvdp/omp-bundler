@@ -581,6 +581,9 @@ function validateScheduleFile(
   if (parsed.missed !== "skip" && parsed.missed !== "catchUp") {
     errors.push(issue(path, "missed", "must be 'skip' or 'catchUp'"));
   }
+  if (parsed.runAtBoot !== undefined && typeof parsed.runAtBoot !== "boolean") {
+    errors.push(issue(path, "runAtBoot", "must be a boolean"));
+  }
   const prompt = parsed.prompt;
   const command = parsed.command;
   const hasPrompt = typeof prompt === "string" && prompt.trim().length > 0;
