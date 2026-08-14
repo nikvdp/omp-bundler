@@ -14,6 +14,7 @@ import {
   OUTBOUND_EVENT_TYPE_HEADER,
   type OutboundEvent,
   type TurnErrorEvent,
+  type TurnCancelledEvent,
   type TurnReplyEvent,
 } from "@omp-bundler/contracts/outbound";
 
@@ -25,7 +26,7 @@ const RECENT_EVENT_LIMIT = 1_000;
 const EARLY_EVENT_LIMIT = 256;
 const EARLY_EVENT_BYTES = 256 * 1024;
 
-type TerminalEvent = TurnReplyEvent | TurnErrorEvent;
+type TerminalEvent = TurnReplyEvent | TurnErrorEvent | TurnCancelledEvent;
 type BufferedEvent = Extract<
   OutboundEvent,
   { type: "turn.delta" | "turn.progress" }
@@ -306,6 +307,18 @@ export class HttpAgentAdapter {
         });
         return;
       }
+      // A cancelled turn produced no answer, and a newer message is already
+      // being handled. 409 rather than an error body: nothing failed, this
+      // request was simply superseded.
+      if (terminal.type === "turn.cancelled") {
+        sendJson(res, 409, {
+          agentId: route.agentId,
+          conversationKey: route.conversationKey,
+          correlationId,
+          cancelled: true,
+        });
+        return;
+      }
 
       sendJson(res, 200, {
         agentId: route.agentId,
@@ -499,13 +512,14 @@ export class HttpAgentAdapter {
       event.type !== "turn.delta" &&
       event.type !== "turn.progress" &&
       event.type !== "turn.reply" &&
-      event.type !== "turn.error"
+      event.type !== "turn.error" &&
+      event.type !== "turn.cancelled"
     ) {
       return;
     }
 
     const early = tracker ?? this.createEarlyTracker(event);
-    if (event.type === "turn.reply" || event.type === "turn.error") {
+    if (isTerminalEvent(event)) {
       if (!early.terminal || event.sequence < early.terminal.sequence) {
         early.terminal = event;
       }
@@ -547,7 +561,7 @@ export class HttpAgentAdapter {
       return;
     }
     if (event.sequence <= active.lastSequence) {
-      if (event.type === "turn.reply" || event.type === "turn.error") {
+      if (isTerminalEvent(event)) {
         this.completeTurn(tracker, event);
       }
       return;
@@ -558,7 +572,7 @@ export class HttpAgentAdapter {
       active.stream?.push(formatSse("delta", event, event.sequence));
     } else if (event.type === "turn.progress") {
       active.stream?.push(formatSse("progress", event, event.sequence));
-    } else if (event.type === "turn.reply" || event.type === "turn.error") {
+    } else if (isTerminalEvent(event)) {
       this.completeTurn(tracker, event);
     }
   }
@@ -577,9 +591,16 @@ export class HttpAgentAdapter {
     }
     const stream = active.stream;
     active.stream = undefined;
-    stream?.finish(
-      formatSse(event.type === "turn.reply" ? "completed" : "error", event, event.sequence),
-    );
+    // A cancelled turn is neither a completion nor a failure: the client must
+    // discard the partial it has been rendering, which `completed` would keep
+    // and `error` would misreport as something going wrong.
+    const sseEvent =
+      event.type === "turn.reply"
+        ? "completed"
+        : event.type === "turn.cancelled"
+          ? "cancelled"
+          : "error";
+    stream?.finish(formatSse(sseEvent, event, event.sequence));
     active.resolve(event);
   }
 
@@ -761,6 +782,18 @@ function parsePublicMessage(rawBody: Buffer): string | null {
   return body.message;
 }
 
+/**
+ * Terminal events close a turn. A turn ends by replying, by failing, or by
+ * being superseded by a newer addressed message.
+ */
+function isTerminalEvent(event: OutboundEvent): event is TerminalEvent {
+  return (
+    event.type === "turn.reply" ||
+    event.type === "turn.error" ||
+    event.type === "turn.cancelled"
+  );
+}
+
 function parseOutboundEvent(rawBody: Buffer): OutboundEvent | null {
   let parsed: unknown;
   try {
@@ -820,6 +853,9 @@ function parseOutboundEvent(rawBody: Buffer): OutboundEvent | null {
       ) {
         return null;
       }
+      break;
+    // Terminal, and carries no fields of its own beyond the common envelope.
+    case "turn.cancelled":
       break;
     default:
       return null;

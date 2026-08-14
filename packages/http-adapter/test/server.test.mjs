@@ -509,6 +509,67 @@ test("HTTP adapter streams authoritative canonical errors and closes", async (t)
   }));
 });
 
+test("HTTP adapter accepts turn.cancelled and closes the stream", async (t) => {
+  const { adapterBaseUrl } = await createHarness(t, async ({
+    res,
+    inbound,
+    adapterBaseUrl: callbackBaseUrl,
+  }) => {
+    const terminal = turnEvent("turn.cancelled", 2, {
+      eventId: "stream-cancelled-2",
+      conversationKey: inbound.conversationKey,
+      correlationId: "correlation-cancelled",
+    });
+    const callback = await postEvent(callbackBaseUrl, terminal);
+    assert.equal(callback.status, 200, "a signed cancellation must be accepted");
+    res.writeHead(202, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "accepted", correlationId: "correlation-cancelled" }));
+  });
+
+  const response = await sendMessage(adapterBaseUrl, "local", {
+    accept: "text/event-stream",
+  });
+  const events = parseSse(await response.text());
+  assert.deepEqual(events.map(({ event, id }) => [event, id]), [
+    ["accepted", undefined],
+    ["cancelled", "2"],
+  ]);
+});
+
+test("HTTP adapter cancels a stream after at least one delta", async (t) => {
+  const { adapterBaseUrl } = await createHarness(t, async ({
+    res,
+    inbound,
+    adapterBaseUrl: callbackBaseUrl,
+  }) => {
+    const common = {
+      conversationKey: inbound.conversationKey,
+      correlationId: "correlation-cancel-delta",
+    };
+    await postEvent(
+      callbackBaseUrl,
+      turnEvent("turn.delta", 1, { ...common, eventId: "d1", text: "partial" }),
+    );
+    const callback = await postEvent(
+      callbackBaseUrl,
+      turnEvent("turn.cancelled", 2, { ...common, eventId: "c2" }),
+    );
+    assert.equal(callback.status, 200);
+    res.writeHead(202, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "accepted", correlationId: "correlation-cancel-delta" }));
+  });
+
+  const response = await sendMessage(adapterBaseUrl, "local", {
+    accept: "text/event-stream",
+  });
+  const events = parseSse(await response.text());
+  assert.deepEqual(events.map(({ event }) => event), [
+    "accepted",
+    "delta",
+    "cancelled",
+  ], "a cancelled turn must terminate rather than time out");
+});
+
 test("HTTP adapter preserves an early JSON terminal after delta buffer overflow", async (t) => {
   const { adapterBaseUrl } = await createHarness(t, async ({
     res,
