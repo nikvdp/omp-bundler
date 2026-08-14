@@ -347,7 +347,11 @@ export class PoolManager {
    * is a safe no-op. Never resolves after the manager is closed: a pending
    * waiter is rejected with {@link PoolClosedError}.
    */
-  async acquire(adapterId: string, conversationKey: string): Promise<Lease> {
+  async acquire(
+    adapterId: string,
+    conversationKey: string,
+    parentConversationKey?: string,
+  ): Promise<Lease> {
     if (!adapterId) throw new Error("adapterId is required");
     if (!conversationKey) throw new Error("conversationKey is required");
     if (this.closed) throw new PoolClosedError();
@@ -416,7 +420,12 @@ export class PoolManager {
 
     if (this.closed) throw new PoolClosedError();
     // Create the child (and the registry mapping if needed).
-    const entry = await this.createEntry(adapterId, conversationKey, id);
+    const entry = await this.createEntry(
+      adapterId,
+      conversationKey,
+      id,
+      parentConversationKey,
+    );
     if (this.closed) {
       // Pool was closed while we were creating. close() is responsible for
       // tearing down all entries and in-flight results; we must not
@@ -638,13 +647,19 @@ export class PoolManager {
     adapterId: string,
     conversationKey: string,
     id: string,
+    parentConversationKey?: string,
   ): Promise<PoolEntry> {
     // Deduplicate concurrent creation for the same conversation.
     const existing = this.inflight.get(id);
     if (existing) return existing;
 
     this.pendingCreations++;
-    const promise = this.doCreate(adapterId, conversationKey, id).finally(
+    const promise = this.doCreate(
+      adapterId,
+      conversationKey,
+      id,
+      parentConversationKey,
+    ).finally(
       () => {
         this.inflight.delete(id);
         this.pendingCreations--;
@@ -658,6 +673,7 @@ export class PoolManager {
     adapterId: string,
     conversationKey: string,
     id: string,
+    parentConversationKey?: string,
   ): Promise<PoolEntry> {
     // 1. Spawn a fresh child through the injected factory.
     let child: RpcChild;
@@ -687,6 +703,7 @@ export class PoolManager {
         child,
         adapterId,
         conversationKey,
+        parentConversationKey,
       );
     } catch (err) {
       await this.closeChildOrThrow(child, adapterId, conversationKey);

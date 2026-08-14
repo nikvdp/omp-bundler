@@ -449,11 +449,20 @@ function validateInboundMessage(parsed: unknown): InboundMessage | null {
     !hasOnlyProperties(obj, [
       "messageId",
       "conversationKey",
+      "parentConversationKey",
       "speaker",
       "text",
       "attachments",
       "addressed",
     ])
+  )
+    return null;
+
+  const parentConversationKey = obj.parentConversationKey;
+  if (
+    parentConversationKey !== undefined &&
+    (typeof parentConversationKey !== "string" ||
+      parentConversationKey.length === 0)
   )
     return null;
 

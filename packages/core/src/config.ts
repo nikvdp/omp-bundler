@@ -59,6 +59,8 @@ export interface CoreConfig {
   idleTimeoutMs: number;
   /** Engagement window length in ms for the ingest buffer. */
   engagementWindowMs: number;
+  /** Quiet period before a held ambient backlog is released. */
+  ambientQuietPeriodMs: number;
   /** Timeout in ms for outbound callback HTTP POSTs. */
   callbackTimeoutMs: number;
   /** Minimum gap in ms between best-effort progress events. */
@@ -104,6 +106,14 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
   const idleTimeoutMs = requiredInt(env, "OMP_IDLE_TIMEOUT_MS");
   const engagementWindowMs = requiredInt(env, "OMP_ENGAGEMENT_WINDOW_MS");
   const callbackTimeoutMs = requiredInt(env, "OMP_CALLBACK_TIMEOUT_MS");
+  // Defaults to 30s: long enough that a back-and-forth between people is not
+  // interrupted, short enough that the agent still feels present. Zero
+  // disables holding entirely.
+  const ambientQuietPeriodMs = optionalInt(
+    env,
+    "OMP_AMBIENT_QUIET_PERIOD_MS",
+    30_000,
+  );
   const progressThresholdMs = optionalInt(
     env,
     "OMP_PROGRESS_THRESHOLD_MS",
@@ -135,6 +145,7 @@ export function loadCoreConfig(env: CoreConfigEnv = process.env): CoreConfig {
     maxChildren,
     idleTimeoutMs,
     engagementWindowMs,
+    ambientQuietPeriodMs,
     callbackTimeoutMs,
     progressThresholdMs,
     retryDelaysMs,
@@ -374,6 +385,9 @@ export function testConfig(overrides: Partial<CoreConfig> = {}): CoreConfig {
     maxChildren: 2,
     idleTimeoutMs: 5000,
     engagementWindowMs: 5000,
+    // Off by default in tests so existing activation assertions are unaffected;
+    // debounce tests set it explicitly.
+    ambientQuietPeriodMs: 0,
     callbackTimeoutMs: 5000,
     progressThresholdMs: 100,
     retryDelaysMs: [],

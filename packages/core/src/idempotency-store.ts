@@ -66,6 +66,20 @@ import { createHash, randomUUID } from "node:crypto";
 import type { InboundMessage } from "@omp-bundler/contracts/inbound";
 import type { OutboundEvent } from "@omp-bundler/contracts/outbound";
 
+/**
+ * Event types that close a correlation. A turn ends by replying, failing, or
+ * being superseded by a newer addressed message.
+ */
+const TERMINAL_EVENT_TYPES: Record<string, true> = {
+  "turn.reply": true,
+  "turn.error": true,
+  "turn.cancelled": true,
+};
+
+function isTerminalEventType(type: string): boolean {
+  return TERMINAL_EVENT_TYPES[type] === true;
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -496,9 +510,9 @@ export class IdempotencyStore {
     if (!event || typeof event !== "object" || typeof event.type !== "string") {
       throw new Error("event must be an OutboundEvent with a string type");
     }
-    if (event.type !== "turn.reply" && event.type !== "turn.error") {
+    if (!isTerminalEventType(event.type)) {
       throw new Error(
-        `saveResponse accepts only terminal turn.reply or turn.error events, got "${event.type}"`,
+        `saveResponse accepts only terminal events, got "${event.type}"`,
       );
     }
     // Correlation id and conversation key are immutable post-insert, so a
@@ -615,7 +629,7 @@ export class IdempotencyStore {
     correlationId: string,
     event: OutboundEvent,
   ): void {
-    if (event.type !== "turn.reply" && event.type !== "turn.error") {
+    if (!isTerminalEventType(event.type)) {
       throw new Error(
         `correlation response must be terminal, got "${event.type}"`,
       );

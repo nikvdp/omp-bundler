@@ -92,7 +92,8 @@ export type OutboundEventType =
   | "turn.delta"
   | "turn.reply"
   | "presence.changed"
-  | "turn.error";
+  | "turn.error"
+  | "turn.cancelled";
 
 /**
  * Presence states of the core agent within a conversation.
@@ -234,6 +235,19 @@ export interface TurnErrorEvent extends OutboundEventBase {
 }
 
 /**
+ * Terminal event for a turn abandoned before it produced a reply, because a
+ * newer addressed message superseded it.
+ *
+ * The turn is treated as never having happened: the session rewinds past it,
+ * so an adapter that already showed partial output MUST remove it rather than
+ * leave the conversation contradicting the session. Like other terminal
+ * events, no `turn.reply` follows for the same `correlationId`.
+ */
+export interface TurnCancelledEvent extends OutboundEventBase {
+  type: "turn.cancelled";
+}
+
+/**
  * Discriminated union of all outbound webhook events. Discriminate on `type`.
  */
 export type OutboundEvent =
@@ -242,6 +256,7 @@ export type OutboundEvent =
   | TurnDeltaEvent
   | TurnReplyEvent
   | PresenceChangedEvent
-  | TurnErrorEvent;
+  | TurnErrorEvent
+  | TurnCancelledEvent;
 
 export { ADAPTER_API_VERSION };

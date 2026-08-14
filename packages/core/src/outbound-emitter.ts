@@ -59,6 +59,7 @@ import type {
   TurnStartedEvent,
   TurnUsage,
   PresenceChangedEvent,
+  TurnCancelledEvent,
 } from "@omp-bundler/contracts/outbound";
 import type { WorkspaceAttachment } from "@omp-bundler/contracts/shared";
 import {
@@ -68,7 +69,10 @@ import {
   OUTBOUND_EVENT_SIGNATURE_HEADER,
   OUTBOUND_EVENT_TYPE_HEADER,
 } from "@omp-bundler/contracts/outbound";
-import { DELIVERY_ATTACHMENT_TOOL } from "./ambient-ingest-extension.js";
+import {
+  DELIVERY_ATTACHMENT_TOOL,
+  STAY_SILENT_TOOL,
+} from "./ambient-ingest-extension.js";
 import type { RpcEventFrame } from "./rpc-child.js";
 
 // ---------------------------------------------------------------------------
@@ -343,6 +347,8 @@ export class OutboundEmitter {
 
   /** Whether a terminal event (turn.reply or turn.error) has been emitted. */
   private terminalEmitted = false;
+  /** Set when the agent called stay_silent: the turn ends with no message. */
+  private staySilent = false;
 
   /** Whether turn.started has been emitted for this correlation. */
   private startedEmitted = false;
@@ -450,7 +456,7 @@ export class OutboundEmitter {
       .query(
         `SELECT event_id, event_type FROM outbound_outbox
           WHERE adapter_id = ? AND correlation_id = ?
-            AND event_type IN ('turn.reply', 'turn.error')
+            AND event_type IN ('turn.reply', 'turn.error', 'turn.cancelled')
           LIMIT 1`,
       )
       .get(this.opts.adapterId, this.opts.correlationId) as
@@ -553,6 +559,28 @@ export class OutboundEmitter {
       sequence: this.nextSequence(),
       occurredAt: toIsoUtc(this.opts.now()),
       presence,
+    };
+    this.deliverDurable(event);
+  }
+
+  /**
+   * Emit the terminal cancellation for a turn abandoned before it replied.
+   *
+   * Durable like other terminal events: the adapter has to receive it to
+   * remove any partial output it already posted, or the conversation is left
+   * showing a reply the session no longer contains.
+   */
+  emitCancelled(): void {
+    if (this.closed || this.terminalEmitted) return;
+    this.terminalEmitted = true;
+    const event: TurnCancelledEvent = {
+      version: ADAPTER_API_VERSION,
+      type: "turn.cancelled",
+      eventId: this.opts.uuid(),
+      conversationKey: this.opts.conversationKey,
+      correlationId: this.opts.correlationId,
+      sequence: this.nextSequence(),
+      occurredAt: toIsoUtc(this.opts.now()),
     };
     this.deliverDurable(event);
   }
@@ -664,6 +692,31 @@ export class OutboundEmitter {
       throw new Error(`outbound failure "${eventId}" changed before retry`);
     }
     await this.enqueue(() => this.deliverPayload(event, row.payload, 0));
+  }
+
+  /**
+   * Emit a terminal reply that core produced itself, with no model turn.
+   *
+   * Used for commands core handles directly, such as starting a new session.
+   * The event is durable and terminal exactly like a model reply, so adapters
+   * clear their status markers and the correlation completes normally.
+   */
+  emitDirectReply(text: string): void {
+    if (this.closed || this.terminalEmitted) return;
+    this.terminalEmitted = true;
+    const event: TurnReplyEvent = {
+      version: ADAPTER_API_VERSION,
+      type: "turn.reply",
+      eventId: this.opts.uuid(),
+      conversationKey: this.opts.conversationKey,
+      correlationId: this.opts.correlationId,
+      sequence: this.nextSequence(),
+      occurredAt: toIsoUtc(this.opts.now()),
+      text,
+      attachments: [],
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 },
+    };
+    this.deliverDurable(event);
   }
 
   /**
@@ -794,6 +847,32 @@ export class OutboundEmitter {
       });
       return;
     }
+    // The agent chose silence. A model always emits something, so without an
+    // explicit opt-out every ambient activation produces a message; this is
+    // how it declines. Emitted as a normal terminal so the correlation closes
+    // and the lease is released, but with no text for the adapter to post.
+    if (this.staySilent) {
+      this.ensureStarted();
+      this.terminalEmitted = true;
+      this.deliverDurable({
+        version: ADAPTER_API_VERSION,
+        type: "turn.reply",
+        eventId: this.opts.uuid(),
+        conversationKey: this.opts.conversationKey,
+        correlationId: this.opts.correlationId,
+        sequence: this.nextSequence(),
+        occurredAt: toIsoUtc(this.opts.now()),
+        text: "",
+        attachments: [],
+        usage: this.replyUsage ?? extractUsageFromAgentEnd(frame) ?? {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          costUsd: 0,
+        },
+      });
+      return;
+    }
     if (this.replyText.length === 0 && this.replyAttachments.length === 0) {
       this.emitProviderError({
         code: "empty_response",
@@ -831,7 +910,10 @@ export class OutboundEmitter {
     this.deliverDurable(event);
   }
 
-  /** Capture successful deliver_attachment tool results for the terminal reply. */
+  /**
+   * Capture markers left by extension tools on their results: attachments to
+   * deliver with the reply, and the agent's decision to stay silent.
+   */
   private handleToolExecutionEnd(frame: RpcEventFrame): void {
     const attachment = extractDeliveryAttachment(frame);
     if (
@@ -841,6 +923,9 @@ export class OutboundEmitter {
       )
     ) {
       this.replyAttachments.push(attachment);
+    }
+    if (frame.toolName === STAY_SILENT_TOOL && frame.isError !== true) {
+      this.staySilent = true;
     }
   }
 

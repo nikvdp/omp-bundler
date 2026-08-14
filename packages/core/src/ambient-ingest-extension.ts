@@ -21,17 +21,17 @@ interface ExtensionAPI {
       handler: (args: string) => Promise<void>;
     },
   ): void;
-  registerTool(options: {
+  registerTool<TParams, TDetails>(options: {
     name: string;
     label: string;
     description: string;
     parameters: unknown;
     execute(
       toolCallId: string,
-      params: DeliveryAttachmentParams,
+      params: TParams,
     ): Promise<{
       content: Array<{ type: "text"; text: string }>;
-      details: { ompBundlerAttachment: DeliveryAttachment };
+      details: TDetails;
     }>;
   }): void;
   sendMessage(
@@ -50,10 +50,15 @@ interface ExtensionAPI {
 
 export const AMBIENT_INGEST_COMMAND = "omp-bundler-ambient";
 export const DELIVERY_ATTACHMENT_TOOL = "deliver_attachment";
+export const STAY_SILENT_TOOL = "stay_silent";
 
 interface AmbientCommandPayload {
   content: string;
   triggerTurn: boolean;
+}
+
+interface StaySilentParams {
+  reason?: string;
 }
 
 interface DeliveryAttachmentParams {
@@ -89,7 +94,7 @@ export default function ambientIngestExtension(pi: ExtensionAPI): void {
   });
 
   const { z } = pi.zod;
-  pi.registerTool({
+  pi.registerTool<DeliveryAttachmentParams, { ompBundlerAttachment: DeliveryAttachment }>({
     name: DELIVERY_ATTACHMENT_TOOL,
     label: "Deliver attachment",
     description: "Attach a workspace output file to the adapter reply",
@@ -103,6 +108,31 @@ export default function ambientIngestExtension(pi: ExtensionAPI): void {
       return {
         content: [{ type: "text", text: `Attached ${attachment.path}` }],
         details: { ompBundlerAttachment: attachment },
+      };
+    },
+  });
+
+  pi.registerTool<StaySilentParams, { ompBundlerStaySilent: { reason: string } }>({
+    name: STAY_SILENT_TOOL,
+    label: "Stay silent",
+    description:
+      "End this turn without sending a message. Use when nothing you could " +
+      "say would be useful to the people in the conversation: you were not " +
+      "addressed, the discussion does not concern you, or someone has " +
+      "already answered. Preferred over replying with filler.",
+    parameters: z.object({
+      reason: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Why staying silent, for operator logs. Never shown in chat."),
+    }),
+    async execute(_toolCallId, params) {
+      return {
+        content: [
+          { type: "text", text: "Staying silent; nothing will be sent." },
+        ],
+        details: { ompBundlerStaySilent: { reason: params.reason ?? "" } },
       };
     },
   });

@@ -81,6 +81,19 @@ export interface IngestBufferOptions {
    */
   engagementWindowMs: number;
   /**
+   * How long the conversation must be silent before a held ambient backlog is
+   * released, in milliseconds.
+   *
+   * When several people are talking faster than the agent can answer, replying
+   * to each ambient message interjects into a conversation that is not waiting
+   * on it. Instead the backlog accumulates and is delivered as one prompt once
+   * the room settles, so nothing is lost and nothing is blurted mid-exchange.
+   *
+   * Zero disables holding: every ambient message inside the window activates
+   * immediately, which is the behavior before this existed.
+   */
+  quietPeriodMs: number;
+  /**
    * Injectable wall-clock returning epoch milliseconds. Used for window
    * deadlines and record timestamps so the state machine is deterministic
    * under tests.
@@ -153,6 +166,18 @@ export interface ConversationStatus {
   windowDeadline: number | null;
 }
 
+/**
+ * A conversation whose held ambient backlog is due for delivery because the
+ * room has gone quiet. Carries everything held since the agent last spoke, so
+ * it can catch up on the whole span in one turn.
+ */
+export interface SettledActivation {
+  adapterId: string;
+  conversationKey: string;
+  records: BufferedRecord[];
+  prompt: string;
+}
+
 // ---------------------------------------------------------------------------
 // Composite key
 // ---------------------------------------------------------------------------
@@ -210,6 +235,14 @@ interface ConversationState {
   backlog: BufferedRecord[];
   /** Epoch millisecond deadline of the open window, or null when closed. */
   windowDeadline: number | null;
+  /**
+   * Arrival time of the most recent message, addressed or not.
+   *
+   * Used to tell a busy conversation from a quiet one: while messages keep
+   * arriving faster than {@link quietPeriodMs}, ambient replies are held back
+   * rather than interjecting into a conversation between other people.
+   */
+  lastArrivalAt: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +257,7 @@ interface ConversationState {
  */
 export class IngestBuffer {
   private readonly engagementWindowMs: number;
+  private readonly quietPeriodMs: number;
   private readonly now: () => number;
   private readonly states = new Map<string, ConversationState>();
 
@@ -234,7 +268,7 @@ export class IngestBuffer {
     if (options === null || typeof options !== "object") {
       throw new TypeError("IngestBufferOptions is required");
     }
-    const { engagementWindowMs, now } = options;
+    const { engagementWindowMs, quietPeriodMs, now } = options;
     if (
       typeof engagementWindowMs !== "number" ||
       !Number.isFinite(engagementWindowMs) ||
@@ -244,10 +278,20 @@ export class IngestBuffer {
         "engagementWindowMs must be a positive, finite number of milliseconds",
       );
     }
+    if (
+      typeof quietPeriodMs !== "number" ||
+      !Number.isFinite(quietPeriodMs) ||
+      quietPeriodMs < 0
+    ) {
+      throw new RangeError(
+        "quietPeriodMs must be a non-negative, finite number of milliseconds",
+      );
+    }
     if (typeof now !== "function") {
       throw new TypeError("now clock function is required");
     }
     this.engagementWindowMs = engagementWindowMs;
+    this.quietPeriodMs = quietPeriodMs;
     this.now = now;
   }
 
@@ -270,9 +314,13 @@ export class IngestBuffer {
     const record = toRecord(adapterId, message, receivedAt);
     const state = this.stateFor(key);
 
+    const sinceLastArrival = receivedAt - state.lastArrivalAt;
+    state.lastArrivalAt = receivedAt;
+
     if (message.addressed) {
       // Addressed: activate (or reset) the window and flush backlog plus
-      // current message as a single prompt decision.
+      // current message as a single prompt decision. Being addressed is a
+      // direct request, so it is answered even when the room is busy.
       state.windowDeadline = receivedAt + this.engagementWindowMs;
       const records = [...state.backlog, record];
       state.backlog = [];
@@ -288,9 +336,16 @@ export class IngestBuffer {
     // Ambient.
     const active = isActive(state, receivedAt);
     if (active) {
-      // Inside the window: reset the window and trigger a turn with the
-      // current message plus any buffered backlog (backlog is normally empty
-      // while engaged, but is flushed defensively and never lost).
+      // Inside the window, but hold while the conversation is moving faster
+      // than the quiet period: people mid-exchange are talking to each other,
+      // not waiting on the agent. The backlog keeps every held message and is
+      // released as one prompt on the first arrival after a lull, so the agent
+      // catches up on the whole span rather than answering a stale fragment.
+      if (this.quietPeriodMs > 0 && sinceLastArrival < this.quietPeriodMs) {
+        state.backlog.push(record);
+        this.states.set(key, state);
+        return { kind: "buffered", record, backlogDepth: state.backlog.length };
+      }
       state.windowDeadline = receivedAt + this.engagementWindowMs;
       const records = [...state.backlog, record];
       state.backlog = [];
@@ -310,6 +365,43 @@ export class IngestBuffer {
     state.backlog.push(record);
     this.states.set(key, state);
     return { kind: "buffered", record, backlogDepth: state.backlog.length };
+  }
+
+  /**
+   * Release backlogs whose conversation has gone quiet.
+   *
+   * Holding ambient messages during a busy exchange only works if something
+   * eventually delivers them. Arrival alone cannot: if the room falls silent
+   * the last held messages have nothing to ride out on, and the agent would
+   * simply never respond to what it deferred. A periodic sweep closes that
+   * gap, so "answer once the conversation settles" happens on the settling
+   * rather than on the next unrelated message.
+   *
+   * Returns one activation per conversation that is now due, each carrying
+   * its whole held backlog as a single prompt.
+   */
+  sweepSettled(): SettledActivation[] {
+    if (this.quietPeriodMs <= 0) return [];
+    const now = this.now();
+    const due: SettledActivation[] = [];
+    for (const [key, state] of this.states) {
+      if (state.backlog.length === 0) continue;
+      if (now - state.lastArrivalAt < this.quietPeriodMs) continue;
+      // Only conversations still engaged: outside the window an ambient
+      // backlog is context for the next address, not a turn of its own.
+      if (!isActive(state, now)) continue;
+      const records = state.backlog;
+      state.backlog = [];
+      state.windowDeadline = now + this.engagementWindowMs;
+      this.states.set(key, state);
+      due.push({
+        adapterId: records[0].adapterId,
+        conversationKey: records[0].conversationKey,
+        records,
+        prompt: renderPrompt(records),
+      });
+    }
+    return due;
   }
 
   /**
@@ -381,7 +473,7 @@ export class IngestBuffer {
   private stateFor(key: string): ConversationState {
     const existing = this.states.get(key);
     if (existing) return existing;
-    return { backlog: [], windowDeadline: null };
+    return { backlog: [], windowDeadline: null, lastArrivalAt: 0 };
   }
 }
 

@@ -205,6 +205,7 @@ export class SessionRegistry {
     child: RpcChild,
     adapterId: string,
     conversationKey: string,
+    parentSessionFile?: string,
   ): Promise<SessionRecord> {
     if (!adapterId) throw new Error("adapterId is required");
     if (!conversationKey) throw new Error("conversationKey is required");
@@ -217,8 +218,10 @@ export class SessionRegistry {
       );
     }
 
-    // Step 1: create the session in the child.
-    const newRes = await child.newSession();
+    // Step 1: create the session in the child. A parent forks: the new session
+    // inherits the conversation up to the branch point, which is what a thread
+    // means to the people in it.
+    const newRes = await child.newSession(parentSessionFile);
     if (!newRes.success) {
       throw new Error(`new_session failed: ${newRes.error ?? "unknown"}`);
     }
@@ -289,6 +292,7 @@ export class SessionRegistry {
     child: RpcChild,
     adapterId: string,
     conversationKey: string,
+    parentConversationKey?: string,
   ): Promise<SessionRecord> {
     const existing = this.getRaw(adapterId, conversationKey);
     if (existing) {
@@ -309,13 +313,43 @@ export class SessionRegistry {
       return inflight;
     }
 
-    const promise = this.create(child, adapterId, conversationKey).finally(
-      () => {
-        this.inflight.delete(key);
-      },
-    );
+    // A thread forks the conversation it started in, so it opens with the
+    // context its participants can see. Resolved at creation only: once the
+    // fork exists the two sessions diverge and the parent stops mattering.
+    const parentSessionFile = parentConversationKey
+      ? this.getRaw(adapterId, parentConversationKey)?.sessionFile
+      : undefined;
+    const promise = this.create(
+      child,
+      adapterId,
+      conversationKey,
+      parentSessionFile,
+    ).finally(() => {
+      this.inflight.delete(key);
+    });
     this.inflight.set(key, promise);
     return promise;
+  }
+
+  /**
+   * Drop the mapping for a conversation so the next turn starts a brand new
+   * session. The underlying session file is left on disk: history stays
+   * recoverable, it simply stops being the conversation's current session.
+   *
+   * Returns true when a mapping existed.
+   */
+  forget(adapterId: string, conversationKey: string): boolean {
+    const existing = this.getRaw(adapterId, conversationKey);
+    if (!existing) return false;
+    this.db
+      .query(
+        `DELETE FROM session_registry
+          WHERE adapter_id = ?
+            AND conversation_key = ?`,
+      )
+      .run(adapterId, conversationKey);
+    this.inflight.delete(conversationKeyOf(adapterId, conversationKey));
+    return true;
   }
 
   // ---- resolve / attach ----

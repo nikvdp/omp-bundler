@@ -49,6 +49,16 @@ export interface InboundMessage {
    * messages sharing this key belong to the same conversation.
    */
   conversationKey: string;
+  /**
+   * Conversation this one branched from, when the adapter models a
+   * sub-conversation such as a chat thread.
+   *
+   * Used only when the session is first created: the new session forks the
+   * parent's, inheriting context up to the branch point. Afterwards the two
+   * diverge and this is ignored. Opaque and in the same namespace as
+   * `conversationKey`.
+   */
+  parentConversationKey?: string;
   /** The party that produced the message. */
   speaker: Speaker;
   /**

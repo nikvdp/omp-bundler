@@ -18,6 +18,18 @@ export interface PumbleMessageFile {
 }
 
 /**
+ * A quoted message, as carried on the message that quotes it.
+ *
+ * Pumble sends the quoted text inline rather than only a reference, so no
+ * extra fetch is needed to show the agent what was quoted.
+ */
+export interface PumbleQuote {
+  text: string;
+  authorId?: string;
+  messageId?: string;
+}
+
+/**
  * Parsed `NEW_MESSAGE` event before adapter-side touches (channel resolution,
  * display-name lookup, attachment download) produce the inputs normalization
  * needs. Carries only fields read from the webhook payload.
@@ -44,6 +56,12 @@ export interface PumbleMessageEvent {
    * integration, which is dropped during normalization.
    */
   authorType?: string;
+  /**
+   * The message this one quotes, when the author quoted something. Carried
+   * through so the agent can read what was quoted: a question about a quoted
+   * message is unanswerable without it.
+   */
+  quote?: PumbleQuote;
 }
 
 /** Workspace-relative attachment ref that crosses the adapter seam. */
@@ -65,6 +83,17 @@ export interface NormalizeContext {
   channelType: string;
   authorDisplayName: string;
   attachments: Attachment[];
+  /**
+   * Display name resolved for the quoted message's author, when the message
+   * quotes one. Falls back to the raw author id.
+   */
+  quoteAuthorDisplayName?: string;
+  /**
+   * Whether the agent has already taken a turn in this thread. A thread it
+   * participates in is treated like a direct conversation; one it has only
+   * observed is not.
+   */
+  threadParticipant?: boolean;
 }
 
 /** Channel types treated as direct conversations with the agent. */
@@ -101,7 +130,7 @@ export function parseNewMessage(
   const messageId = stringValue(body.mId) || stringValue(payload.messageId);
   const authorId = stringValue(body.aId) || stringValue(payload.authorId);
   const text = stringValue(body.tx) || stringValue(payload.text);
-  const files = parseFiles(body.f);
+  const files = parseMessageFiles(body.f);
   if (
     !workspaceId ||
     !channelId ||
@@ -129,6 +158,7 @@ export function parseNewMessage(
     ephemeral: Boolean(body.eph ?? payload.ephemeral),
     channelType: channelTypeRaw || undefined,
     authorType: authorTypeRaw || undefined,
+    quote: parseQuote(body.qu ?? body.quote ?? payload.quote),
   };
 }
 
@@ -173,23 +203,43 @@ export function normalizePumbleMessage(
   const mentioned =
     Boolean(ctx.botId) && event.mentionedUserIds.includes(ctx.botId!);
 
-  const text = stripBotMentionToken(event.text, ctx.botId);
-  if (!text && ctx.attachments.length === 0) {
+  const body = stripBotMentionToken(event.text, ctx.botId);
+  if (!body && ctx.attachments.length === 0) {
     return null;
   }
+  // Prepend the quoted message so a question about it is answerable. Without
+  // this the agent sees only "what did I quote?" and has to guess.
+  const quoted = event.quote?.text.trim();
+  const quotedBy = ctx.quoteAuthorDisplayName?.trim() || event.quote?.authorId;
+  const text = quoted
+    ? `[quoting ${quotedBy ?? "someone"}: ${quoted}]${body ? `\n${body}` : ""}`
+    : body;
 
   const displayName = ctx.authorDisplayName.trim();
   const speaker: Speaker = displayName
     ? { id: event.authorId, displayName }
     : { id: event.authorId, displayName: event.authorId };
 
+  // A thread is its own conversation, forked from the channel it started in.
+  // Without the thread component every thread in a channel shares one session
+  // and parallel threads interleave into a single context.
+  const channelKey = `pumble:${event.workspaceId}:${event.channelId}`;
+  const threadRootId = event.threadRootId;
   return {
     messageId: event.messageId,
-    conversationKey: `pumble:${event.workspaceId}:${event.channelId}`,
+    conversationKey: threadRootId
+      ? `${channelKey}:${threadRootId}`
+      : channelKey,
+    ...(threadRootId ? { parentConversationKey: channelKey } : {}),
     speaker,
     text,
     attachments: ctx.attachments,
-    addressed: direct || mentioned,
+    // A thread the agent is already part of behaves like a DM: every message
+    // in it is addressed, because entering that thread is the act of address
+    // and nobody re-tags the bot on each follow-up. A thread it has never
+    // spoken in stays ambient, so two people threading among themselves do
+    // not pull it in.
+    addressed: direct || mentioned || ctx.threadParticipant === true,
   };
 }
 
@@ -229,7 +279,37 @@ function stripBotMentionToken(text: string, botId?: string): string {
     .trim();
 }
 
-function parseFiles(value: unknown): PumbleMessageFile[] {
+/**
+ * Read a quoted message from a payload.
+ *
+ * Pumble's REST API names this `quote` with a plain `text`, while webhook
+ * payloads abbreviate keys. Both spellings are accepted rather than assuming
+ * one, since a missed quote is silent: the agent answers a question about a
+ * message it cannot see. Returns undefined when nothing usable is present.
+ */
+function parseQuote(value: unknown): PumbleQuote | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const text = stringValue(record.tx) || stringValue(record.text);
+  if (!text) {
+    return undefined;
+  }
+  return {
+    text,
+    authorId:
+      optionalString(record.aId) ?? optionalString(record.authorId) ?? undefined,
+    messageId:
+      optionalString(record.mId) ?? optionalString(record.messageId) ?? undefined,
+  };
+}
+
+/**
+ * Read a message's file list. Exported because the webhook omits files, so the
+ * adapter re-reads them from the API using the same shape.
+ */
+export function parseMessageFiles(value: unknown): PumbleMessageFile[] {
   if (!Array.isArray(value)) {
     return [];
   }
