@@ -7,7 +7,7 @@ import { joinPublicUrl, loadBridgeConfig } from "./config.js";
 import { buildManifest, pumbleAuthorizationScopes } from "./manifest.js";
 import { PumbleApi } from "./pumble-api.js";
 import { verifyPumbleSignature } from "./security.js";
-import { TokenStore } from "./token-store.js";
+import { TokenStore, type WorkspaceTokens } from "./token-store.js";
 import { TargetStore, type Target } from "./target-store.js";
 import { SettingsStore } from "./settings.js";
 import { PumbleAttachmentSender } from "./attachment-sender.js";
@@ -327,6 +327,37 @@ interface NewMessageResult {
 const threadRootAddressed = new Map<string, boolean>();
 /** Bounds the cache; oldest entries are evicted, and a miss simply re-fetches. */
 const THREAD_ROOT_CACHE_LIMIT = 500;
+const botDisplayNames = new Map<string, string>();
+
+/**
+ * Resolve the bot name users actually see in Pumble. The OAuth bot id is the
+ * stable config value; the user lookup supplies the renameable display name.
+ * A failed lookup disables plain-name activation but never affects structured
+ * mentions or direct messages.
+ */
+async function resolveBotDisplayName(
+  workspaceTokens: WorkspaceTokens,
+): Promise<string> {
+  const { botId, botToken } = workspaceTokens;
+  if (!botId || !botToken) return "";
+  const cached = botDisplayNames.get(botId);
+  if (cached !== undefined) return cached;
+  try {
+    const user = await pumble.getUser(config.appKey, botToken, botId);
+    const name =
+      stringValue(user.name) ||
+      stringValue(user.displayName) ||
+      stringValue(user.username);
+    if (name) botDisplayNames.set(botId, name);
+    return name;
+  } catch (error) {
+    console.warn(
+      `>>> Pumble bot-name lookup failed for ${botId}; plain-name invocation disabled:`,
+      error instanceof Error ? error.message : String(error),
+    );
+    return "";
+  }
+}
 
 async function isThreadRootAddressedToAgent(
   channelId: string,
@@ -406,6 +437,8 @@ async function processNewMessage(
       error: "PUMBLE_APP_KEY is not configured",
     };
   }
+
+  const botDisplayName = await resolveBotDisplayName(workspaceTokens);
 
   // Resolve channel type from the Pumble API (authoritative).
   let channelType = event.channelType || "";
@@ -600,6 +633,7 @@ async function processNewMessage(
   // Normalize the Pumble message into the inbound contract.
   const normalizeContext: NormalizeContext = {
     botId: workspaceTokens.botId,
+    botDisplayName,
     channelType,
     authorDisplayName,
     attachments,

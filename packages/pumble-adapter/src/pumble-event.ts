@@ -74,12 +74,14 @@ type Speaker = InboundMessage["speaker"];
  * Inputs {@link normalizePumbleMessage} cannot read from the payload alone.
  * Each is produced by an adapter-side touch:
  *   - `botId`: the configured bot user id for the workspace (OAuth install).
+ *   - `botDisplayName`: current bot name resolved from that user id.
  *   - `channelType`: resolved channel type, uppercased, authoritative.
  *   - `authorDisplayName`: display name resolved for `event.authorId`.
  *   - `attachments`: downloaded attachment refs, workspace-relative paths.
  */
 export interface NormalizeContext {
   botId?: string;
+  botDisplayName?: string;
   channelType: string;
   authorDisplayName: string;
   attachments: Attachment[];
@@ -173,15 +175,15 @@ export function parseNewMessage(
  *
  * The conversation key is `pumble:<workspaceId>:<channelId>`: stable across a
  * channel, independent of author and thread. Activation (`addressed`) is true
- * for direct and self channels, or when the configured bot is in the message's
- * structured mention list; otherwise it is ambient (`false`). Mention
- * detection uses the parsed `mentionedUserIds`, never text substring matching.
+ * for direct and self channels, a structured bot mention, or a leading exact
+ * invocation of the bot's current Pumble display name. Name matching is
+ * case-insensitive and token-bounded; mid-sentence references and partial
+ * names remain ambient.
  *
- * The exact configured-bot mention token `<@botId>` is stripped from the text so
- * the agent sees the user's message; the configured bot's display name is not
- * stripped (unreliable substring matching). Outputs exactly the six contract
- * fields with no Pumble-native keys. Author id and resolved display name are
- * preserved as the {@link Speaker}.
+ * The exact configured-bot mention token `<@botId>` is stripped from the text
+ * so the agent sees the user's message. A plain-name invocation is preserved:
+ * besides being user-authored content, it tells the model which runtime name
+ * addressed it.
  */
 export function normalizePumbleMessage(
   event: PumbleMessageEvent,
@@ -201,6 +203,7 @@ export function normalizePumbleMessage(
   const direct = DIRECT_CHANNEL_TYPES[channelType] === true;
   const mentioned =
     Boolean(ctx.botId) && event.mentionedUserIds.includes(ctx.botId!);
+  const named = invokesBotByName(event.text, ctx.botDisplayName);
 
   const body = stripBotMentionToken(event.text, ctx.botId);
   if (!body && ctx.attachments.length === 0) {
@@ -238,7 +241,7 @@ export function normalizePumbleMessage(
     // and nobody re-tags the bot on each follow-up. A thread it has never
     // spoken in stays ambient, so two people threading among themselves do
     // not pull it in.
-    addressed: direct || mentioned || ctx.threadParticipant === true,
+    addressed: direct || mentioned || named || ctx.threadParticipant === true,
   };
 }
 
@@ -276,6 +279,20 @@ function stripBotMentionToken(text: string, botId?: string): string {
     .replace(new RegExp(`<@${escapeRegExp(botId)}>`, "gi"), "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * Recognize only a leading, complete display-name token. Pumble's structured
+ * mention remains authoritative; this covers users typing the visible bot
+ * name without selecting an `@mention`.
+ */
+function invokesBotByName(text: string, displayName?: string): boolean {
+  const name = displayName?.trim();
+  if (!name) return false;
+  return new RegExp(
+    `^\\s*@?${escapeRegExp(name)}(?=$|[\\s,:;.!?—–-])`,
+    "i",
+  ).test(text);
 }
 
 /**
