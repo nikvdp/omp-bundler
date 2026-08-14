@@ -502,6 +502,21 @@ export class PoolManager {
     this.drainWaiters();
   }
 
+  /**
+   * Close and remove the pooled child for one conversation.
+   *
+   * Session reset must evict the live child as well as deleting its registry
+   * mapping; otherwise the next acquire reuses the same in-memory OMP session.
+   */
+  async retireConversation(
+    adapterId: string,
+    conversationKey: string,
+  ): Promise<void> {
+    const entry = this.entries.get(conversationIdOf(adapterId, conversationKey));
+    if (!entry) return;
+    await this.retireChild(adapterId, conversationKey, entry.child);
+  }
+
   // ---- stats / observability ----
 
   /** Observable snapshot of pool state. */

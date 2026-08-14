@@ -750,9 +750,9 @@ export class CoreSupervisor {
   }
 
   /**
-   * Start a new session for a conversation. Drops the registry mapping so the
-   * next message creates a fresh session; the previous session file stays on
-   * disk, so its history remains recoverable.
+   * Start a new session for a conversation. Stops any live child before
+   * dropping the registry mapping so the next message cannot reuse the old
+   * in-memory OMP session.
    */
   private async handleSessionReset(
     adapterId: string,
@@ -760,6 +760,9 @@ export class CoreSupervisor {
     correlationId: string,
   ): Promise<void> {
     const convKey = compositeKey(adapterId, message.conversationKey);
+    const active = this.active.get(convKey);
+    if (active) await this.interruptTurn(active);
+    await this.pool.retireConversation(adapterId, message.conversationKey);
     const existed = this.sessions.forget(adapterId, message.conversationKey);
     this.buffer.recordInteraction(adapterId, message.conversationKey);
 
