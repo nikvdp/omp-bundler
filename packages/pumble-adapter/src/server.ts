@@ -7,13 +7,15 @@ import { joinPublicUrl, loadBridgeConfig } from "./config.js";
 import { buildManifest, pumbleAuthorizationScopes } from "./manifest.js";
 import { PumbleApi } from "./pumble-api.js";
 import { verifyPumbleSignature } from "./security.js";
-import { TokenStore } from "./token-store.js";
+import { TokenStore, type WorkspaceTokens } from "./token-store.js";
 import { TargetStore, type Target } from "./target-store.js";
+import { SettingsStore } from "./settings.js";
 import { PumbleAttachmentSender } from "./attachment-sender.js";
 import { DeliveryStore } from "./delivery-store.js";
 import {
   parseNewMessage,
   normalizePumbleMessage,
+  parseMessageFiles,
   type NormalizeContext,
 } from "./pumble-event.js";
 import {
@@ -51,6 +53,11 @@ const targetStore = new TargetStore(
 const deliveryStore = new DeliveryStore(
   path.join(config.pumbleDataDir, "delivered-events.json"),
 );
+const settings = new SettingsStore({
+  file: config.settingsFile,
+  logger: console,
+});
+settings.seed();
 
 const attachmentSender = new PumbleAttachmentSender(config, pumble);
 
@@ -70,6 +77,7 @@ const resolver: ConversationResolver = async (
     channelId: target.channelId,
     triggerMessageId: target.triggerMessageId,
     threadRootId: target.threadRootId,
+    direct: target.direct,
   };
 };
 
@@ -79,6 +87,7 @@ const renderer = new PumbleRenderer({
   logger: console,
   attachmentSender,
   checkpointStore: deliveryStore,
+  settings,
 });
 
 const server = http.createServer(async (req, res) => {
@@ -246,6 +255,14 @@ async function handlePumbleEvents(
       config.signatureToleranceSeconds,
     )
   ) {
+    // Log rejections: a silently dropped webhook is indistinguishable from one
+    // Pumble never sent, which makes the difference impossible to diagnose from
+    // the outside.
+    console.warn(
+      ">>> Pumble event rejected: invalid signature",
+      `timestamp=${headerValue(req.headers["x-pumble-request-timestamp"])}`,
+      `bytes=${rawBody.length}`,
+    );
     sendText(res, 401, "Invalid signature");
     return;
   }
@@ -273,14 +290,17 @@ async function handlePumbleEvents(
   }
 
   if (eventType !== "NEW_MESSAGE") {
+    console.log(`>>> Pumble event ignored: type=${eventType || "(none)"}`);
     sendText(res, 200, "ok");
     return;
   }
 
+  console.log(`>>> Pumble NEW_MESSAGE accepted workspace=${workspaceId}`);
   const result = await processNewMessage(payload);
   if (!result.ok) {
     // Missing tokens, context, or download failures are explicit, retryable.
     // 5xx so Pumble retries; safe failures are never silent.
+    console.warn(">>> Pumble NEW_MESSAGE failed:", result.error || "unknown");
     sendText(res, 500, result.error || "processing failed");
     return;
   }
@@ -293,12 +313,107 @@ interface NewMessageResult {
   error?: string;
 }
 
+/**
+ * Whether the message that opened a thread addressed the agent.
+ *
+ * When someone starts a thread by mentioning the bot, or starts one in a DM,
+ * the thread is a conversation with the agent and every later message in it
+ * counts as addressed. Cached because it is fixed for the life of the thread
+ * and would otherwise cost an API call on every reply.
+ *
+ * A failed lookup returns false: treating an unknown thread as not-addressed
+ * only means the bot needs an explicit mention there.
+ */
+const threadRootAddressed = new Map<string, boolean>();
+/** Bounds the cache; oldest entries are evicted, and a miss simply re-fetches. */
+const THREAD_ROOT_CACHE_LIMIT = 500;
+const botDisplayNames = new Map<string, string>();
+
+/**
+ * Resolve the bot name users actually see in Pumble. The OAuth bot id is the
+ * stable config value; the user lookup supplies the renameable display name.
+ * A failed lookup disables plain-name activation but never affects structured
+ * mentions or direct messages.
+ */
+async function resolveBotDisplayName(
+  workspaceTokens: WorkspaceTokens,
+): Promise<string> {
+  const { botId, botToken } = workspaceTokens;
+  if (!botId || !botToken) return "";
+  const cached = botDisplayNames.get(botId);
+  if (cached !== undefined) return cached;
+  try {
+    const user = await pumble.getUser(config.appKey, botToken, botId);
+    const name =
+      stringValue(user.name) ||
+      stringValue(user.displayName) ||
+      stringValue(user.username);
+    if (name) botDisplayNames.set(botId, name);
+    return name;
+  } catch (error) {
+    console.warn(
+      `>>> Pumble bot-name lookup failed for ${botId}; plain-name invocation disabled:`,
+      error instanceof Error ? error.message : String(error),
+    );
+    return "";
+  }
+}
+
+async function isThreadRootAddressedToAgent(
+  channelId: string,
+  threadRootId: string,
+  workspaceTokens: { botToken?: string; botId?: string },
+): Promise<boolean> {
+  const { botToken, botId } = workspaceTokens;
+  // Without a token or bot id there is nothing to compare a mention against.
+  if (!botToken || !botId) return false;
+  const cacheKey = `${channelId}:${threadRootId}`;
+  const cached = threadRootAddressed.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  let addressed = false;
+  try {
+    const root = await pumble.fetchMessage(
+      config.appKey,
+      botToken,
+      channelId,
+      threadRootId,
+    );
+    const record = (root.message ?? root) as Record<string, unknown>;
+    const mentioned = Array.isArray(record.mentionedUserIds)
+      ? record.mentionedUserIds.includes(botId)
+      : false;
+    // Fall back to the raw mention token: the REST shape does not always
+    // expose a parsed mention list.
+    addressed = mentioned || stringValue(record.text).includes(`<@${botId}>`);
+  } catch (error) {
+    console.warn(
+      ">>> Pumble thread root lookup failed:",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  if (threadRootAddressed.size >= THREAD_ROOT_CACHE_LIMIT) {
+    const oldest = threadRootAddressed.keys().next().value;
+    if (oldest !== undefined) threadRootAddressed.delete(oldest);
+  }
+  threadRootAddressed.set(cacheKey, addressed);
+  return addressed;
+}
+
 async function processNewMessage(
   payload: Record<string, unknown>,
 ): Promise<NewMessageResult> {
   const event = parseNewMessage(payload);
   if (!event) {
-    // Malformed payload: not retryable, but we ack so Pumble does not retry.
+    // Not retryable, so we ack; but a rejected payload is otherwise invisible.
+    // Log the shape that failed: a message the parser refuses looks exactly
+    // like one that was never sent, and that is the hardest failure to find.
+    const body = payload.body;
+    const shape =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? Object.keys(body as Record<string, unknown>).sort().join(",")
+        : typeof body;
+    console.warn(`>>> Pumble NEW_MESSAGE rejected: body keys=[${shape}]`);
     return { ok: true };
   }
 
@@ -323,6 +438,8 @@ async function processNewMessage(
     };
   }
 
+  const botDisplayName = await resolveBotDisplayName(workspaceTokens);
+
   // Resolve channel type from the Pumble API (authoritative).
   let channelType = event.channelType || "";
   if (!channelType) {
@@ -332,9 +449,17 @@ async function processNewMessage(
         workspaceTokens.botToken,
         event.channelId,
       );
+      // Pumble nests the channel under a `channel` key; the type is not at the
+      // top level. Read both so either shape resolves.
+      const nested = channelResponse.channel;
+      const channelBody =
+        nested && typeof nested === "object" && !Array.isArray(nested)
+          ? (nested as Record<string, unknown>)
+          : channelResponse;
       channelType =
+        stringValue(channelBody.channelType) ||
+        stringValue(channelBody.type) ||
         stringValue(channelResponse.type) ||
-        stringValue(channelResponse.channelType) ||
         "";
     } catch (error) {
       return {
@@ -352,7 +477,11 @@ async function processNewMessage(
     };
   }
 
-  // Resolve author display name from the Pumble API.
+  // Resolve the author's display name so the agent can say who spoke. This is
+  // cosmetic: normalizePumbleMessage falls back to the author id when the name
+  // is blank, so a lookup failure must not drop the message. The bot also only
+  // has this permission when the workspace granted user:read at install time,
+  // which older installs did not.
   let authorDisplayName = "";
   try {
     const userResponse = await pumble.getUser(
@@ -366,18 +495,76 @@ async function processNewMessage(
       stringValue(userResponse.username) ||
       "";
   } catch (error) {
-    return {
-      ok: false,
-      error: `user resolution failed for ${event.authorId}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    };
+    console.warn(
+      `>>> Pumble user lookup failed for ${event.authorId}; using id as display name:`,
+      error instanceof Error ? error.message : String(error),
+    );
   }
-  if (!authorDisplayName) {
-    return {
-      ok: false,
-      error: `could not determine display name for user ${event.authorId}`,
-    };
+
+  // The NEW_MESSAGE webhook carries neither the quoted message nor uploaded
+  // files, so read them back from the API. Without this the agent is asked
+  // about a quote or an image it cannot see and answers from a guess.
+  // Non-fatal: a failed fetch costs that context, not the message.
+  if (!event.quote || event.files.length === 0) {
+    try {
+      const full = await pumble.fetchMessage(
+        config.appKey,
+        workspaceTokens.botToken,
+        event.channelId,
+        event.messageId,
+      );
+      const raw = (full.message ?? full) as Record<string, unknown>;
+      const quoted = raw.quote;
+      if (
+        !event.quote &&
+        quoted &&
+        typeof quoted === "object" &&
+        !Array.isArray(quoted)
+      ) {
+        const record = quoted as Record<string, unknown>;
+        const quotedText = stringValue(record.text);
+        if (quotedText) {
+          event.quote = {
+            text: quotedText,
+            authorId: stringValue(record.authorId) || undefined,
+            messageId: stringValue(record.messageId) || undefined,
+          };
+        }
+      }
+      if (event.files.length === 0) {
+        const fetched = parseMessageFiles(raw.files);
+        if (fetched.length > 0) event.files = fetched;
+      }
+    } catch (error) {
+      console.warn(
+        ">>> Pumble message fetch failed:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  // Same lookup for the quoted message's author, so a quote reads as a name
+  // rather than an id. Also cosmetic and also non-fatal.
+  let quoteAuthorDisplayName = "";
+  if (event.quote?.authorId) {
+    if (event.quote.authorId === event.authorId) {
+      quoteAuthorDisplayName = authorDisplayName;
+    } else {
+      try {
+        const quotedUser = await pumble.getUser(
+          config.appKey,
+          workspaceTokens.botToken,
+          event.quote.authorId,
+        );
+        quoteAuthorDisplayName =
+          stringValue(quotedUser.name) ||
+          stringValue(quotedUser.displayName) ||
+          stringValue(quotedUser.username) ||
+          "";
+      } catch {
+        // Falls back to the author id inside the rendered quote.
+      }
+    }
   }
 
   // Download attachments.
@@ -424,12 +611,34 @@ async function processNewMessage(
       ...(f.mimeType ? { mediaType: f.mimeType } : {}),
     }));
 
+  // A thread counts as the agent's conversation when its ROOT addressed the
+  // agent: someone opened it by tagging the bot, so the whole thread is
+  // theirs and follow-ups need no repeated mention.
+  //
+  // Deliberately not "the agent has spoken here": replying once to a tagged
+  // message inside someone else's thread would then capture that thread
+  // forever. There the tag activates that message only, exactly like a
+  // channel.
+  // In a DM every message is already addressed, threads included, so skip the
+  // lookup there.
+  const threadAddressedAgent =
+    event.threadRootId && channelType.toUpperCase() !== "DIRECT"
+      ? await isThreadRootAddressedToAgent(
+          event.channelId,
+          event.threadRootId,
+          workspaceTokens,
+        )
+      : false;
+
   // Normalize the Pumble message into the inbound contract.
   const normalizeContext: NormalizeContext = {
     botId: workspaceTokens.botId,
+    botDisplayName,
     channelType,
     authorDisplayName,
     attachments,
+    quoteAuthorDisplayName,
+    threadParticipant: threadAddressedAgent,
   };
   const inboundMessage = normalizePumbleMessage(event, normalizeContext);
   if (!inboundMessage) {
@@ -452,11 +661,22 @@ async function processNewMessage(
   }
 
   // Resolve the target for outbound callbacks.
+  //
+  // Replying in a channel starts a thread on the triggering message, so an
+  // answer does not push unrelated conversation up the channel. An existing
+  // thread root always wins: a reply to a threaded message belongs in that
+  // same thread. DMs stay inline, where threading only adds a click.
+  const isDirect = channelType.toUpperCase() === "DIRECT";
+  const threadRepliesInChannels = settings.get().threadRepliesInChannels;
+  const threadRootId =
+    event.threadRootId ??
+    (threadRepliesInChannels && !isDirect ? event.messageId : undefined);
   const target: Target = {
     workspaceId: event.workspaceId,
     channelId: event.channelId,
     triggerMessageId: event.messageId,
-    threadRootId: event.threadRootId,
+    threadRootId,
+    direct: isDirect,
   };
 
   // Serialize the target save, core POST, and correlation binding for this
@@ -547,6 +767,21 @@ async function postToCore(body: string): Promise<string> {
 // Core outbound callback: /core/events
 // ---------------------------------------------------------------------------
 
+/**
+ * Terminal event types: each one closes a correlation, so the stored target
+ * can be released. Kept in one place because missing a type here leaks a
+ * target for every affected turn.
+ */
+const TERMINAL_EVENT_TYPES: Record<string, true> = {
+  "turn.reply": true,
+  "turn.error": true,
+  "turn.cancelled": true,
+};
+
+function isTerminalEvent(type: string): boolean {
+  return TERMINAL_EVENT_TYPES[type] === true;
+}
+
 async function handleCoreEvents(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -598,7 +833,7 @@ async function handleCoreEvents(
   const event = payload as unknown as OutboundEvent;
 
   if (await deliveryStore.hasCompleted(event.eventId)) {
-    if (event.type === "turn.reply" || event.type === "turn.error") {
+    if (isTerminalEvent(event.type)) {
       await targetStore.forgetCorrelation(event.correlationId);
     }
     sendText(res, 200, "ok");
@@ -618,7 +853,7 @@ async function handleCoreEvents(
   // Persist dedupe before acknowledging; terminal targets can then be released.
   await deliveryStore.markCompleted(event.eventId);
 
-  if (event.type === "turn.reply" || event.type === "turn.error") {
+  if (isTerminalEvent(event.type)) {
     await targetStore.forgetCorrelation(event.correlationId);
   }
 
@@ -679,6 +914,7 @@ function validateOutboundEvent(
     "turn.reply": true,
     "presence.changed": true,
     "turn.error": true,
+    "turn.cancelled": true,
   };
   if (!validTypes[type]) {
     return `unknown event type: ${type}`;

@@ -1,7 +1,7 @@
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { optionString } from "../args.ts";
-import { parseYaml } from "../config.ts";
+import { parse as parseSpecYaml } from "yaml";
 import {
   expandModelPlaceholders,
   loadBundleModels,
@@ -59,11 +59,38 @@ export interface BuildValidation {
   readonly modelBundle: LoadedModelBundle;
 }
 
+/**
+ * Parse user-authored YAML for read-only validation using the full-spec
+ * parser, so `check` accepts every document the runtime accepts (block
+ * scalars in particular). The hand-rolled parser in `config.ts` stays on the
+ * round-trip editing path, where preserving comments and formatting matters.
+ *
+ * Returns the parsed value, or `null` after recording a parse error that
+ * names the offending line. A syntax error must never surface as a schema
+ * complaint about an unrelated field.
+ */
+function readValidationYaml(
+  path: string,
+  source: string,
+  label: string,
+  errors: ValidationIssue[],
+): unknown | null {
+  try {
+    return parseSpecYaml(source) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+    errors.push(issue(path, undefined, `${label} is not valid YAML: ${detail}`));
+    return null;
+  }
+}
 
-const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: true, run: true };
+
+
+const PROJECT_KEYS: Record<string, true> = { version: true, agent: true, image: true, run: true, files: true };
 const AGENT_KEYS: Record<string, true> = { id: true };
 const IMAGE_KEYS: Record<string, true> = { tag: true };
 const RUN_KEYS: Record<string, true> = { dataVolume: true, corePort: true, adapterPort: true };
+const FILE_KEYS: Record<string, true> = { env: true, path: true, mode: true };
 const OMP_REQUIRED_FILES = ["AGENTS.md", "config.yml"] as const;
 const SECRET_ENV_NAME = /(?:API_KEY|APP_KEY|CLIENT_SECRET|SIGNING_SECRET|SHARED_SECRET|AUTH_BROKER_TOKEN|PASSWORD|PRIVATE_KEY|ACCESS_TOKEN|REFRESH_TOKEN|SECRET|TOKEN)$/i;
 const SECRET_TOKEN = /\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{12,})\b/;
@@ -79,14 +106,12 @@ const URL_ENV_NAMES: Record<string, true> = {
   PUMBLE_API_BASE_URL: true,
   PUMBLE_FILE_HOST_BASE_URL: true,
   CLIPROXY_BASE_URL: true,
-  custom-provider_BASE_URL: true,
 };
 const CREDENTIAL_ENV_NAMES: Record<string, true> = {
   OMP_AUTH_BROKER_TOKEN: true,
   OMP_HTTP_API_TOKEN: true,
   OMP_ADAPTERS: true,
   CLIPROXY_API_KEY: true,
-  custom-provider_API_KEY: true,
   OLLAMA_CLOUD_API_KEY: true,
   OPENCODE_GO_API_KEY: true,
   PUMBLE_APP_CLIENT_SECRET: true,
@@ -145,11 +170,9 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   } else if (!configStat.isFile()) {
     errors.push(issue(configPath, undefined, "must be a regular file"));
   } else {
-    try {
-      parsedConfig = parseYaml(await readFile(configPath, "utf8"));
-    } catch {
-      errors.push(issue(configPath, undefined, "is not valid YAML; fix its syntax without committing credentials"));
-    }
+    const configSource = await readFile(configPath, "utf8");
+    const parsedDocument = readValidationYaml(configPath, configSource, PROJECT_CONFIG_FILE, errors);
+    if (parsedDocument !== null) parsedConfig = parsedDocument as YamlValue;
   }
 
   const dockerfilePath = join(rootDir, "Dockerfile");
@@ -160,6 +183,13 @@ export async function validateBundleForBuild(options: CheckOptions): Promise<Bui
   const projectInfo = buildProjectContext(rootDir, configPath, parsedConfig, errors);
   const agents = [projectInfo.project.agent] as [AgentDirectory];
   await validateAgent(projectInfo.project.agent, errors);
+  await validateSchedulesDirectory(rootDir, errors);
+  const filesConfig: unknown = projectInfo.project.config.files;
+  if (Array.isArray(filesConfig)) {
+    for (const entry of filesConfig) {
+      if (isRecord(entry) && typeof entry.env === "string") credentialNames.add(entry.env);
+    }
+  }
 
   let modelBundle: LoadedModelBundle = {
     catalog: { providers: {} },
@@ -374,11 +404,69 @@ function validateProjectConfig(
       }
     }
   }
+  if (value.files !== undefined) validateFilesConfig(value.files, path, errors);
   if (isRecord(value.image) && value.image.tag !== undefined && (
     typeof value.image.tag !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/.test(value.image.tag) || value.image.tag.includes("..")
   )) {
     errors.push(issue(path, "image.tag", "must be a safe Docker image tag without traversal, whitespace, or shell expansion"));
   }
+}
+
+function validateFilesConfig(
+  value: YamlValue,
+  path: string,
+  errors: ValidationIssue[],
+): void {
+  if (!Array.isArray(value)) {
+    errors.push(issue(path, "files", "must be an array"));
+    return;
+  }
+  const seenPaths = new Set<string>();
+  value.forEach((entry, index) => {
+    const field = `files[${index}]`;
+    if (!isRecord(entry)) {
+      errors.push(issue(path, field, "must be a mapping"));
+      return;
+    }
+    for (const key of Object.keys(entry)) {
+      if (!(key in FILE_KEYS)) errors.push(issue(path, `${field}.${key}`, "is not a supported field"));
+    }
+
+    if (typeof entry.env !== "string" || !entry.env.trim()) {
+      errors.push(issue(path, `${field}.env`, "must be a non-empty environment variable name"));
+    } else if (!ENV_KEY.test(entry.env)) {
+      errors.push(issue(path, `${field}.env`, "must be a valid environment variable name"));
+    }
+
+    if (typeof entry.path !== "string" || !entry.path) {
+      errors.push(issue(path, `${field}.path`, "must be a non-empty absolute path"));
+    } else {
+      if (seenPaths.has(entry.path)) {
+        errors.push(issue(path, `${field}.path`, "must be unique across files entries"));
+      } else {
+        seenPaths.add(entry.path);
+      }
+      if (!isAbsolute(entry.path)) {
+        errors.push(issue(path, `${field}.path`, "must be an absolute path"));
+      } else if (entry.path === "/data" || entry.path.startsWith("/data/")) {
+        errors.push(issue(path, `${field}.path`, "must not be under /data"));
+      } else if (
+        entry.path === "/agent" ||
+        entry.path.startsWith("/agent/") ||
+        entry.path === "/app" ||
+        entry.path.startsWith("/app/")
+      ) {
+        errors.push(issue(path, `${field}.path`, "must not target reserved bundler paths /agent or /app"));
+      }
+    }
+
+    if (
+      entry.mode !== undefined &&
+      (typeof entry.mode !== "string" || !/^0?[0-7]{3,4}$/.test(entry.mode))
+    ) {
+      errors.push(issue(path, `${field}.mode`, "must be an octal mode with 3 or 4 digits"));
+    }
+  });
 }
 
 function validateMapping(
@@ -420,6 +508,130 @@ async function validateComponents(agent: AgentDirectory, errors: ValidationIssue
   await validateTypeScriptDirectory(join(agent.path, "extensions"), "extension", errors);
   await validateTypeScriptDirectory(join(agent.path, "tools"), "tool", errors);
   await validateSkillsDirectory(join(agent.path, "skills"), errors);
+}
+
+/**
+ * Validate the bundle-root `schedules/` directory of cron job YAML files.
+ * `*.yml` are active; `*.example` (and any other suffix) are inert. Schedules
+ * live at the bundle root, not under the agent `.omp` surface, so this is
+ * separate from {@link validateComponents}.
+ */
+async function validateSchedulesDirectory(
+  bundleRoot: string,
+  errors: ValidationIssue[],
+): Promise<void> {
+  const directory = join(bundleRoot, "schedules");
+  const info = await lstat(directory).catch(() => null);
+  if (!info?.isDirectory()) return;
+  const names = await readdir(directory).catch(() => [] as string[]);
+  const seen = new Set<string>();
+  for (const name of names.sort()) {
+    const path = join(directory, name);
+    const entry = await lstat(path).catch(() => null);
+    if (!entry) continue;
+    if (entry.isSymbolicLink()) {
+      errors.push(issue(path, undefined, "schedule files must not be symlinks"));
+      continue;
+    }
+    if (!entry.isFile()) {
+      errors.push(issue(path, undefined, "schedule entries must be regular files"));
+      continue;
+    }
+    const parsed = componentFileName(name, ".yml");
+    if (!parsed || parsed.example) continue; // inert (e.g. *.yml.example) or unrelated: ignore
+    if (seen.has(parsed.id)) {
+      errors.push(issue(path, "schedule name", `duplicates active schedule '${parsed.id}'`));
+    }
+    seen.add(parsed.id);
+    const source = await readFile(path, "utf8").catch(() => null);
+    if (source === null) {
+      errors.push(issue(path, undefined, "cannot be read; check file permissions"));
+      continue;
+    }
+    validateScheduleFile(path, source, parsed.id, errors);
+  }
+}
+
+/** Validate one cron schedule YAML body against the job schema. */
+function validateScheduleFile(
+  path: string,
+  source: string,
+  expectedId: string,
+  errors: ValidationIssue[],
+): void {
+  const document = readValidationYaml(path, source, "schedule", errors) as YamlValue | null;
+  if (document === null) return;
+  if (!isRecord(document)) {
+    errors.push(issue(path, undefined, "schedule must be a YAML mapping"));
+    return;
+  }
+  const parsed = document;
+  if (typeof parsed.schedule !== "string" || !parsed.schedule.trim()) {
+    errors.push(issue(path, "schedule", "must be a non-empty 5-field cron expression"));
+  } else if (!CRON_FIELD_RE.test(parsed.schedule.trim())) {
+    errors.push(issue(path, "schedule", "must be a 5-field cron expression (minute hour day month weekday)"));
+  }
+  if (parsed.timezone !== undefined) {
+    if (typeof parsed.timezone !== "string" || !parsed.timezone.trim()) {
+      errors.push(issue(path, "timezone", "must be a non-empty IANA timezone"));
+    } else if (!isValidTimezone(parsed.timezone.trim())) {
+      errors.push(issue(path, "timezone", "must be a valid IANA timezone (e.g. America/New_York)"));
+    }
+  }
+  if (parsed.missed !== "skip" && parsed.missed !== "catchUp") {
+    errors.push(issue(path, "missed", "must be 'skip' or 'catchUp'"));
+  }
+  if (parsed.runAtBoot !== undefined && typeof parsed.runAtBoot !== "boolean") {
+    errors.push(issue(path, "runAtBoot", "must be a boolean"));
+  }
+  const prompt = parsed.prompt;
+  const command = parsed.command;
+  const hasPrompt = typeof prompt === "string" && prompt.trim().length > 0;
+  const hasCommand = typeof command === "string" && command.trim().length > 0;
+  if (prompt !== undefined && !hasPrompt) {
+    errors.push(issue(path, "prompt", "must be a non-empty string"));
+  }
+  if (command !== undefined && !hasCommand) {
+    errors.push(issue(path, "command", "must be a non-empty string"));
+  }
+  if (hasPrompt && hasCommand) {
+    errors.push(issue(path, undefined, "exactly one of prompt or command is required"));
+  } else if (!hasPrompt && !hasCommand && prompt === undefined && command === undefined) {
+    errors.push(issue(path, undefined, "exactly one of prompt or command is required"));
+  }
+  if (parsed.timeout !== undefined) {
+    if (!hasCommand) {
+      errors.push(issue(path, "timeout", "is only valid with command"));
+    } else if (!isPositiveFiniteInteger(parsed.timeout)) {
+      errors.push(issue(path, "timeout", "must be a positive finite integer"));
+    }
+  }
+  scanCredentialAssignments(source, path, errors);
+  void expectedId;
+}
+
+/** A 5-field cron expression: minute hour day-of-month month day-of-week. */
+const CRON_FIELD_RE =
+  /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/;
+
+/** True when a YAML scalar is a positive finite integer. */
+function isPositiveFiniteInteger(value: YamlValue): boolean {
+  const number = typeof value === "number"
+    ? value
+    : typeof value === "string" && value.trim().length > 0
+      ? Number(value)
+      : Number.NaN;
+  return Number.isFinite(number) && Number.isInteger(number) && number > 0;
+}
+
+/** True when `tz` is a valid IANA timezone Intl can format. */
+function isValidTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function validateMarkdownDirectory(
@@ -548,7 +760,7 @@ async function validateSkillsDirectory(directory: string, errors: ValidationIssu
   }
 }
 
-function componentFileName(name: string, extension: ".md" | ".ts"): { id: string; example: boolean } | null {
+function componentFileName(name: string, extension: ".md" | ".ts" | ".yml"): { id: string; example: boolean } | null {
   const active = new RegExp(`^([a-z0-9][a-z0-9_-]{0,63})\\${extension}$`).exec(name);
   if (active) return { id: active[1], example: false };
   const example = new RegExp(`^([a-z0-9][a-z0-9_-]{0,63})\\${extension}\\.example$`).exec(name);
@@ -573,13 +785,9 @@ function validateFrontmatter(
     return;
   }
   const body = lines.slice(1, end + 1).join("\n");
-  let parsed: YamlValue;
-  try {
-    parsed = parseYaml(body);
-  } catch {
-    errors.push(issue(path, "frontmatter", "is not valid YAML"));
-    return;
-  }
+  const frontmatter = readValidationYaml(path, body, "frontmatter", errors) as YamlValue | null;
+  if (frontmatter === null) return;
+  const parsed = frontmatter;
   if (!isRecord(parsed)) {
     errors.push(issue(path, "frontmatter", "must be a YAML mapping"));
     return;
@@ -631,12 +839,10 @@ async function validateYamlFile(
     errors.push(issue(path, undefined, "cannot be read; check permissions"));
     return;
   }
-  try {
-    const value = parseYaml(source);
+  const value = readValidationYaml(path, source, label, errors) as YamlValue | null;
+  if (value !== null) {
     if (!isRecord(value)) errors.push(issue(path, undefined, `${label} must be a YAML mapping`));
     else validator?.(value, path, errors);
-  } catch {
-    errors.push(issue(path, undefined, `${label} is not valid YAML`));
   }
   scanCredentialAssignments(source, path, errors);
 }
@@ -785,7 +991,7 @@ function scanCredentialAssignments(source: string, path: string, errors: Validat
   if (structured) {
     try {
       scanStructuredCredentialValues(
-        /\.(?:json)$/i.test(path) ? (JSON.parse(source) as YamlValue) : parseYaml(source),
+        /\.(?:json)$/i.test(path) ? (JSON.parse(source) as YamlValue) : (parseSpecYaml(source) as YamlValue),
         path,
         errors,
       );

@@ -6,8 +6,8 @@
 #   1. Render models.yml from the env-var template.
 #   2. Configure the selected bundled adapter (HTTP by default).
 #   3. Run the orphan sweep once; fail if it is missing or fails.
-#   4. Supervise the core server (port 8787) and selected adapter
-#      (port 8765). The first child to exit tears down its sibling.
+#   4. Supervise the core server (port 8787), selected adapter (port 8765),
+#      and optional cron scheduler. The first child to exit tears down siblings.
 #
 # The core server loads the ambient ingest extension at runtime; it
 # must be present in the staged packages/core/src tree.
@@ -19,12 +19,23 @@
 set -euo pipefail
 
 # -- paths -------------------------------------------------------------
+# One agent directory, at OMP's default location.
+#
+# OMP 17.1.3 honors OMP_AGENT_DIR for skills, AGENTS.md, and config.yml but
+# ignores it for tools, extensions, models, and task agents. Pointing that
+# variable at a second directory therefore splits the definition in half and
+# silently drops whichever surface the loader resolves from the default. This
+# installs the whole definition where every loader already looks, and does not
+# set OMP_AGENT_DIR at all.
+#
+# This directory is a durable Docker volume, so everything OMP writes here --
+# sessions, blobs, agent.db, history.db, memories -- survives a rebuild. The
+# rendered models.yml persists with it and is overwritten from runtime env on
+# every boot.
 AGENT_DIR="${HOME}/.omp/agent"
-RUNTIME_AGENT_DIR="${HOME}/.omp/runtime-agent"
 BUILD_DIR="${OMP_BUILD_DIR:-/app/build}"
-MODELS_TMPL="${AGENT_DIR}/models.yml.tmpl"
-MODELS_OUT="${RUNTIME_AGENT_DIR}/models.yml"
-export OMP_AGENT_DIR="$RUNTIME_AGENT_DIR"
+MODELS_TMPL="${AGENT_SRC:-/agent}/models.yml.tmpl"
+MODELS_OUT="${AGENT_DIR}/models.yml"
 
 # Explicit /data mount paths shared by core and the selected adapter.
 DATA_DIR="${OMP_DATA_DIR:-/data}"
@@ -38,6 +49,27 @@ DURABLE_OMP_DIR="${DURABLE_AGENT_DIR}/.omp"
 export OMP_AGENT_ROOT="$DURABLE_AGENT_DIR"
 export OMP_WORKSPACE_DIR="$WORKSPACE_DIR"
 
+# Inbound attachments must land inside the directory the agent actually runs
+# in. Core spawns the agent with --cwd <agent root>/workspace, so a file
+# written under OMP_WORKSPACE_DIR is invisible to it: the model receives a
+# workspace-relative path that resolves to nothing, and reports that it can
+# see the filename but cannot open the file.
+export PUMBLE_BRIDGE_FILE_DIR="${PUMBLE_BRIDGE_FILE_DIR:-${DURABLE_WORKSPACE_DIR}/pumble-files}"
+
+# Cron source is seeded into this durable tree once, then the agent owns
+# edits/deletions there across container restarts.
+CRON_DATA_DIR="${OMP_CRON_DATA_DIR:-${DATA_DIR}/cron}"
+CRON_SCHEDULES_DIR="${OMP_CRON_SCHEDULES_DIR:-${CRON_DATA_DIR}/schedules}"
+SOURCE_SCHEDULES_DIR="${OMP_CRON_SOURCE_DIR:-/schedules}"
+export OMP_CRON_DATA_DIR="$CRON_DATA_DIR"
+export OMP_CRON_SCHEDULES_DIR="$CRON_SCHEDULES_DIR"
+
+# Adapter settings are seeded into the durable tree once, then the agent owns
+# them: it can change its own behavior at runtime by editing this file.
+SETTINGS_DIR="${DATA_DIR}/config"
+SETTINGS_FILE="${SETTINGS_DIR}/settings.jsonc"
+export PUMBLE_SETTINGS_FILE="$SETTINGS_FILE"
+
 # Child registry: the orphan sweep and the core server both read and
 # write this JSON file to track live RPC child process groups. It
 # lives on the durable /data volume so it survives restarts.
@@ -50,6 +82,7 @@ ORPHAN_SWEEP="${OMP_ORPHAN_SWEEP:-/app/packages/core/src/orphan-sweep.ts}"
 CORE_SERVER="${OMP_CORE_SERVER:-/app/packages/core/src/server.ts}"
 HTTP_SERVER="${OMP_HTTP_SERVER:-/app/packages/http-adapter/src/server.ts}"
 PUMBLE_SERVER="${OMP_PUMBLE_SERVER:-/app/packages/pumble-adapter/src/server.ts}"
+CRON_SERVER="${OMP_CRON_SERVER:-/app/packages/core/src/cron-scheduler.ts}"
 
 # Ambient ingest extension loaded by the core server at runtime.
 AMBIENT_EXTENSION="${OMP_AMBIENT_EXTENSION:-/app/packages/core/src/ambient-ingest-extension.ts}"
@@ -100,6 +133,66 @@ for _required in AGENTS.md config.yml; do
 	fi
 done
 
+# -- 0b. materialize env-to-file secrets -------------------------------
+FILES_MANIFEST="${AGENT_SRC}/files.json"
+if [ -f "$FILES_MANIFEST" ]; then
+	# shellcheck disable=SC2016
+	FILES_MANIFEST="$FILES_MANIFEST" bun -e '
+    import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+    import { dirname } from "node:path";
+
+    const manifestPath = process.env.FILES_MANIFEST;
+    const fail = (message) => {
+      console.error(`[entrypoint] error: ${message}`);
+      process.exit(1);
+    };
+    let entries;
+    try {
+      entries = JSON.parse(await readFile(manifestPath, "utf8"));
+    } catch {
+      fail(`cannot read env-to-file manifest ${manifestPath}`);
+    }
+    if (!Array.isArray(entries)) fail(`${manifestPath} must contain an array`);
+    for (const [index, entry] of entries.entries()) {
+      const field = `files[${index}]`;
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        fail(`${field} must be an object`);
+      }
+      const env = entry.env;
+      const path = entry.path;
+      const mode = entry.mode === undefined ? "0600" : entry.mode;
+      if (typeof env !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(env)) {
+        fail(`${field}.env must be a valid environment variable name`);
+      }
+      if (
+        typeof path !== "string" ||
+        !path.startsWith("/") ||
+        path === "/data" ||
+        path.startsWith("/data/") ||
+        path === "/agent" ||
+        path.startsWith("/agent/") ||
+        path === "/app" ||
+        path.startsWith("/app/")
+      ) {
+        fail(`${field}.path must be an absolute path outside /data, /agent, and /app`);
+      }
+      if (typeof mode !== "string" || !/^0?[0-7]{3,4}$/.test(mode)) {
+        fail(`${field}.mode must be an octal mode with 3 or 4 digits`);
+      }
+      const value = process.env[env];
+      if (value === undefined || value.length === 0) {
+        fail(`${env} is required for ${field} and must be non-empty`);
+      }
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await writeFile(path, Buffer.from(value, "base64"));
+      await chmod(path, Number.parseInt(mode, 8));
+    }
+  '
+else
+	log "no env-to-file manifest found; skipping materialization"
+fi
+
+
 
 # The durable root, refreshed definition, and persistent workspace are
 # operator state. Never follow symlinks while preparing them.
@@ -130,24 +223,69 @@ mkdir -p \
 	"$DURABLE_AGENT_DIR" \
 	"$DURABLE_WORKSPACE_DIR"
 
-link_into_data() {
-	local target="$1" expected="$2"
-	if [ -e "$target" ] && [ ! -L "$target" ]; then
-		die "refusing to clobber existing $target (expected a symlink or nothing)"
+# Cron schedules and run history share the durable /data volume. Seed the
+# mutable schedule tree once; later boots preserve agent edits and deletions.
+if [ -L "$CRON_DATA_DIR" ]; then
+	die "${CRON_DATA_DIR} must not be a symlink"
+fi
+if [ -e "$CRON_DATA_DIR" ] && [ ! -d "$CRON_DATA_DIR" ]; then
+	die "${CRON_DATA_DIR} must be a directory"
+fi
+if [ -L "$CRON_SCHEDULES_DIR" ]; then
+	die "${CRON_SCHEDULES_DIR} must not be a symlink"
+fi
+if [ -e "$CRON_SCHEDULES_DIR" ] && [ ! -d "$CRON_SCHEDULES_DIR" ]; then
+	die "${CRON_SCHEDULES_DIR} must be a directory"
+fi
+mkdir -p "$CRON_DATA_DIR" "$CRON_SCHEDULES_DIR"
+CRON_SEED_MARKER="${CRON_SCHEDULES_DIR}/.omp-bundler-seeded"
+if [ -L "$CRON_SEED_MARKER" ]; then
+	die "${CRON_SEED_MARKER} must not be a symlink"
+fi
+if [ ! -e "$CRON_SEED_MARKER" ]; then
+	if [ -L "$SOURCE_SCHEDULES_DIR" ]; then
+		die "${SOURCE_SCHEDULES_DIR} must not be a symlink"
 	fi
-	if [ -L "$target" ]; then
-		# Already a symlink: verify it points at the expected data dir.
-		# A stale link to a different path is a failure, not silently
-		# accepted.
-		local resolved
-		resolved="$(readlink "$target")"
-		if [ "$resolved" != "$expected" ]; then
-			die "$target is a symlink to '$resolved', expected '$expected'"
-		fi
-		return 0
+	if [ -d "$SOURCE_SCHEDULES_DIR" ] && [ "$SOURCE_SCHEDULES_DIR" != "$CRON_SCHEDULES_DIR" ]; then
+		for _schedule in "$SOURCE_SCHEDULES_DIR"/*; do
+			[ -e "$_schedule" ] || continue
+			if [ -L "$_schedule" ]; then
+				die "${_schedule} must not be a symlink"
+			fi
+			_schedule_name="${_schedule##*/}"
+			_schedule_target="${CRON_SCHEDULES_DIR}/${_schedule_name}"
+			if [ -e "$_schedule_target" ] || [ -L "$_schedule_target" ]; then
+				continue
+			fi
+			cp -R "$_schedule" "$_schedule_target" ||
+				die "failed to seed ${_schedule}"
+		done
 	fi
-	ln -s "$expected" "$target"
-}
+	touch "$CRON_SCHEDULES_DIR/.omp-bundler-seeded"
+fi
+
+# The adapter seeds this file itself on first read, from the template that
+# lives beside the defaults in settings.ts, so there is one source of truth
+# for both. The directory is created here because the agent must be able to
+# write it, and never overwritten: after first boot the file is the agent's,
+# and an image upgrade must not discard its changes.
+if [ -e "$SETTINGS_DIR" ] && [ ! -d "$SETTINGS_DIR" ]; then
+	die "${SETTINGS_DIR} must be a directory"
+fi
+mkdir -p "$SETTINGS_DIR"
+if [ -L "$SETTINGS_FILE" ]; then
+	die "${SETTINGS_FILE} must not be a symlink"
+fi
+
+# The agent edits its own settings, so the file must be inside a directory it
+# is allowed to write.
+OMP_ARGS="${OMP_ARGS:+${OMP_ARGS} }--add-dir ${SETTINGS_DIR}"
+export OMP_ARGS
+
+# Make cron state available to every OMP session through its native additional
+# workspace-root flag; the scheduler and adapter sessions share these args.
+OMP_ARGS="${OMP_ARGS:+${OMP_ARGS} }--add-dir ${CRON_DATA_DIR}"
+export OMP_ARGS
 
 # -- 1. refresh the durable agent definition ---------------------------
 # Stage the image-owned tree beside the destination, then swap it into place.
@@ -184,19 +322,38 @@ if [ "$_had_previous_omp" -eq 1 ]; then
 fi
 log "refreshed agent ${OMP_AGENT_ID}"
 
-# OMP only discovers project .omp files in the exact cwd. Materialize the
-# refreshed definition as its explicit agent directory so the child can keep
-# cwd in the empty persistent workspace without losing config or components.
-if [ -L "$RUNTIME_AGENT_DIR" ]; then
-	die "${RUNTIME_AGENT_DIR} must not be a symlink"
+# Install the refreshed definition at OMP's default agent directory. This is
+# the whole definition in one place: instructions, config, skills, commands,
+# tools, extensions, and task agents. Every OMP loader resolves from here,
+# whether or not it honors OMP_AGENT_DIR.
+#
+# This directory is a durable volume: OMP owns everything it writes here
+# (sessions, blobs, agent.db, history.db, memories). The definition is copied
+# over the top on every boot so bundle edits land, and nothing is ever
+# deleted. A component removed from the bundle therefore lingers until the
+# volume is cleared by hand; that is the deliberate trade for never touching
+# OMP's own data.
+if [ -L "$AGENT_DIR" ]; then
+	die "${AGENT_DIR} must not be a symlink"
 fi
-rm -rf "$RUNTIME_AGENT_DIR"
-if ! cp -R "$DURABLE_OMP_DIR" "$RUNTIME_AGENT_DIR"; then
-	rm -rf "$RUNTIME_AGENT_DIR"
-	die "failed to materialize OMP runtime agent directory"
+mkdir -p "$AGENT_DIR"
+if ! cp -R "${DURABLE_OMP_DIR}/." "$AGENT_DIR/"; then
+	die "failed to install the agent definition at ${AGENT_DIR}"
 fi
-link_into_data "${RUNTIME_AGENT_DIR}/sessions" "$SESSIONS_DIR"
-log "materialized OMP runtime agent directory"
+
+# One-time migration: sessions used to live at /data/sessions, symlinked into
+# the ephemeral agent directory. Now that the agent directory is itself a
+# durable volume, OMP writes them in place. Move any pre-migration history
+# across so conversations survive the switch; the legacy directory is left
+# behind, empty, rather than deleted.
+if [ -d "$SESSIONS_DIR" ] && [ ! -L "$SESSIONS_DIR" ] && [ ! -e "${AGENT_DIR}/sessions" ]; then
+	mkdir -p "${AGENT_DIR}/sessions"
+	if ! cp -R "${SESSIONS_DIR}/." "${AGENT_DIR}/sessions/"; then
+		die "failed to migrate sessions from ${SESSIONS_DIR}"
+	fi
+	log "migrated sessions from ${SESSIONS_DIR} to ${AGENT_DIR}/sessions"
+fi
+log "installed agent definition at ${AGENT_DIR}"
 
 # -- 2. render models --------------------------------------------------
 # bun build/render-models.ts expands runtime placeholders, omits providers
@@ -205,6 +362,9 @@ log "rendering models.yml from ${MODELS_TMPL}"
 bun "$BUILD_DIR/render-models.ts" \
 	--input "$MODELS_TMPL" \
 	--output "$MODELS_OUT"
+# The rendered catalog holds real credentials, so it lands on the ephemeral
+# container layer and is re-created from runtime env on every boot.
+chmod 0600 "$MODELS_OUT"
 log "models rendered to ${MODELS_OUT}"
 
 # Optional central credential vault. Both values are required together. The
@@ -298,6 +458,25 @@ pumble)
 	;;
 esac
 
+# -- 4. cron scheduler -------------------------------------------------
+# Keep the scheduler alive even when the directory starts empty so an agent
+# can create its first schedule without a container restart.
+CRON_ENABLED=""
+if [ "${OMP_CRON_ENABLED+x}" = x ]; then
+	case "${OMP_CRON_ENABLED,,}" in
+	true|1|yes|on)
+		CRON_ENABLED=1
+		;;
+	*)
+		CRON_ENABLED=0
+		log "cron disabled (OMP_CRON_ENABLED=${OMP_CRON_ENABLED})"
+		;;
+	esac
+else
+	CRON_ENABLED=1
+	log "cron enabled with durable schedules at ${CRON_SCHEDULES_DIR}"
+fi
+
 # -- 4. orphan sweep ---------------------------------------------------
 # The orphan sweep is a core module. It MUST run once; we do not
 # silently skip it. If the executable is absent or fails, the
@@ -309,9 +488,9 @@ log "running orphan sweep: ${ORPHAN_SWEEP}"
 bun "$ORPHAN_SWEEP"
 log "orphan sweep complete"
 
-# -- 5. start core + selected adapter under supervision -----------------
-# This shell remains PID 1, forwards signals, and tears down the sibling
-# when either supervised service exits.
+# -- 5. start core + selected adapter (+ optional cron) under supervision -
+# This shell remains PID 1, forwards signals, and tears down every
+# supervised sibling when any service exits.
 
 [ -f "$CORE_SERVER" ] || die "core server not found at ${CORE_SERVER}"
 [ -f "$ADAPTER_SERVER" ] || die "${ADAPTER_LABEL} adapter server not found at ${ADAPTER_SERVER}"
@@ -319,6 +498,7 @@ log "orphan sweep complete"
 
 CORE_PID=""
 ADAPTER_PID=""
+CRON_PID=""
 EXIT_CODE=0
 TEARING_DOWN=0
 
@@ -329,6 +509,9 @@ forward_signal() {
 	fi
 	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 		kill -"$sig" "$CORE_PID" 2>/dev/null || true
+	fi
+	if [ -n "$CRON_PID" ] && kill -0 "$CRON_PID" 2>/dev/null; then
+		kill -"$sig" "$CRON_PID" 2>/dev/null || true
 	fi
 }
 
@@ -343,7 +526,19 @@ log "starting ${ADAPTER_LABEL} adapter: ${ADAPTER_SERVER}"
 bun "$ADAPTER_SERVER" &
 ADAPTER_PID=$!
 
-log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}"
+if [ "$CRON_ENABLED" = 1 ] && [ -f "$CRON_SERVER" ]; then
+	log "starting cron scheduler: ${CRON_SERVER}"
+	bun "$CRON_SERVER" &
+	CRON_PID=$!
+elif [ "$CRON_ENABLED" = 1 ]; then
+	log "cron scheduler not found; skipping: ${CRON_SERVER}"
+fi
+
+if [ -n "$CRON_PID" ]; then
+	log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}, cron pid=${CRON_PID}"
+else
+	log "core pid=${CORE_PID}, ${ADAPTER_LABEL} pid=${ADAPTER_PID}"
+fi
 
 set +e
 wait -n
@@ -361,13 +556,19 @@ fi
 for _ in {1..50}; do
 	CORE_ALIVE=0
 	ADAPTER_ALIVE=0
+	CRON_ALIVE=0
 	if [ -n "$CORE_PID" ] && kill -0 "$CORE_PID" 2>/dev/null; then
 		CORE_ALIVE=1
 	fi
 	if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
 		ADAPTER_ALIVE=1
 	fi
-	if [ "$CORE_ALIVE" -eq 0 ] && [ "$ADAPTER_ALIVE" -eq 0 ]; then
+	if [ -n "$CRON_PID" ] && kill -0 "$CRON_PID" 2>/dev/null; then
+		CRON_ALIVE=1
+	fi
+	if [ "$CORE_ALIVE" -eq 0 ] &&
+		[ "$ADAPTER_ALIVE" -eq 0 ] &&
+		[ "$CRON_ALIVE" -eq 0 ]; then
 		break
 	fi
 	sleep 0.1
@@ -381,6 +582,11 @@ if [ -n "$ADAPTER_PID" ] && kill -0 "$ADAPTER_PID" 2>/dev/null; then
 	log "${ADAPTER_LABEL} adapter did not exit; sending SIGKILL"
 	kill -9 "$ADAPTER_PID" 2>/dev/null || true
 	wait "$ADAPTER_PID" 2>/dev/null || true
+fi
+if [ -n "$CRON_PID" ] && kill -0 "$CRON_PID" 2>/dev/null; then
+	log "cron scheduler did not exit; sending SIGKILL"
+	kill -9 "$CRON_PID" 2>/dev/null || true
+	wait "$CRON_PID" 2>/dev/null || true
 fi
 
 log "supervisor exiting (status ${EXIT_CODE})"

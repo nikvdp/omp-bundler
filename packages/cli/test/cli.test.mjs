@@ -198,14 +198,15 @@ async function createEntrypointHarness(root) {
   const coreServer = join(root, "core-server.ts");
   const httpServer = join(root, "http-server.ts");
   const pumbleServer = join(root, "pumble-server.ts");
+  const cronServer = join(root, "cron-server.ts");
   const ambientExtension = join(root, "ambient-ingest-extension.ts");
   await mkdir(binDir, { recursive: true });
   await writeText(join(buildDir, "render-models.ts"), "export {};\n");
-  await writeText(join(homeDir, ".omp", "agent", "models.yml.tmpl"), "{}\n");
   await writeText(orphanSweep, "export {};\n");
   await writeText(coreServer, "export {};\n");
   await writeText(httpServer, "export {};\n");
   await writeText(pumbleServer, "export {};\n");
+  await writeText(cronServer, "export {};\n");
   await writeText(ambientExtension, "export {};\n");
   const capturePath = join(root, "entrypoint-capture.json");
   await writeFile(
@@ -233,9 +234,13 @@ if (args[0]?.endsWith("/render-models.ts")) {
     OMP_AGENT_ROOT: process.env.OMP_AGENT_ROOT,
     OMP_WORKSPACE_DIR: process.env.OMP_WORKSPACE_DIR,
     OMP_AGENT_DIR: process.env.OMP_AGENT_DIR,
+    OMP_ARGS: process.env.OMP_ARGS,
+    OMP_CRON_SCHEDULES_DIR: process.env.OMP_CRON_SCHEDULES_DIR,
   });
   writeFileSync(process.env.ENTRYPOINT_CAPTURE_PATH + ".tmp", capture);
   renameSync(process.env.ENTRYPOINT_CAPTURE_PATH + ".tmp", process.env.ENTRYPOINT_CAPTURE_PATH);
+} else if ([process.env.OMP_HTTP_SERVER, process.env.OMP_PUMBLE_SERVER, process.env.OMP_CRON_SERVER].includes(args[0])) {
+  setInterval(() => {}, 1000);
 }
 `,
     { encoding: "utf8", mode: 0o755 },
@@ -243,6 +248,9 @@ if (args[0]?.endsWith("/render-models.ts")) {
 
   return {
     async run(agentSrc, dataDir, overrides = {}) {
+      // The models template ships beside the baked agent definition, so it
+      // lives in the image source directory rather than the home agent dir.
+      await writeText(join(agentSrc, "models.yml.tmpl"), "{}\n");
       await rm(capturePath, { force: true });
       const env = {
         ...process.env,
@@ -253,6 +261,7 @@ if (args[0]?.endsWith("/render-models.ts")) {
         OMP_CORE_SERVER: coreServer,
         OMP_HTTP_SERVER: httpServer,
         OMP_PUMBLE_SERVER: pumbleServer,
+        OMP_CRON_SERVER: cronServer,
         OMP_AMBIENT_EXTENSION: ambientExtension,
         OMP_CHILD_REGISTRY_PATH: join(dataDir, "child-registry.json"),
         OMP_BUNDLER_ADAPTER: "http",
@@ -475,6 +484,26 @@ test("CLI framework owns command parsing, help, and shell completions", async ()
   assert.match(legacy.stderr(), /Unknown command: service/);
 });
 
+test("generate and destroy accept the schedule kind through the parser", async () => {
+  const generateCalls = [];
+  const generateCapture = captureIO();
+  assert.equal(await main(["generate", "schedule", "daily"], {
+    cwd: "/work",
+    io: generateCapture.io,
+    handlers: { generate(args) { generateCalls.push(args.positionals); return 0; } },
+  }), 0);
+  assert.deepEqual(generateCalls, [["schedule", "daily"]]);
+
+  const destroyCalls = [];
+  const destroyCapture = captureIO();
+  assert.equal(await main(["destroy", "schedule", "daily", "--yes"], {
+    cwd: "/work",
+    io: destroyCapture.io,
+    handlers: { destroy(args) { destroyCalls.push(args.positionals); return 0; } },
+  }), 0);
+  assert.deepEqual(destroyCalls, [["schedule", "daily"]]);
+});
+
 test("compiled standalone invokes the CLI main module", async () => {
   await withTempDirectory(async (root) => {
     const executable = join(root, "omp-bundler");
@@ -507,14 +536,9 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
       [],
       "the persistent agent workspace starts empty",
     );
-    const runtimeAgentDir = join(
-      root,
-      "entrypoint-home",
-      ".omp",
-      "runtime-agent",
-    );
+    const agentDir = join(root, "entrypoint-home", ".omp", "agent");
     await writeText(
-      join(runtimeAgentDir, "stale-runtime.txt"),
+      join(agentDir, "stale-runtime.txt"),
       "remove stale runtime copy\n",
     );
 
@@ -545,6 +569,17 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
       join(imageV2, ".omp", "skills", "meeting-notes", "SKILL.md"),
       "# Meeting notes\n",
     );
+    // Tools and extensions are the surfaces OMP resolves from its default
+    // agent directory regardless of OMP_AGENT_DIR. Stage them so a split
+    // definition cannot pass this test.
+    await writeText(
+      join(imageV2, ".omp", "tools", "custom_tool.ts"),
+      "export default () => ({});\n",
+    );
+    await writeText(
+      join(imageV2, ".omp", "extensions", "custom-ext.ts"),
+      "export default () => {};\n",
+    );
     const second = await harness.run(imageV2, dataDir);
     assert.equal(second.code, 0, second.stderr);
     assert.equal(
@@ -561,37 +596,66 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
     assert.equal(second.capture.OMP_AGENT_ID, "alpha");
     assert.equal(second.capture.OMP_AGENT_ROOT, join(dataDir, "agent"));
     assert.equal(second.capture.OMP_WORKSPACE_DIR, join(dataDir, "workspace"));
-    assert.equal(second.capture.OMP_AGENT_DIR, runtimeAgentDir);
     assert.equal(
-      await readFile(join(runtimeAgentDir, "config.yml"), "utf8"),
+      second.capture.OMP_AGENT_DIR,
+      undefined,
+      "OMP_AGENT_DIR must not be set: OMP honors it for only some loaders",
+    );
+    assert.equal(
+      await readFile(join(agentDir, "config.yml"), "utf8"),
       "image-v2\n",
     );
     assert.equal(
-      await readFile(join(runtimeAgentDir, "AGENTS.md"), "utf8"),
+      await readFile(join(agentDir, "AGENTS.md"), "utf8"),
       "# alpha\n\nStaged instructions.\n",
     );
     assert.equal(
       await readFile(
-        join(runtimeAgentDir, "skills", "meeting-notes", "SKILL.md"),
+        join(agentDir, "skills", "meeting-notes", "SKILL.md"),
         "utf8",
       ),
       "# Meeting notes\n",
     );
+    // These two assertions are the regression guard. OMP loads tools and
+    // extensions from its default agent directory only, so a definition
+    // split across two directories leaves them missing while skills and
+    // instructions still resolve and the agent looks healthy.
     assert.equal(
-      await exists(join(runtimeAgentDir, "stale-runtime.txt")),
-      false,
+      await readFile(join(agentDir, "tools", "custom_tool.ts"), "utf8"),
+      "export default () => ({});\n",
+      "bundle tools must reach the directory OMP loads tools from",
     );
     assert.equal(
-      await readFile(join(runtimeAgentDir, "models.yml"), "utf8"),
+      await readFile(join(agentDir, "extensions", "custom-ext.ts"), "utf8"),
+      "export default () => {};\n",
+      "bundle extensions must reach the directory OMP loads extensions from",
+    );
+    // The agent directory is a durable volume that OMP owns: the definition is
+    // copied over the top on every boot and nothing is deleted, so a file
+    // written at runtime survives the refresh.
+    assert.equal(
+      await exists(join(agentDir, "stale-runtime.txt")),
+      true,
+      "runtime state in the agent directory must survive a definition refresh",
+    );
+    assert.equal(
+      await readFile(join(agentDir, "models.yml"), "utf8"),
       "{}\n",
     );
     assert.equal(
-      (await lstat(join(runtimeAgentDir, "sessions"))).isSymbolicLink(),
-      true,
+      await exists(join(root, "entrypoint-home", ".omp", "runtime-agent")),
+      false,
+      "the second agent directory must not exist: one definition, one location",
     );
     assert.equal(
-      await realpath(join(runtimeAgentDir, "sessions")),
-      await realpath(join(dataDir, "sessions")),
+      (await lstat(join(agentDir, "sessions"))).isSymbolicLink(),
+      false,
+      "sessions are written in place now that the agent directory is durable",
+    );
+    assert.equal(
+      await exists(join(agentDir, "sessions")),
+      true,
+      "OMP writes sessions inside its own durable agent directory",
     );
     assert.equal(
       await exists(join(dataDir, "agent", ".omp", "models.yml")),
@@ -606,6 +670,63 @@ test("entrypoint refreshes only singular .omp, preserves workspace, and register
         agentId: "alpha",
       },
     ]);
+  });
+});
+
+test("entrypoint persists live cron schedules and exposes their workspace root", async () => {
+  await withTempDirectory(async (root) => {
+    const harness = await createEntrypointHarness(root);
+    const dataDir = join(root, "cron-data");
+    const source = await createStagedAgent(root, "image", "alpha", "config\n");
+    const bakedSchedules = join(root, "baked-schedules");
+    await writeText(
+      join(bakedSchedules, "daily.yml"),
+      'schedule: "0 9 * * *"\nmissed: skip\nprompt: "original"\n',
+    );
+    await writeText(
+      join(bakedSchedules, "example-schedule.yml.example"),
+      'schedule: "0 9 * * *"\nmissed: skip\nprompt: "inactive"\n',
+    );
+
+    const first = await harness.run(source, dataDir, {
+      OMP_ARGS: "--profile test",
+      OMP_CRON_ENABLED: "true",
+      OMP_CRON_SOURCE_DIR: bakedSchedules,
+    });
+    assert.equal(first.code, 0, first.stderr);
+    const liveSchedules = join(dataDir, "cron", "schedules");
+    assert.equal(
+      await readFile(join(liveSchedules, "daily.yml"), "utf8"),
+      'schedule: "0 9 * * *"\nmissed: skip\nprompt: "original"\n',
+    );
+    assert.equal(first.capture.OMP_CRON_SCHEDULES_DIR, liveSchedules);
+    // Both the settings file and cron state are agent-writable, so each is
+    // exposed as a workspace root.
+    assert.equal(
+      first.capture.OMP_ARGS,
+      `--profile test --add-dir ${join(dataDir, "config")} --add-dir ${join(dataDir, "cron")}`,
+    );
+
+    await writeText(
+      join(liveSchedules, "daily.yml"),
+      'schedule: "0 10 * * *"\nmissed: skip\nprompt: "edited"\n',
+    );
+    await rm(join(liveSchedules, "example-schedule.yml.example"));
+
+    const second = await harness.run(source, dataDir, {
+      OMP_ARGS: "--profile test",
+      OMP_CRON_ENABLED: "true",
+      OMP_CRON_SOURCE_DIR: bakedSchedules,
+    });
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(
+      await readFile(join(liveSchedules, "daily.yml"), "utf8"),
+      'schedule: "0 10 * * *"\nmissed: skip\nprompt: "edited"\n',
+    );
+    assert.equal(
+      await exists(join(liveSchedules, "example-schedule.yml.example")),
+      false,
+    );
   });
 });
 
@@ -731,6 +852,7 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
         "extensions",
         "skills",
         "tools",
+        "schedules",
       ]),
     );
     for (const relativePath of [
@@ -739,12 +861,17 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
       join("extensions", "example-extension.ts.example"),
       join("skills", "example-skill", "SKILL.md.example"),
       join("tools", "example-tool.ts.example"),
+      join("schedules", "example-schedule.yml.example"),
     ]) {
       assert.equal(await exists(join(derived, relativePath)), true, relativePath);
     }
     const starterModels = parseYaml(await readFile(join(derived, "models.yml"), "utf8"));
     assert.deepEqual(starterModels, { providers: {} });
     assert.match(await readFile(join(derived, "Dockerfile"), "utf8"), /FROM oven\/bun:/);
+    assert.match(
+      await readFile(join(derived, "Dockerfile"), "utf8"),
+      /extra system tools \(customize\)/,
+    );
     assert.deepEqual(
       parseYaml(await readFile(join(derived, "omp-bundler.yml"), "utf8"))
         .agent,
@@ -755,6 +882,7 @@ test("new creates the full root scaffold and derives or accepts an agent id", as
     assert.match(generatedReadme, /omp-bundler generate skill meeting-notes/);
     assert.match(generatedReadme, /model add <provider\/model>/);
     assert.match(generatedReadme, /discovers the live adapter port automatically/);
+    assert.match(generatedReadme, /generate schedule/);
 
     await invoke(newCommand, parent, ["custom"], { id: "alpha" });
     const custom = join(parent, "custom");
@@ -780,11 +908,21 @@ test("component generators and destroy commands use root paths without deployed 
       ["tool", "lookup-record", join("tools", "lookup-record.ts")],
       ["extension", "lifecycle-log", join("extensions", "lifecycle-log.ts")],
       ["subagent", "researcher", join("subagents", "researcher.md")],
+      ["schedule", "daily-summary", join("schedules", "daily-summary.yml")],
     ];
     for (const [kind, name, relativePath] of components) {
       await invoke(generateCommand, bundle, [kind, name]);
       assert.equal(await exists(join(bundle, relativePath)), true);
     }
+    assert.deepEqual(
+      parseYaml(await readFile(join(bundle, "schedules", "daily-summary.yml"), "utf8")),
+      {
+        schedule: "0 9 * * 1-5",
+        timezone: "UTC",
+        missed: "skip",
+        prompt: "Replace this with the prompt daily-summary should run on schedule.",
+      },
+    );
     const generatedAdapter = await invoke(generateCommand, bundle, ["adapter", "pumble"]);
     assert.equal(generatedAdapter.result, undefined);
     const envExample = await readFile(join(bundle, "runtime.env.example"), "utf8");
@@ -795,6 +933,10 @@ test("component generators and destroy commands use root paths without deployed 
     await assert.rejects(
       () => invoke(generateCommand, bundle, ["skill", "alpha", "wrong"]),
       /usage: omp-bundler generate skill <name>/,
+    );
+    await assert.rejects(
+      () => invoke(generateCommand, bundle, ["schedule", "two", "args"]),
+      /usage: omp-bundler generate schedule <name>/,
     );
     await assert.rejects(
       () => invoke(generateCommand, bundle, ["adapter", "pumble"], { agent: "alpha" }),
@@ -870,6 +1012,40 @@ if (args[0] === "models") {
     const listed = await invoke(modelCommand, bundle, ["list"]);
     assert.match(listed.stdout, /\* direct\/direct-model/);
     assert.match(listed.stdout, /  openai\/imported-model/);
+  });
+});
+
+test("check accepts block scalars in schedules and reports YAML syntax errors as such", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+
+    // A multi-line command is ordinary YAML and the cron runtime executes it,
+    // so check must accept it too.
+    await writeText(
+      join(bundle, "schedules", "sync.yml"),
+      'schedule: "*/10 * * * *"\nmissed: skip\ntimeout: 600\ncommand: |\n  set -eu\n  echo one\n  echo two\n',
+    );
+    const blockScalar = await validateBundle({ cwd: bundle });
+    assert.equal(
+      blockScalar.ok,
+      true,
+      blockScalar.errors.map((entry) => entry.message).join("\n"),
+    );
+
+    // A real syntax error must name YAML, not a schema field that happens to
+    // be missing because the parser gave up early.
+    await writeText(
+      join(bundle, "schedules", "sync.yml"),
+      'schedule: "*/10 * * * *"\nmissed: skip\n  command: "echo hi"\n bad indent\n',
+    );
+    const malformed = await validateBundle({ cwd: bundle });
+    assert.equal(malformed.ok, false);
+    assert(
+      malformed.errors.some((entry) => entry.message.includes("not valid YAML")),
+      `expected a YAML parse error, got: ${malformed.errors.map((entry) => entry.message).join("\n")}`,
+    );
   });
 });
 
@@ -972,9 +1148,239 @@ test("check and Docker staging map agent components into OMP", async () => {
       assert.equal(await exists(join(contextPath, "agent", ".omp", "subagents")), false);
       assert.equal(await exists(join(contextPath, "agent", ".omp", "model.yml")), false);
       assert.equal(await exists(join(contextPath, "agent", ".git")), false);
+      // The scaffolded inert example schedule is staged so the Dockerfile COPY resolves.
+      assert.equal(await exists(join(contextPath, "schedules", "example-schedule.yml.example")), true);
     } finally {
       await removeDockerContext(contextPath);
     }
+  });
+});
+
+test("check validates and Docker staging writes env-to-file secret manifests", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+    const configPath = join(bundle, "omp-bundler.yml");
+    const writeFilesConfig = async (files) => {
+      const lines = ["version: 1", "agent:", "  id: alpha"];
+      if (files !== undefined) {
+        lines.push("files:");
+        for (const file of files) {
+          lines.push(`  - env: ${file.env}`, `    path: ${file.path}`);
+          if (file.mode !== undefined) lines.push(`    mode: "${file.mode}"`);
+        }
+      }
+      lines.push("");
+      await writeText(configPath, `${lines.join("\n")}`);
+    };
+
+    const validFiles = [
+      { env: "GITHUB_SSH_KEY", path: "/root/.ssh/id_ed25519", mode: "0600" },
+      { env: "SECOND_SECRET", path: "/root/.ssh/known_key" },
+    ];
+    await writeFilesConfig(validFiles);
+    const valid = await validateBundle({ cwd: bundle });
+    assert.equal(valid.ok, true, valid.errors.map((entry) => entry.message).join("\n"));
+    assert.deepEqual(valid.credentialNames, ["GITHUB_SSH_KEY", "SECOND_SECRET"]);
+    const checked = await invoke(checkCommand, bundle, []);
+    assert.equal(checked.result, 0, checked.stderr);
+    assert.match(checked.stdout, /Credential names present: GITHUB_SSH_KEY, SECOND_SECRET/);
+
+    const assets = join(parent, "assets");
+    await createCanonicalAssetSource(assets);
+    const staged = await stageDockerContext([valid.agent], assets, undefined, valid.project.config.files);
+    try {
+      assert.deepEqual(
+        JSON.parse(await readFile(join(staged, "agent", "files.json"), "utf8")),
+        validFiles,
+      );
+    } finally {
+      await removeDockerContext(staged);
+    }
+
+    const invalidCases = [
+      {
+        name: "relative path",
+        files: [{ env: "KEY", path: "relative/key" }],
+        field: "files[0].path",
+        message: "absolute path",
+      },
+      {
+        name: "persistent path",
+        files: [{ env: "KEY", path: "/data/secret" }],
+        field: "files[0].path",
+        message: "under /data",
+      },
+      {
+        name: "bad mode",
+        files: [{ env: "KEY", path: "/root/secret", mode: "0999" }],
+        field: "files[0].mode",
+        message: "octal mode",
+      },
+      {
+        name: "bad environment name",
+        files: [{ env: "KEY-NAME", path: "/root/secret" }],
+        field: "files[0].env",
+        message: "valid environment variable",
+      },
+      {
+        name: "duplicate path",
+        files: [
+          { env: "KEY_ONE", path: "/root/secret" },
+          { env: "KEY_TWO", path: "/root/secret" },
+        ],
+        field: "files[1].path",
+        message: "unique",
+      },
+    ];
+    for (const invalid of invalidCases) {
+      await writeFilesConfig(invalid.files);
+      const report = await validateBundle({ cwd: bundle });
+      assert.equal(report.ok, false, `${invalid.name} unexpectedly passed`);
+      assert(
+        report.errors.some((entry) =>
+          entry.field === invalid.field && entry.message.includes(invalid.message)
+        ),
+        `${invalid.name}: ${report.errors.map((entry) => `${entry.field}: ${entry.message}`).join("; ")}`,
+      );
+    }
+
+    await writeFilesConfig(undefined);
+    const withoutFiles = await validateBundle({ cwd: bundle });
+    assert.equal(withoutFiles.ok, true, withoutFiles.errors.map((entry) => entry.message).join("\n"));
+    const emptyStaged = await stageDockerContext([withoutFiles.agent], assets, undefined, withoutFiles.project.config.files);
+    try {
+      assert.deepEqual(
+        JSON.parse(await readFile(join(emptyStaged, "agent", "files.json"), "utf8")),
+        [],
+      );
+    } finally {
+      await removeDockerContext(emptyStaged);
+    }
+  });
+});
+
+test("check validates cron schedule files at the bundle root", async () => {
+  await withTempDirectory(async (parent) => {
+    await invoke(newCommand, parent, ["bundle"], { id: "alpha" });
+    const bundle = join(parent, "bundle");
+    await seedModel(bundle, "alpha");
+
+    // The scaffolded example stays inert and does not trip validation.
+    const base = await validateBundle({ cwd: bundle });
+    assert.equal(base.ok, true, base.errors.map((entry) => entry.message).join("\n"));
+
+    await writeText(join(bundle, "schedules", "good.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "timezone: America/New_York",
+      "missed: skip",
+      'prompt: "Run the daily summary."',
+      "",
+    ].join("\n"));
+    const good = await validateBundle({ cwd: bundle });
+    assert.equal(good.ok, true, good.errors.map((entry) => entry.message).join("\n"));
+
+    await writeText(join(bundle, "schedules", "command.yml"), [
+      'schedule: "*/10 * * * *"',
+      "missed: skip",
+      'command: "printf ok"',
+      "timeout: 300",
+      "",
+    ].join("\n"));
+    const commandOnly = await validateBundle({ cwd: bundle });
+    assert.equal(commandOnly.ok, true, commandOnly.errors.map((entry) => entry.message).join("\n"));
+
+    await writeText(join(bundle, "schedules", "both.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'prompt: "Run it."',
+      'command: "printf ok"',
+      "",
+    ].join("\n"));
+    const both = await validateBundle({ cwd: bundle });
+    assert(both.errors.some((entry) =>
+      entry.message.includes("exactly one of prompt or command"),
+    ));
+
+    await writeText(join(bundle, "schedules", "neither.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      "",
+    ].join("\n"));
+    const neither = await validateBundle({ cwd: bundle });
+    assert(neither.errors.some((entry) =>
+      entry.message.includes("exactly one of prompt or command"),
+    ));
+
+    await writeText(join(bundle, "schedules", "prompt-timeout.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'prompt: "Run it."',
+      "timeout: 300",
+      "",
+    ].join("\n"));
+    const promptTimeout = await validateBundle({ cwd: bundle });
+    assert(promptTimeout.errors.some((entry) =>
+      entry.field === "timeout" && entry.message.includes("only valid with command"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-timeout.yml"), [
+      'schedule: "0 9 * * *"',
+      "missed: skip",
+      'command: "printf ok"',
+      "timeout: 0",
+      "",
+    ].join("\n"));
+    const badTimeout = await validateBundle({ cwd: bundle });
+    assert(badTimeout.errors.some((entry) =>
+      entry.field === "timeout" && entry.message.includes("positive finite integer"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-cron.yml"), [
+      'schedule: "not a cron expr"',
+      "missed: skip",
+      'prompt: "x"',
+      "",
+    ].join("\n"));
+    const badCron = await validateBundle({ cwd: bundle });
+    assert(badCron.errors.some((entry) =>
+      entry.field === "schedule" && entry.message.includes("5-field cron"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-tz.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "timezone: Not/A/Zone",
+      "missed: skip",
+      'prompt: "x"',
+      "",
+    ].join("\n"));
+    const badTz = await validateBundle({ cwd: bundle });
+    assert(badTz.errors.some((entry) =>
+      entry.field === "timezone" && entry.message.includes("IANA timezone"),
+    ));
+
+    await writeText(join(bundle, "schedules", "bad-missed.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "missed: later",
+      'prompt: "x"',
+      "",
+    ].join("\n"));
+    const badMissed = await validateBundle({ cwd: bundle });
+    assert(badMissed.errors.some((entry) =>
+      entry.field === "missed" && entry.message.includes("'skip' or 'catchUp'"),
+    ));
+
+    await writeText(join(bundle, "schedules", "no-prompt.yml"), [
+      'schedule: "0 9 * * 1-5"',
+      "missed: skip",
+      'prompt: ""',
+      "",
+    ].join("\n"));
+    const noPrompt = await validateBundle({ cwd: bundle });
+    assert(noPrompt.errors.some((entry) =>
+      entry.field === "prompt" && entry.message.includes("non-empty"),
+    ));
   });
 });
 

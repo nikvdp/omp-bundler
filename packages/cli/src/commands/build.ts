@@ -70,7 +70,7 @@ export const buildCommand: CommandHandler = async (
 
   let contextPath: string | undefined;
   try {
-    contextPath = await stageDockerContext(result.agents, validation.modelBundle, undefined);
+    contextPath = await stageDockerContext(result.agents, validation.modelBundle, undefined, result.project.config.files);
     const docker = await executeChild("docker", buildDockerArgs(tag, contextPath), {
       stdio: "inherit",
       forwardSignals: true,

@@ -41,6 +41,7 @@ function config(root: string, agentId: string): CoreConfig {
     maxChildren: 1,
     idleTimeoutMs: 1_000,
     engagementWindowMs: 1_000,
+    ambientQuietPeriodMs: 0,
     callbackTimeoutMs: 1_000,
     progressThresholdMs: 500,
     retryDelaysMs: [1_000],

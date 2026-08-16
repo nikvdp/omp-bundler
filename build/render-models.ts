@@ -95,7 +95,7 @@ function failAll(errors: string[]): never {
 
 // Valid env-var names: uppercase letters, digits, underscore; must
 // start with a letter or underscore. Matches ${ANTHROPIC_API_KEY},
-// ${custom-provider_BASE_URL}, etc.
+// and provider-specific environment placeholders.
 export const PLACEHOLDER = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 // Generic braced token: any ${...} at all, including shell-style

@@ -9,7 +9,7 @@ import {
 export { CANONICAL_ASSET_PATHS } from "../package-assets.ts";
 import { assertSafeIdentifier } from "../identifiers.ts";
 import type { LoadedModelBundle } from "../model-config.ts";
-import type { AgentDirectory } from "../types.ts";
+import type { AgentDirectory, ProjectConfig } from "../types.ts";
 
 
 export const BUNDLE_ROOT_LABEL = "io.omp-bundler.bundle-root";
@@ -19,6 +19,7 @@ export interface RunDockerArguments {
   readonly corePort: number;
   readonly adapterPort: number;
   readonly dataVolume: string;
+  readonly agentVolume: string;
   readonly envFile: string;
   readonly bundleRoot: string;
   readonly containerName?: string;
@@ -53,6 +54,8 @@ export function runDockerArgs(
     `${options.adapterPort}:8765`,
     "-v",
     `${options.dataVolume}:/data`,
+    "-v",
+    `${options.agentVolume}:/root/.omp/agent`,
     "--env-file",
     options.envFile,
     options.image,
@@ -81,6 +84,7 @@ export async function stageDockerContext(
   agents: readonly AgentDirectory[],
   modelsOrAssetsRoot?: LoadedModelBundle | string,
   assetsRoot?: string,
+  filesConfig?: ProjectConfig["files"],
 ): Promise<string> {
   const models = typeof modelsOrAssetsRoot === "object" ? modelsOrAssetsRoot : undefined;
   const sourceAssetsRoot = typeof modelsOrAssetsRoot === "string" ? modelsOrAssetsRoot : assetsRoot;
@@ -100,9 +104,19 @@ export async function stageDockerContext(
     await mkdir(stagedAgent, { recursive: true });
     await writeFile(join(stagedAgent, "id"), `${agent.id}\n`, "utf8");
     await copyAgentSourceNoSymlinks(agent.path, stagedOmp);
+    // Stage the bundle-root schedules/ directory (cron source) when present so
+    // the Dockerfile's `COPY schedules/ /schedules/` resolves. Optional: a
+    // bundle without schedules simply stages nothing and runs core + adapter.
+    const schedulesSource = join(agent.path, "schedules");
+    if (await lstat(schedulesSource).catch(() => null)) {
+      await copyTreeNoSymlinks(schedulesSource, join(contextPath, "schedules"), true);
+    }
+    await writeFile(join(stagedAgent, "files.json"), JSON.stringify(filesConfig ?? [], null, 2), "utf8");
 
     if (models !== undefined) {
-      await writeFile(join(contextPath, "template", "models.yml.tmpl"), models.source, "utf8");
+      // Staged beside the agent definition, not into a shared sample folder.
+      // The Dockerfile copies it to the agent directory the entrypoint reads.
+      await writeFile(join(stagedAgent, "models.yml.tmpl"), models.source, "utf8");
     }
     return contextPath;
   } catch (error) {

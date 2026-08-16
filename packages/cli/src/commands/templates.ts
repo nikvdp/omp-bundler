@@ -19,10 +19,8 @@ export const PUMBLE_RUNTIME_FIELDS = [
 ] as const;
 
 /**
- * Fresh runtime.env.example for a default HTTP bundle. Compact and
- * self-explaining: one comment, the adapter mode, a blank line, and the
- * optional HTTP Bearer token. No auth-broker or Pumble fields — those are
- * opt-in sections generated on request.
+ * Fresh runtime.env.example for a default HTTP bundle. It explains the
+ * adapter, HTTP token, and opt-in cron override without enabling extra modes.
  */
 export const RUNTIME_ENV_EXAMPLE = runtimeEnvExample();
 
@@ -34,6 +32,9 @@ export function runtimeEnvExample(): string {
     "",
     "# Optional Bearer token for the public HTTP endpoint. Leave empty only on trusted localhost.",
     "OMP_HTTP_API_TOKEN=",
+    "",
+    "# Cron is enabled automatically when schedules/*.yml exists. See README.md: Cron schedules.",
+    "# OMP_CRON_ENABLED=",
   ];
   return `${lines.join("\n")}\n`;
 }
@@ -85,6 +86,10 @@ export function agentScaffoldFiles(agentId: string): readonly PlannedWrite[] {
     {
       path: "tools/example-tool.ts.example",
       content: exampleToolTemplate(),
+    },
+    {
+      path: "schedules/example-schedule.yml.example",
+      content: exampleScheduleTemplate(),
     },
   ];
 }
@@ -143,6 +148,7 @@ commands/example-command.md.example
 extensions/example-extension.ts.example
 skills/example-skill/SKILL.md.example
 tools/example-tool.ts.example
+schedules/example-schedule.yml.example
 \`\`\`
 
 The \`.example\` suffix keeps each starter inactive. Use the matching generator
@@ -155,6 +161,19 @@ omp-bundler generate extension lifecycle-log
 omp-bundler generate skill meeting-notes
 omp-bundler generate tool read-transcript
 \`\`\`
+
+## Cron
+
+Schedules live under \`schedules/\`. The scaffolded
+\`schedules/example-schedule.yml.example\` is inert; create an active schedule
+with \`omp-bundler generate schedule <name>\` and remove it with
+\`omp-bundler destroy schedule <name>\`. On first startup, image schedules are
+seeded once into \`/data/cron/schedules\`; that durable directory is then owned
+by the agent and is not refreshed by rebuilding an existing deployment.
+
+Each run writes to \`/data/cron/jobs/<job-id>/\`. See the repository README's
+\`Cron schedules\` section for the YAML schema and prompt/command examples.
+
 
 ## Development loop
 
@@ -190,6 +209,41 @@ function exampleExtensionTemplate(): string {
 
 function exampleToolTemplate(): string {
   return `import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";\n\nconst factory: CustomToolFactory = (pi) => ({\n  name: "example_tool",\n  label: "Example Tool",\n  description: "A harmless starter custom tool.",\n  parameters: pi.zod.object({}),\n\n  async execute() {\n    return {\n      content: [{ type: "text", text: "Customize this tool before using it." }],\n    };\n  },\n});\n\nexport default factory;\n`;
+}
+
+export function scheduleFile(name: string): PlannedWrite {
+  return { path: `schedules/${name}.yml`, content: scheduleTemplate(name) };
+}
+
+export function exampleScheduleTemplate(): string {
+  return [
+    "# Cron schedule. This example is inert while it has the .example suffix.",
+    "# Rename to example-schedule.yml (drop .example) to activate it.",
+    "# The agent runs `prompt` in a fresh OMP session on this schedule and writes",
+    "# its output to /data/cron/jobs/<job-id>/ for the agent to read.",
+    "# Use command: instead of prompt: to run a raw shell command without a model turn.",
+    "schedule: \"0 9 * * 1-5\"",
+    "timezone: UTC",
+    "missed: skip",
+    "prompt: \"Summarize today's meetings and post the summary.\"",
+    "",
+  ].join("\n");
+}
+
+export function scheduleTemplate(name: string): string {
+  return [
+    `# Cron schedule for ${name}. Edit the fields below.`,
+    "# schedule: 5-field cron expression (minute hour day month weekday).",
+  "# timezone: IANA timezone (e.g. America/New_York). Defaults to UTC.",
+  "# missed: skip (advance to next fire time) or catchUp (fire for missed intervals).",
+  "# prompt: the user message sent to the agent each run.",
+  "# Use command: instead of prompt: to run a raw shell command without a model turn.",
+  'schedule: "0 9 * * 1-5"',
+  "timezone: UTC",
+  "missed: skip",
+  `prompt: ${JSON.stringify(`Replace this with the prompt ${name} should run on schedule.`)}`,
+  "",
+  ].join("\n");
 }
 
 function skillTemplate(name: string): string {

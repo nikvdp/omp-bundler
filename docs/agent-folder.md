@@ -1,59 +1,51 @@
-# Agent folder discovery mapping
+# Agent folder discovery
 
-This document maps each directory and file inside the `template/` agent
-folder to the OMP loader that finds it. The container installs this folder as
-`$HOME/.omp/agent`, OMP's default agent directory.
- 
-OMP 17.1.3 does not apply `OMP_AGENT_DIR` consistently to task-agent
-discovery: config, extensions, and tools follow it, but task agents still load
-from `$HOME/.omp/agent/agents`. Installing the folder at the default location
-keeps every discovery surface on one root without explicit extension paths.
+The container installs one agent definition at `$HOME/.omp/agent`, OMP's
+default agent directory, and does not set `OMP_AGENT_DIR`.
 
-## Directory layout
+## Why one directory
 
+OMP 17.1.3 applies `OMP_AGENT_DIR` to some loaders and not others:
+
+| Follows `OMP_AGENT_DIR` | Ignores it, uses `$HOME/.omp/agent` |
+| --- | --- |
+| `AGENTS.md` | custom tools |
+| `config.yml` | extensions |
+| skills | model catalog (`models.yml`) |
+| | task agents (`agents/`) |
+
+Pointing `OMP_AGENT_DIR` at a second directory therefore splits the definition
+in half. The dangerous part is how it fails: instructions and skills still
+resolve, so the agent answers normally while silently missing every custom
+tool, its extensions, and its models. Nothing errors.
+
+Installing the whole definition at the default location removes the question.
+Every loader resolves the same tree whether or not it honors the variable.
+
+## Layout
+
+The entrypoint copies the refreshed definition from `/data/agent/.omp` to
+`$HOME/.omp/agent` on every start:
+
+```text
+$HOME/.omp/agent/
+  AGENTS.md          session instructions
+  config.yml         model roles and settings
+  models.yml         rendered from the baked template at boot
+  agents/            task agents (staged from the bundle's subagents/)
+  commands/          slash commands
+  extensions/        TypeScript extensions
+  skills/            skills, resolvable as skill://<name>
+  tools/             custom tools
+  sessions -> /data/sessions
 ```
-template/
-  AGENTS.md                      instructions every session loads
-  config.yml                     model roles, providers, settings
-  models.yml.tmpl                rendered to models.yml at container start
-  agents/
-    reviewer-lite.md             spawnable subagent definition
-  commands/
-    status.md                   slash command (expands to /status)
-  extensions/
-    session-banner.ts           TypeScript extension (hooks + commands)
-  skills/
-    hello-agent-folder/
-      SKILL.md                   skill discovered via skill://hello-agent-folder
-  tools/
-    workspace_info.ts            custom tool factory
-```
 
-## Discovery mapping
+This directory is on the ephemeral container layer, never `/data`, so the
+rendered catalog and its credentials do not persist. Sessions are symlinked
+onto the durable volume.
 
-| Path                              | Loader                                         | Effect                                                   |
-| --------------------------------- | ---------------------------------------------- | -------------------------------------------------------- |
-| `AGENTS.md`                       | `discoverContextFiles`                         | Loaded as session instructions.                          |
-| `config.yml`                      | `loadSettings`                                 | Parsed for `modelRoles`, `enabledModels`, `disabledProviders`, provider order, and tags. |
-| `models.yml.tmpl`                 | Container entrypoint renderer                  | `${VAR}` placeholders resolve against container env before `ModelRegistry.create` loads the resulting `models.yml`. |
-| `agents/*.md`                     | `discoverAgents`                               | Each markdown file's frontmatter (`name`, `description`, `tools`, `spawns`) registers a spawnable subagent. |
-| `commands/*.md`                   | `discoverSlashCommands`                        | Frontmatter `description` plus body becomes a slash command. `status.md` becomes `/status`. |
-| `extensions/*.ts`                 | `discoverExtensions`                           | Default export is a factory `(pi: ExtensionAPI) => void` called at startup; hooks and commands register here. |
-| `skills/*/SKILL.md`               | `discoverSkills`                               | Frontmatter `name` plus body; resolvable as `skill://<name>`. |
-| `tools/*.ts`                      | `discoverAndLoadCustomTools`                   | Default export is a `CustomToolFactory` returning a tool definition and `execute` handler. |
+## Regression guard
 
-## Smoke checklist
-
-Install or link `template/` at `$HOME/.omp/agent`, then start OMP and confirm:
-
-- `skill://hello-agent-folder` resolves and the skill appears in
-  discovered skills.
-- The `workspace_info` custom tool is callable.
-- The `reviewer-lite` subagent is spawnable via the task tool.
-- The `session-banner` extension registers the `/agent-folder-status`
-  command and greets on `session_start`.
-- `/status` (from `commands/status.md`) expands.
-- `config.yml` and the rendered `models.yml` are picked up for model
-  roles and provider credentials.
-
-These mirror the confirmation list in `template/AGENTS.md`.
+`packages/cli/test/cli.test.mjs`, in the entrypoint test, asserts that a staged
+tool and extension arrive in `$HOME/.omp/agent` and that no second agent
+directory exists. Those assertions fail if the definition is ever split again.

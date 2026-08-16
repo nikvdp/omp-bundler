@@ -32,7 +32,11 @@ async function materializedAssetsRoot(): Promise<string> {
   } catch {
     // Missing stamp: extract below.
   }
-  if (stamp !== BUILD_ID) {
+  // BUILD_ID is a digest of the embedded assets, so a stamp mismatch means the
+  // cache holds a different build's files. "stub" is the committed placeholder
+  // shared by every pre-prepack build: it identifies no particular content, so
+  // a cache stamped with it is never reusable and is always re-extracted.
+  if (stamp !== BUILD_ID || BUILD_ID === "stub") {
     await rm(root, { recursive: true, force: true });
     await mkdir(root, { recursive: true });
     for (const [assetPath, content] of Object.entries(EMBEDDED_ASSETS)) {

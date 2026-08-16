@@ -118,7 +118,7 @@ function createParser(
     "Generate an agent component or adapter configuration",
     (command) => command
       .positional("kind", {
-        choices: ["skill", "command", "tool", "extension", "subagent", "adapter"] as const,
+        choices: ["skill", "command", "tool", "extension", "subagent", "adapter", "schedule"] as const,
         describe: "Component type",
       })
       .positional("name", { type: "string", describe: "Component name or adapter type" })
@@ -131,7 +131,7 @@ function createParser(
     "Remove a generated component",
     (command) => command
       .positional("kind", {
-        choices: ["skill", "command", "tool", "extension", "subagent"] as const,
+        choices: ["skill", "command", "tool", "extension", "subagent", "schedule"] as const,
         describe: "Component type",
       })
       .positional("name", { type: "string", describe: "Component name" })

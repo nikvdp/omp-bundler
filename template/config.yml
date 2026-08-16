@@ -1,4 +1,0 @@
-# Shared OMP settings for the bundled agent. Model selection belongs to
-# the deployment or an agent-specific config, not this provider-neutral
-# default.
-setupVersion: 1

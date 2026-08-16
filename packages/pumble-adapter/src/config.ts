@@ -36,6 +36,12 @@ export interface BridgeConfig {
   httpTimeoutMs: number;
   /** Maximum bytes served on a single GET /download response. */
   downloadMaxBytes: number;
+  /**
+   * Path of the runtime-mutable settings file. Behavior knobs live there
+   * rather than in env so the agent can change them while running; see
+   * settings.ts.
+   */
+  settingsFile: string;
 }
 
 export function loadBridgeConfig(env = process.env): BridgeConfig {
@@ -97,7 +103,7 @@ export function loadBridgeConfig(env = process.env): BridgeConfig {
     ),
     manifestDisplayName: valueOrDefault(
       env.PUMBLE_MANIFEST_DISPLAY_NAME,
-      "agent",
+      "OMP Bundler",
       "PUMBLE_MANIFEST_DISPLAY_NAME",
     ),
     manifestBotTitle: valueOrDefault(
@@ -147,6 +153,13 @@ export function loadBridgeConfig(env = process.env): BridgeConfig {
       "PUMBLE_HTTP_TIMEOUT_MS",
       env.PUMBLE_HTTP_TIMEOUT_MS,
       15_000,
+    ),
+    // Behavior knobs are not env-configurable: they live in a JSONC file on
+    // the durable volume so the agent can change them while running.
+    settingsFile: valueOrDefault(
+      env.PUMBLE_SETTINGS_FILE,
+      path.join(dataDir, "config", "settings.jsonc"),
+      "PUMBLE_SETTINGS_FILE",
     ),
   };
 }

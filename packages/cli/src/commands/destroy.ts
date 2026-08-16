@@ -19,6 +19,7 @@ const DESTROY_HELP = [
   "omp-bundler destroy tool <name> [--dry-run] [--yes]",
   "omp-bundler destroy extension <name> [--dry-run] [--yes]",
   "omp-bundler destroy subagent <name> [--dry-run] [--yes]",
+  "omp-bundler destroy schedule <name> [--dry-run] [--yes]",
 ].join("\n");
 
 const COMPONENT_DIRECTORY: Record<string, string> = {
@@ -36,6 +37,7 @@ export const destroyCommand: CommandHandler = async (args, context) => {
     return 0;
   }
   if (kind && Object.hasOwn(COMPONENT_DIRECTORY, kind)) return destroyComponent(kind, args, context);
+  if (kind === "schedule") return destroySchedule(args, context);
   throw new Error(`unknown destroy target '${kind ?? ""}'. Run 'omp-bundler destroy --help' for available commands`);
 };
 
@@ -98,4 +100,30 @@ async function executeDestruction(
   }
   await applyFilePlan(plan);
   return 0;
+}
+
+async function destroySchedule(
+  args: ParsedArguments,
+  context: CommandContext,
+): Promise<number> {
+  for (const name of Object.keys(args.options)) {
+    if (name !== "help" && name !== "dry-run" && name !== "yes") {
+      throw new Error(`unknown option '--${name}'`);
+    }
+  }
+  if (args.positionals.length !== 2) {
+    throw new Error(`usage: omp-bundler destroy schedule <name> [--dry-run] [--yes]`);
+  }
+  const scheduleName = assertSafeIdentifier(args.positionals[1], "schedule name");
+  const project = await loadProject(undefined, context.cwd);
+  const schedulePath = join(project.rootDir, "schedules", `${scheduleName}.yml`);
+  await assertNoSymlinkComponents(project.rootDir, schedulePath, "schedule path");
+  const info = await lstat(schedulePath).catch(() => null);
+  if (!info) throw new Error(`schedule '${scheduleName}' does not exist: ${schedulePath}`);
+  if (info.isSymbolicLink()) throw new Error(`schedule path must not be a symlink: ${schedulePath}`);
+  if (!info.isFile()) throw new Error(`schedule path is not a regular file: ${schedulePath}`);
+  const plan = createRemovePlan(project.rootDir, [
+    relativePlanPath(project.rootDir, schedulePath),
+  ]);
+  return executeDestruction(plan, args, context);
 }

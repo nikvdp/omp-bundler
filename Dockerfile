@@ -9,6 +9,15 @@ FROM oven/bun:1.3.14-debian AS base
 # installs the agent folder at the default OMP location, /root/.omp/agent.
 ENV HOME=/root
 
+# ── extra system tools (customize) ─────────────────────────────────────
+# This bundle owns this Dockerfile. Add any CLIs your agent shells out to
+# (git, openssh-client, gh, a Google Docs CLI, etc.) here, before the
+# runtime layout below. Example:
+#
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#       git openssh-client ca-certificates \
+#  && rm -rf /var/lib/apt/lists/*
+
 # ── OMP install ──────────────────────────────────────────────────────
 # OMP is installed into the image, not copied from the host. Pin to
 # 17.1.3; npm's --global install places the `omp` bin on PATH.
@@ -19,7 +28,7 @@ WORKDIR /app
 
 # Copy all four staged package trees: contracts (shared types and
 # schemas), core (inbound HTTP server on port 8787), http-adapter
-# (default agent-like agent HTTP API on port 8765), and pumble-adapter
+# (default agent HTTP API on port 8765), and pumble-adapter
 # (optional Pumble webhook/callback service on port 8765).
 # node_modules and secrets are excluded by .dockerignore; Bun executes
 # the TypeScript source directly.
@@ -32,17 +41,18 @@ COPY packages/pumble-adapter/   ./packages/pumble-adapter/
 COPY build/            ./build/
 COPY entrypoint/       ./entrypoint/
 
-# Install the agent folder at $HOME/.omp/agent, OMP's default agent
-# directory. NOT OMP_AGENT_DIR: OMP 17.1.3 does not apply that
-# var consistently to task-agent discovery, so we use the default
-# location to keep every discovery surface on one root.
-COPY template/         "${HOME}/.omp/agent/"
-
 # Bake the single staged agent definition. The image-side source is
 # immutable; the entrypoint refreshes only its .omp tree onto the durable
 # volume and leaves the persistent workspace untouched.
+#
+# There is no separate sample agent folder. OMP honors OMP_AGENT_DIR for
+# some loaders and not others, so the entrypoint installs this one
+# definition at OMP's default agent directory and every loader agrees.
 COPY agent/id       /agent/id
 COPY agent/.omp/    /agent/.omp/
+COPY agent/files.json  /agent/files.json
+COPY agent/models.yml.tmpl /agent/models.yml.tmpl
+COPY schedules/     /schedules/
 
 # ── production dependency install ─────────────────────────────────────
 # Install production dependencies for each package from its lock file.
@@ -58,7 +68,8 @@ RUN cd packages/contracts && bun install --frozen-lockfile --production \
 
 # ── /data mount ──────────────────────────────────────────────────────
 # A single shared volume covers sessions, the legacy unbound workspace,
-# the bound agent workspace, artifacts, and adapter-specific persistent state.
+# the bound agent workspace, artifacts, adapter state, and mutable cron
+# schedules/run history.
 # OMP's default agent dir is $HOME/.omp/agent; session data lives at
 # $HOME/.omp/agent/sessions and artifacts at .../artifacts. To keep
 # these on the durable volume instead of the ephemeral layer:
@@ -74,6 +85,8 @@ ENV OMP_WORKSPACE_DIR=/data/workspace
 ENV OMP_ARTIFACTS_DIR=/data/artifacts
 ENV PI_ARTIFACTS_DIR=/data/artifacts
 ENV OMP_AGENT_ROOT=/data/agent
+ENV OMP_CRON_SCHEDULES_DIR=/data/cron/schedules
+ENV OMP_CRON_DATA_DIR=/data/cron
 
 # Core runtime invariants. Paths and internal service addresses belong to
 # this image; credentials and adapter registrations remain runtime inputs.
@@ -85,6 +98,10 @@ ENV OMP_OUTBOX_DB_PATH=/data/core/outbound.sqlite
 ENV OMP_MAX_CHILDREN=8
 ENV OMP_IDLE_TIMEOUT_MS=900000
 ENV OMP_ENGAGEMENT_WINDOW_MS=300000
+# Hold ambient replies while a conversation is moving faster than this, then
+# deliver everything held as one catch-up turn once it settles. Being directly
+# addressed always answers immediately. 0 disables holding.
+ENV OMP_AMBIENT_QUIET_PERIOD_MS=30000
 ENV OMP_CALLBACK_TIMEOUT_MS=15000
 ENV OMP_PROGRESS_THRESHOLD_MS=500
 ENV OMP_RETRY_DELAYS_MS=250,1000,5000
@@ -116,9 +133,7 @@ EXPOSE 8765
 # first, so fixed-base providers remain available without provider keys.
 # Custom providers still need their base URL at runtime.
 #   CLIPROXY_BASE_URL    optional cliproxyapi provider base URL
-#   custom-provider_BASE_URL     optional custom-provider provider base URL
 #   CLIPROXY_API_KEY     cliproxyapi key without a broker
-#   custom-provider_API_KEY      custom-provider key without a broker
 #   OLLAMA_CLOUD_API_KEY ollama-cloud key without a broker
 #   OPENCODE_GO_API_KEY  opencode-go key without a broker
 #   SYNTHETIC_API_KEY    synthetic key without a broker

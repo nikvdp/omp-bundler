@@ -42,8 +42,9 @@
  */
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import type { InboundMessage } from "@omp-bundler/contracts/inbound";
 import type { OutboundEvent } from "@omp-bundler/contracts/outbound";
@@ -178,6 +179,7 @@ export class CoreSupervisor {
   private readonly wiredChildren = new WeakSet<RpcChild>();
 
   private closed = false;
+  private settleTimer: NodeJS.Timeout | undefined;
   private closePromise: Promise<void> | null = null;
 
   constructor(options: CoreSupervisorOptions) {
@@ -195,6 +197,7 @@ export class CoreSupervisor {
     });
     this.buffer = new IngestBuffer({
       engagementWindowMs: this.config.engagementWindowMs,
+      quietPeriodMs: this.config.ambientQuietPeriodMs,
       now: this.now,
     });
     this.pool = new PoolManager({
@@ -206,6 +209,15 @@ export class CoreSupervisor {
         console.error(`[pool] ${event.type}: ${event.message}`);
       },
     });
+
+    // Held ambient backlogs need something to release them once a room falls
+    // silent; arrivals alone cannot, since silence is the absence of one.
+    if (this.config.ambientQuietPeriodMs > 0) {
+      this.settleTimer = setInterval(() => {
+        void this.flushSettled();
+      }, this.config.ambientQuietPeriodMs);
+      this.settleTimer.unref?.();
+    }
   }
 
   /**
@@ -331,6 +343,19 @@ export class CoreSupervisor {
       compositeKey(adapterId, message.conversationKey),
     );
     if (recovery) await recovery.catch(() => {});
+    // An addressed message arriving mid-turn supersedes the turn in flight.
+    //
+    // This must happen BEFORE the correlation is read below: joining the
+    // active correlation and then cancelling it would take the new message
+    // down with the old turn, so the interruption would land but the
+    // replacement would never be answered.
+    const inFlight = this.active.get(
+      compositeKey(adapterId, message.conversationKey),
+    );
+    if (inFlight && message.addressed && !inFlight.terminalEmitted) {
+      await this.interruptTurn(inFlight);
+    }
+
     // 1. Idempotency: new messages join the active turn correlation.
     const activeCorrelation = this.active.get(
       compositeKey(adapterId, message.conversationKey),
@@ -454,6 +479,10 @@ export class CoreSupervisor {
   }
 
   private async closeImpl(): Promise<void> {
+    if (this.settleTimer) {
+      clearInterval(this.settleTimer);
+      this.settleTimer = undefined;
+    }
     // Closing the pool first stops active children and rejects queued
     // acquisitions. Preserve its failure while still draining emitters and
     // closing durable stores.
@@ -485,6 +514,47 @@ export class CoreSupervisor {
     if (poolError) throw poolError;
   }
 
+  /**
+   * Start a turn for every conversation whose held ambient backlog has
+   * settled.
+   *
+   * Each held message was already appended to its session when it was
+   * buffered, so the context exists; what is missing is a turn over it. The
+   * synthesized message carries the whole held span, which is what makes the
+   * agent catch up on the conversation rather than answer its last line.
+   *
+   * Failures are logged and dropped: a settled flush is opportunistic, and a
+   * conversation that cannot start one now will try again on the next sweep
+   * or the next arrival.
+   */
+  private async flushSettled(): Promise<void> {
+    if (this.closed) return;
+    for (const settled of this.buffer.sweepSettled()) {
+      const last = settled.records[settled.records.length - 1];
+      const message: InboundMessage = {
+        messageId: last.messageId,
+        conversationKey: settled.conversationKey,
+        speaker: last.speaker,
+        text: settled.prompt,
+        attachments: [],
+        addressed: false,
+      };
+      try {
+        const begun = this.idempotency.beginInbound(settled.adapterId, message);
+        await this.activate(
+          settled.adapterId,
+          message,
+          begun.correlationId,
+          "prompt",
+        );
+      } catch (err) {
+        console.error(
+          `[settled flush] ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
   // ---- internals: activation ----
 
   /**
@@ -506,12 +576,32 @@ export class CoreSupervisor {
     correlationId: string,
     mode: ActivationMode,
   ): Promise<void> {
+    // Commands core handles itself, before any child is leased.
+    //
+    // Session identity belongs to core, not to OMP: a conversation is bound to
+    // a session file by the registry, so OMP's own /new cannot take effect —
+    // it would report a fresh start while core handed the same session back on
+    // the next turn. Handling it here drops the mapping instead, which is what
+    // the user actually asked for.
+    //
+    // Only an exact match counts, so "what does /new do?" is a normal message.
+    // /compact is deliberately NOT intercepted: it mutates the current session
+    // in place, which already works through OMP.
+    if (SESSION_RESET_COMMANDS[message.text.trim().toLowerCase()] === true) {
+      await this.handleSessionReset(adapterId, message, correlationId);
+      return;
+    }
+
     const convKey = compositeKey(adapterId, message.conversationKey);
     let corr = this.active.get(convKey);
     // One live lease stays held for an active correlation until terminal
     // completion; later arrivals use that child directly, never re-acquire.
     if (!corr) {
-      const lease = await this.pool.acquire(adapterId, message.conversationKey);
+      const lease = await this.pool.acquire(
+        adapterId,
+        message.conversationKey,
+        message.parentConversationKey,
+      );
       const messageIds = new Set([message.messageId]);
       const emitter = this.createEmitter(
         adapterId,
@@ -559,7 +649,11 @@ export class CoreSupervisor {
           addressed: message.addressed,
           receivedAt: this.now(),
         });
-        assertRpcSuccess(await child.prompt(promptText), "prompt");
+        const images = await this.loadImages(message.attachments);
+        assertRpcSuccess(
+          await child.prompt(promptText, images.length ? { images } : {}),
+          "prompt",
+        );
       } else if (mode === "steer") {
         // Addressed, streaming: steer the active stream with the current
         // message. Backlog is in the session history, not duplicated.
@@ -573,8 +667,12 @@ export class CoreSupervisor {
           addressed: message.addressed,
           receivedAt: this.now(),
         });
+        const images = await this.loadImages(message.attachments);
         assertRpcSuccess(
-          await child.prompt(promptText, { streamingBehavior: "steer" }),
+          await child.prompt(promptText, {
+            streamingBehavior: "steer",
+            ...(images.length ? { images } : {}),
+          }),
           "steer",
         );
       } else {
@@ -608,6 +706,123 @@ export class CoreSupervisor {
     }
   }
 
+  /**
+   * Read image attachments into inline content the model can actually look at.
+   *
+   * Attachments are otherwise only named in the prompt text, which tells a
+   * vision model a file exists without letting it see the contents; the agent
+   * ends up reporting that it has the filename but cannot open the image.
+   *
+   * Non-image attachments keep their path-only treatment: the agent can open
+   * those with normal file tools. A file that cannot be read is skipped rather
+   * than failing the turn, since the message itself is still answerable.
+   */
+  private async loadImages(
+    attachments: InboundMessage["attachments"],
+  ): Promise<Array<{ type: "image"; data: string; mimeType: string }>> {
+    const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+    for (const attachment of attachments) {
+      const mimeType = attachment.mediaType;
+      if (!mimeType?.startsWith("image/")) continue;
+      // Same root the child is spawned with (resolveChildSpawnPlan), so a
+      // workspace-relative path means the same thing here and to the agent.
+      const root = this.config.agentRootDir;
+      const absolute =
+        isAbsolute(attachment.path) || root === null
+          ? attachment.path
+          : join(root, "workspace", attachment.path);
+      try {
+        const bytes = await readFile(absolute);
+        images.push({
+          type: "image",
+          data: bytes.toString("base64"),
+          mimeType,
+        });
+      } catch (error) {
+        console.error(
+          `[attachment] could not read image ${absolute}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    return images;
+  }
+
+  /**
+   * Start a new session for a conversation. Stops any live child before
+   * dropping the registry mapping so the next message cannot reuse the old
+   * in-memory OMP session.
+   */
+  private async handleSessionReset(
+    adapterId: string,
+    message: InboundMessage,
+    correlationId: string,
+  ): Promise<void> {
+    const convKey = compositeKey(adapterId, message.conversationKey);
+    const active = this.active.get(convKey);
+    if (active) await this.interruptTurn(active);
+    await this.pool.retireConversation(adapterId, message.conversationKey);
+    const existed = this.sessions.forget(adapterId, message.conversationKey);
+    this.buffer.recordInteraction(adapterId, message.conversationKey);
+
+    // Register a correlation exactly like a real turn so the terminal reply
+    // flows through the normal completion path. Emitting and closing by hand
+    // skipped the flush, which left the event undelivered and the conversation
+    // wedged with no lease and no terminal event.
+    const corr: ActiveCorrelation = {
+      correlationId,
+      adapterId,
+      conversationKey: message.conversationKey,
+      messageIds: new Set([message.messageId]),
+      emitter: this.createEmitter(
+        adapterId,
+        message.conversationKey,
+        correlationId,
+        new Set([message.messageId]),
+      ),
+      lease: null,
+      pendingFollowUps: 0,
+      terminalEmitted: false,
+    };
+    this.active.set(convKey, corr);
+    corr.emitter.emitDirectReply(
+      existed
+        ? "Started a new session. Earlier messages are no longer in context."
+        : "Already on a new session.",
+    );
+    corr.terminalEmitted = true;
+    this.cleanupCorrelation(convKey, corr);
+  }
+
+  /**
+   * Abandon an in-flight turn because a newer addressed message superseded it.
+   *
+   * Aborts the child so it stops generating, emits the terminal cancellation
+   * so the adapter can remove any partial output it already posted, and clears
+   * the correlation. The replacement turn then leases the child normally.
+   *
+   * Best-effort by design: a failed abort must not stop the newer message
+   * being answered, which is the whole point of interrupting.
+   */
+  private async interruptTurn(corr: ActiveCorrelation): Promise<void> {
+    const convKey = compositeKey(corr.adapterId, corr.conversationKey);
+    // Emit the cancellation BEFORE aborting. Aborting makes the child report
+    // agent_end with no text, which the emitter would otherwise turn into an
+    // "Agent completed without producing a reply" error posted to the channel.
+    // Claiming the terminal first makes that path a no-op.
+    corr.emitter.emitCancelled();
+    corr.terminalEmitted = true;
+    if (corr.lease) {
+      try {
+        await corr.lease.child.abort();
+      } catch {
+        // Child already gone or unresponsive; the cleanup below still runs.
+      }
+    }
+    this.cleanupCorrelation(convKey, corr);
+  }
+
   // ---- internals: passive message append ----
 
   /**
@@ -633,7 +848,11 @@ export class CoreSupervisor {
       return;
     }
     // No active child: acquire a lease just for the append, then release.
-    const lease = await this.pool.acquire(adapterId, message.conversationKey);
+    const lease = await this.pool.acquire(
+      adapterId,
+      message.conversationKey,
+      message.parentConversationKey,
+    );
     try {
       await this.runAmbientCommand(
         lease.child,
@@ -1118,6 +1337,16 @@ function assertRpcSuccess(response: RpcResponseFrame, operation: string): void {
     throw new Error(`${operation} was rejected by the agent process`);
   }
 }
+
+/**
+ * Messages core answers itself by starting a new session. Matched against the
+ * whole trimmed, lowercased message so a mention of the command in ordinary
+ * conversation is not treated as one.
+ */
+const SESSION_RESET_COMMANDS: Record<string, true> = {
+  "/new": true,
+  "/reset": true,
+};
 
 /** Composite conversation key (collision-proof, same algorithm as IngestBuffer). */
 function compositeKey(adapterId: string, conversationKey: string): string {
